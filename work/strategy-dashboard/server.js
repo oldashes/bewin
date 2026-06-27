@@ -22,6 +22,8 @@ const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2024-01-01";
 const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
 const DEFAULT_SYNC_MAX_STOCKS = 20;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
+const THS_SYNC_JOB = "ths-popularity-refresh";
+const DEFAULT_THS_WATCHLIST_MAX = 20;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 
 const PSEUDO_BOARD_RE =
@@ -267,6 +269,53 @@ function normalizeDate(value) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   if (/^\d{8}$/.test(text)) return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
   return "";
+}
+
+function normalizeYmd(value) {
+  const date = normalizeDate(value);
+  if (date) return date.replaceAll("-", "");
+  return chinaDateYmd();
+}
+
+function dateFromYmd(value) {
+  const text = String(value || "").trim();
+  if (/^\d{8}$/.test(text)) return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
+  return normalizeDate(text);
+}
+
+function chinaDateYmd(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .format(date)
+    .replaceAll("-", "");
+}
+
+function chinaMinuteKey(date = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    })
+      .formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}${parts.month}${parts.day}${parts.hour}${parts.minute}`;
+}
+
+function thsSnapshotTimeFromKey(key) {
+  const text = String(key || "");
+  if (!/^\d{12}$/.test(text)) return null;
+  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}T${text.slice(8, 10)}:${text.slice(10, 12)}:00+08:00`;
 }
 
 function clamp(value, min = 0, max = 1) {
@@ -1730,6 +1779,362 @@ async function dailySyncPayload(query = {}, headers = {}) {
   });
 }
 
+function thsConceptTag(item) {
+  const tag = item?.tag || {};
+  const conceptTag = tag.concept_tag;
+  if (Array.isArray(conceptTag) && conceptTag.length >= 3) return String(conceptTag[2] || "");
+  return "";
+}
+
+function isAStockCode(code, market) {
+  if (!/^[036]\d{5}$/.test(String(code || ""))) return false;
+  return !market || ["17", "33"].includes(String(market));
+}
+
+function thsHistoryRecordsFromPayload(payload, requestedYmd, category) {
+  const data = payload?.data || {};
+  const listMap = data.stock_list || data.plate_list || {};
+  const records = [];
+  for (const [timeKey, items] of Object.entries(listMap)) {
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      const code = String(item.code || "");
+      const market = String(item.market || item.market_id || "");
+      if (category === "stock" && !isAStockCode(code, market)) continue;
+      const itemTimeKey = String(item.time || timeKey || "");
+      const snapshotYmd = /^\d{12}$/.test(itemTimeKey) ? itemTimeKey.slice(0, 8) : requestedYmd;
+      records.push({
+        source: "ths",
+        category,
+        metric: "hot",
+        snapshot_date: dateFromYmd(snapshotYmd),
+        snapshot_key: itemTimeKey || `${requestedYmd}0000`,
+        snapshot_time: thsSnapshotTimeFromKey(itemTimeKey),
+        code,
+        name: String(item.name || ""),
+        market,
+        rank: n(item.order),
+        rank_change: n(item.hot_rank_chg),
+        heat_value: n(item.rate),
+        pct: null,
+        price: null,
+        float_market_value: null,
+        main_tag: category === "stock" ? thsConceptTag(item) : "",
+        raw: item,
+      });
+    }
+  }
+  return records;
+}
+
+async function fetchThsHotHistory(category, ymd) {
+  const type = category === "stock" ? "stock" : category === "industry" ? "industry" : "concept";
+  const url = `https://eq.10jqka.com.cn/open/api/hot_list/history/v1/rank?type=${type}&date=${ymd}`;
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Referer: "https://eq.10jqka.com.cn/webpage/ths-hot-list/index.html",
+    },
+  });
+  if (!response.ok) throw new Error(`同花顺热榜请求失败：${response.status}`);
+  const json = await response.json();
+  if (json.status_code !== 0) throw new Error(`同花顺热榜返回异常：${json.status_msg || json.status_code}`);
+  return thsHistoryRecordsFromPayload(json, ymd, category);
+}
+
+function thsAttentionRecordFromRow(row, snapshotYmd, snapshotKey, snapshotTime) {
+  const code = String(row?.[0] || "");
+  const market = String(row?.[7] || "");
+  if (!isAStockCode(code, market)) return null;
+  return {
+    source: "ths",
+    category: "stock",
+    metric: "attention",
+    snapshot_date: dateFromYmd(snapshotYmd),
+    snapshot_key: snapshotKey,
+    snapshot_time: snapshotTime,
+    code,
+    name: String(row?.[1] || ""),
+    market,
+    rank: n(row?.[2]),
+    rank_change: n(row?.[3]),
+    heat_value: null,
+    pct: n(row?.[4]),
+    price: n(row?.[5]),
+    float_market_value: n(row?.[6]),
+    main_tag: "",
+    raw: { rankRow: row },
+  };
+}
+
+async function fetchThsAttentionDegree(code, snapshotYmd) {
+  const url = `https://basic.10jqka.com.cn/api/stockph/popularity.php?code=${encodeURIComponent(code)}&data_type=rank`;
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Referer: `https://basic.10jqka.com.cn/stockph/attentionDegree.html?code=${encodeURIComponent(code)}`,
+    },
+  });
+  if (!response.ok) throw new Error(`同花顺人气榜请求失败：${response.status}`);
+  const json = await response.json();
+  if (json.status_code !== 0) throw new Error(`同花顺人气榜返回异常：${json.status_msg || json.status_code}`);
+  const data = json.data || {};
+  const snapshotKey = `${snapshotYmd}1500`;
+  const snapshotTime = `${dateFromYmd(snapshotYmd)}T15:00:00+08:00`;
+  const rows = Array.isArray(data.rank_list) ? data.rank_list : [];
+  return rows
+    .map((row) => thsAttentionRecordFromRow(row, snapshotYmd, snapshotKey, snapshotTime))
+    .filter(Boolean);
+}
+
+async function selectThsAttentionWatchlist(maxStocks, lookbackDays) {
+  const { rows } = await getDbPool().query(
+    `
+      with bounds as (
+        select coalesce(max(signal_date), current_date) as max_signal_date
+        from strategy_signals
+      )
+      select s.code, max(s.signal_date) as latest_signal_date
+      from strategy_signals s
+      cross join bounds b
+      where s.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
+      group by s.code
+      order by max(s.signal_date) desc
+      limit $2::int
+    `,
+    [lookbackDays, maxStocks],
+  );
+  return rows.map((row) => row.code).filter(Boolean);
+}
+
+async function upsertPopularitySnapshots(records) {
+  const cleanRecords = records
+    .filter((record) => record.source && record.category && record.metric && record.snapshot_date && record.snapshot_key && record.code)
+    .map((record) => ({
+      ...record,
+      raw: record.raw || {},
+    }));
+  if (!cleanRecords.length) return 0;
+
+  await getDbPool().query(
+    `
+      with input as (
+        select *
+        from jsonb_to_recordset($1::jsonb) as x(
+          source text,
+          category text,
+          metric text,
+          snapshot_date date,
+          snapshot_key text,
+          snapshot_time timestamptz,
+          code text,
+          name text,
+          market text,
+          rank integer,
+          rank_change integer,
+          heat_value numeric,
+          pct numeric,
+          price numeric,
+          float_market_value numeric,
+          main_tag text,
+          raw jsonb
+        )
+      )
+      insert into popularity_snapshots (
+        source, category, metric, snapshot_date, snapshot_key, snapshot_time,
+        code, name, market, rank, rank_change, heat_value, pct, price,
+        float_market_value, main_tag, raw, updated_at
+      )
+      select
+        source, category, metric, snapshot_date, snapshot_key, snapshot_time,
+        code, name, market, rank, rank_change, heat_value, pct, price,
+        float_market_value, main_tag, coalesce(raw, '{}'::jsonb), now()
+      from input
+      on conflict (source, category, metric, snapshot_key, code) do update set
+        name = excluded.name,
+        market = excluded.market,
+        rank = excluded.rank,
+        rank_change = excluded.rank_change,
+        heat_value = excluded.heat_value,
+        pct = excluded.pct,
+        price = excluded.price,
+        float_market_value = excluded.float_market_value,
+        main_tag = excluded.main_tag,
+        raw = excluded.raw,
+        updated_at = now()
+    `,
+    [JSON.stringify(cleanRecords)],
+  );
+
+  const stockRecords = new Map();
+  for (const record of cleanRecords) {
+    if (record.category !== "stock" || !isAStockCode(record.code, record.market)) continue;
+    stockRecords.set(record.code, {
+      code: record.code,
+      name: record.name || record.code,
+      exchange: String(record.market) === "17" ? "SH" : "SZ",
+      board: null,
+      industry: null,
+      region: null,
+      concepts: record.main_tag ? [record.main_tag] : [],
+      listing_date: null,
+    });
+  }
+  await bulkUpsertStocksForSnapshots([...stockRecords.values()]);
+  return cleanRecords.length;
+}
+
+async function bulkUpsertStocksForSnapshots(records) {
+  if (!records.length) return;
+  await getDbPool().query(
+    `
+      with input as (
+        select *
+        from jsonb_to_recordset($1::jsonb) as x(
+          code text,
+          name text,
+          exchange text,
+          board text,
+          industry text,
+          region text,
+          concepts jsonb,
+          listing_date date
+        )
+      )
+      insert into stocks (code, name, exchange, board, industry, region, concepts, listing_date, updated_at)
+      select code, name, exchange, board, industry, region, coalesce(concepts, '[]'::jsonb), listing_date, now()
+      from input
+      on conflict (code) do update set
+        name = coalesce(excluded.name, stocks.name),
+        exchange = coalesce(excluded.exchange, stocks.exchange),
+        concepts = case
+          when jsonb_array_length(excluded.concepts) > 0 then excluded.concepts
+          else stocks.concepts
+        end,
+        updated_at = now()
+    `,
+    [JSON.stringify(records)],
+  );
+}
+
+async function runThsPopularitySync(options = {}) {
+  requireDatabase();
+  const requestedYmd = normalizeYmd(options.date);
+  const lookbackDays = boundedInteger(
+    options.lookbackDays ?? process.env.THS_WATCHLIST_LOOKBACK_DAYS ?? process.env.SYNC_LOOKBACK_DAYS,
+    DEFAULT_SYNC_LOOKBACK_DAYS,
+    1,
+    365,
+  );
+  const watchlistMax = boundedInteger(
+    options.watchlistMax ?? process.env.THS_WATCHLIST_MAX,
+    DEFAULT_THS_WATCHLIST_MAX,
+    0,
+    200,
+  );
+  const includeAttention = options.includeAttention !== false && options.includeAttention !== "false";
+  const categories = String(options.categories || process.env.THS_HOT_CATEGORIES || "stock,concept,industry")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => ["stock", "concept", "industry"].includes(item));
+  const startedAt = new Date().toISOString();
+  const params = { requestedYmd, categories, includeAttention, watchlistMax, lookbackDays };
+  const run = await createSyncRun(THS_SYNC_JOB, { params, startedAt });
+  const results = [];
+
+  try {
+    const allRecords = [];
+    for (const category of categories) {
+      const item = { category, metric: "hot", status: "pending" };
+      try {
+        const records = await fetchThsHotHistory(category, requestedYmd);
+        item.status = "fetched";
+        item.recordCount = records.length;
+        item.actualDates = [...new Set(records.map((record) => record.snapshot_date))].sort();
+        allRecords.push(...records);
+      } catch (error) {
+        item.status = "failed";
+        item.error = error.message;
+      }
+      results.push(item);
+    }
+
+    const actualYmd =
+      allRecords.find((record) => record.category === "stock")?.snapshot_key?.slice(0, 8) ||
+      allRecords[0]?.snapshot_key?.slice(0, 8) ||
+      requestedYmd;
+
+    if (includeAttention) {
+      const watchlist = await selectThsAttentionWatchlist(watchlistMax, lookbackDays);
+      const attentionCodes = [...new Set(["300674", ...watchlist])];
+      const item = { category: "stock", metric: "attention", status: "pending", requestedCodes: attentionCodes.length };
+      const attentionRecords = [];
+      const failures = [];
+      for (const code of attentionCodes) {
+        try {
+          attentionRecords.push(...(await fetchThsAttentionDegree(code, actualYmd)));
+        } catch (error) {
+          failures.push({ code, error: error.message });
+        }
+      }
+      item.status = failures.length && !attentionRecords.length ? "failed" : failures.length ? "partial" : "fetched";
+      item.recordCount = attentionRecords.length;
+      item.uniqueCount = new Set(attentionRecords.map((record) => record.code)).size;
+      item.failures = failures.slice(0, 10);
+      allRecords.push(...attentionRecords);
+      results.push(item);
+    }
+
+    const uniqueRecords = new Map();
+    for (const record of allRecords) {
+      uniqueRecords.set(`${record.source}:${record.category}:${record.metric}:${record.snapshot_key}:${record.code}`, record);
+    }
+    const savedCount = await upsertPopularitySnapshots([...uniqueRecords.values()]);
+    const failedCount = results.filter((item) => item.status === "failed").length;
+    const partialCount = results.filter((item) => item.status === "partial").length;
+    const summary = {
+      jobName: THS_SYNC_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params: { ...params, actualYmd },
+      selectedCount: uniqueRecords.size,
+      successCount: savedCount,
+      failedCount,
+      partialCount,
+      results,
+    };
+    const status = failedCount ? (savedCount ? "partial" : "failed") : partialCount ? "partial" : "success";
+    await finishSyncRun(run.id, status, summary, failedCount && !savedCount ? "all ths categories failed" : null);
+    return { ...summary, status };
+  } catch (error) {
+    const summary = {
+      jobName: THS_SYNC_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: 0,
+      successCount: 0,
+      failedCount: 1,
+      results,
+    };
+    await finishSyncRun(run.id, "failed", summary, error.message);
+    throw error;
+  }
+}
+
+async function thsSyncPayload(query = {}, headers = {}) {
+  assertCronAuthorized(query, headers);
+  return runThsPopularitySync({
+    date: query.date,
+    categories: query.categories,
+    includeAttention: query.includeAttention,
+    watchlistMax: query.watchlistMax,
+    lookbackDays: query.lookbackDays,
+  });
+}
+
 function findTradingIndex(rows, date, useNext = false) {
   const exact = rows.findIndex((row) => row.date === date);
   if (exact >= 0) return useNext ? exact + 1 : exact;
@@ -1879,6 +2284,7 @@ async function handleApiRequest(pathname, query, headers = {}) {
   if (pathname === "/api/stock-signals") return stockSignalsPayload(query);
   if (pathname === "/api/position") return positionPayload(query);
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
+  if (pathname === "/api/cron/ths-sync") return thsSyncPayload(query, headers);
   const error = new Error("Not found");
   error.statusCode = 404;
   throw error;
@@ -1913,4 +2319,7 @@ module.exports = {
   positionPayload,
   dailySyncPayload,
   runDailyKlineSync,
+  thsSyncPayload,
+  runThsPopularitySync,
+  upsertPopularitySnapshots,
 };

@@ -73,6 +73,30 @@ create table if not exists stock_daily_bars (
   primary key (code, trade_date)
 );
 
+create table if not exists popularity_snapshots (
+  id bigserial primary key,
+  source text not null,
+  category text not null,
+  metric text not null,
+  snapshot_date date not null,
+  snapshot_key text not null,
+  snapshot_time timestamptz,
+  code text not null,
+  name text,
+  market text,
+  rank integer,
+  rank_change integer,
+  heat_value numeric,
+  pct numeric,
+  price numeric,
+  float_market_value numeric,
+  main_tag text,
+  raw jsonb not null default '{}'::jsonb,
+  captured_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (source, category, metric, snapshot_key, code)
+);
+
 create table if not exists sync_runs (
   id bigserial primary key,
   job_name text not null,
@@ -93,4 +117,7 @@ create index if not exists idx_strategy_signals_rank on strategy_signals(rank);
 create index if not exists idx_stocks_name on stocks(name);
 create index if not exists idx_stock_daily_bars_date on stock_daily_bars(trade_date desc);
 create index if not exists idx_stock_daily_bars_updated on stock_daily_bars(updated_at);
+create index if not exists idx_popularity_snapshots_source_date on popularity_snapshots(source, category, metric, snapshot_date desc);
+create index if not exists idx_popularity_snapshots_code_date on popularity_snapshots(source, code, snapshot_date desc);
+create index if not exists idx_popularity_snapshots_time on popularity_snapshots(snapshot_time desc);
 create index if not exists idx_sync_runs_job_started on sync_runs(job_name, started_at desc);

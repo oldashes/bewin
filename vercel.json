@@ -11,6 +11,10 @@
     {
       "path": "/api/cron/daily-sync",
       "schedule": "30 8 * * 1-5"
+    },
+    {
+      "path": "/api/cron/ths-sync",
+      "schedule": "40 8 * * 1-5"
     }
   ],
   "rewrites": [

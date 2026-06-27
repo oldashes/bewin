@@ -8,7 +8,9 @@
     "db:schema": "node scripts/db-schema.js",
     "db:import": "node scripts/import-signals.js",
     "db:import-klines": "node scripts/import-klines.js",
-    "sync:daily": "node scripts/daily-sync.js"
+    "db:import-ths": "node scripts/import-ths-history.js",
+    "sync:daily": "node scripts/daily-sync.js",
+    "sync:ths": "node scripts/ths-sync.js"
   },
   "dependencies": {
     "pg": "^8.16.3"
