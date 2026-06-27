@@ -4,6 +4,11 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node work/strategy-dashboard/server.js"
+    "start": "node work/strategy-dashboard/server.js",
+    "db:schema": "node scripts/db-schema.js",
+    "db:import": "node scripts/import-signals.js"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }
