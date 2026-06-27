@@ -38,10 +38,32 @@ KLINE_START_DATE=2025-01-01 npm run db:import-klines
 
 服务端收益验证会优先读取 Neon 的 `stock_daily_bars`；如果某只股票没有入库，会临时请求东方财富 K 线并写回 Neon。
 
+## Vercel
+
+Vercel 导入 GitHub 仓库时使用：
+
+```text
+Application Preset: Other
+Root Directory: ./
+Build Command: 留空
+Output Directory: 留空
+Install Command: npm install
+```
+
+环境变量：
+
+```text
+DATABASE_URL=postgresql://...
+```
+
+根目录 `public/` 是静态前端，`api/` 是 Vercel Functions。
+
 ## 目录
 
 ```text
 work/strategy-dashboard/   Web 服务和前端页面
+public/                    Vercel 静态前端入口
+api/                       Vercel Functions 入口
 outputs/                   回测 CSV、分析报告和截图输出
 work/cache/                本地行情/板块缓存，不提交 GitHub
 ```

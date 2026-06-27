@@ -1617,28 +1617,42 @@ function sendFile(res, requestPath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
+async function handleApiRequest(pathname, query) {
+  if (pathname === "/api/overview") return overviewPayload(query);
+  if (pathname === "/api/daily") return dailyPayload(query);
+  if (pathname === "/api/timeline") return timelinePayload(query);
+  if (pathname === "/api/stock-signals") return stockSignalsPayload(query);
+  if (pathname === "/api/position") return positionPayload(query);
+  const error = new Error("Not found");
+  error.statusCode = 404;
+  throw error;
+}
+
 const server = http.createServer(async (req, res) => {
   const parsed = new URL(req.url, `http://${HOST}:${PORT}`);
   const query = Object.fromEntries(parsed.searchParams.entries());
   try {
-    if (parsed.pathname === "/api/overview") {
-      sendJson(res, await overviewPayload(query));
-    } else if (parsed.pathname === "/api/daily") {
-      sendJson(res, await dailyPayload(query));
-    } else if (parsed.pathname === "/api/timeline") {
-      sendJson(res, await timelinePayload(query));
-    } else if (parsed.pathname === "/api/stock-signals") {
-      sendJson(res, await stockSignalsPayload(query));
-    } else if (parsed.pathname === "/api/position") {
-      positionPayload(query).then((payload) => sendJson(res, payload)).catch((error) => sendJson(res, { error: error.message }, 500));
+    if (parsed.pathname.startsWith("/api/")) {
+      sendJson(res, await handleApiRequest(parsed.pathname, query));
     } else {
       sendFile(res, parsed.pathname);
     }
   } catch (error) {
-    sendJson(res, { error: error.message }, 500);
+    sendJson(res, { error: error.message }, error.statusCode || 500);
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Strategy dashboard running at http://${HOST}:${PORT}`);
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Strategy dashboard running at http://${HOST}:${PORT}`);
+  });
+}
+
+module.exports = {
+  handleApiRequest,
+  overviewPayload,
+  dailyPayload,
+  timelinePayload,
+  stockSignalsPayload,
+  positionPayload,
+};
