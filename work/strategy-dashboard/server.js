@@ -18,6 +18,7 @@ const STOCK_META_FILE = path.join(ROOT, "work/cache/strategy-dashboard/stock-met
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
+const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2024-01-01";
 
 const PSEUDO_BOARD_RE =
   /(百日|新高|新低|昨日|近期|最近|连板|涨停|打板|首板|触板|一字|破板|竞价|低价|高价|融资|沪股通|深股通|破净|红利|ST|季报|年报|预增|预盈|预亏|业绩|基金|重仓|成份|送转|转债|MSCI|富时|标普|证金|养老金)/;
@@ -1326,8 +1327,15 @@ async function fetchKline(stock) {
   const json = await response.json();
   const rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
   if (!rows.length) throw new Error(`没有找到 ${stock.code} 的日 K 数据`);
-  fs.mkdirSync(KLINE_DIR, { recursive: true });
-  fs.writeFileSync(stock.cacheFile, JSON.stringify(rows));
+  try {
+    fs.mkdirSync(KLINE_DIR, { recursive: true });
+    fs.writeFileSync(stock.cacheFile, JSON.stringify(rows));
+  } catch {
+    // Serverless deployments may not have a writable project directory.
+  }
+  if (shouldUseDatabase("em")) {
+    await saveKlineToDb(stock, rows);
+  }
   return rows;
 }
 
@@ -1350,11 +1358,121 @@ function parseKlineLine(line) {
 }
 
 async function loadKline(stock) {
+  if (shouldUseDatabase("em")) {
+    const rows = await loadKlineFromDb(stock);
+    if (rows.length) return rows;
+  }
   if (fs.existsSync(stock.cacheFile)) {
     const rows = JSON.parse(fs.readFileSync(stock.cacheFile, "utf8"));
-    if (Array.isArray(rows) && rows.length) return rows;
+    if (Array.isArray(rows) && rows.length) {
+      if (shouldUseDatabase("em")) await saveKlineToDb(stock, rows);
+      return rows;
+    }
   }
   return fetchKline(stock);
+}
+
+async function loadKlineFromDb(stock) {
+  const { rows } = await getDbPool().query(
+    `
+      select trade_date, open, close, high, low, volume, amount, amplitude, pct, change, turnover
+      from stock_daily_bars
+      where code = $1
+      order by trade_date asc
+    `,
+    [stock.code],
+  );
+  return rows
+    .map((row) => ({
+      date: normalizeDate(row.trade_date),
+      open: n(row.open),
+      close: n(row.close),
+      high: n(row.high),
+      low: n(row.low),
+      volume: n(row.volume),
+      amount: n(row.amount),
+      amplitude: n(row.amplitude),
+      pct: n(row.pct),
+      change: n(row.change),
+      turnover: n(row.turnover),
+    }))
+    .filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close));
+}
+
+async function saveKlineToDb(stock, rows) {
+  const cleanRows = rows
+    .filter((row) => row.date >= KLINE_DB_START_DATE && Number.isFinite(row.open) && Number.isFinite(row.close))
+    .map((row) => ({
+      code: stock.code,
+      trade_date: row.date,
+      market: stock.market,
+      open: row.open,
+      close: row.close,
+      high: row.high,
+      low: row.low,
+      volume: row.volume,
+      amount: row.amount,
+      amplitude: row.amplitude,
+      pct: row.pct,
+      change: row.change,
+      turnover: row.turnover,
+    }));
+  if (!cleanRows.length) return;
+
+  const pool = getDbPool();
+  await pool.query(
+    "insert into stocks (code, name, exchange, updated_at) values ($1, $2, $3, now()) on conflict (code) do nothing",
+    [stock.code, stock.code, stock.market],
+  );
+
+  for (let index = 0; index < cleanRows.length; index += 5000) {
+    const chunk = cleanRows.slice(index, index + 5000);
+    await pool.query(
+      `
+        with input as (
+          select *
+          from jsonb_to_recordset($1::jsonb) as x(
+            code text,
+            trade_date date,
+            market text,
+            open numeric,
+            close numeric,
+            high numeric,
+            low numeric,
+            volume numeric,
+            amount numeric,
+            amplitude numeric,
+            pct numeric,
+            change numeric,
+            turnover numeric
+          )
+        )
+        insert into stock_daily_bars (
+          code, trade_date, market, open, close, high, low, volume, amount,
+          amplitude, pct, change, turnover, source, updated_at
+        )
+        select
+          code, trade_date, market, open, close, high, low, volume, amount,
+          amplitude, pct, change, turnover, 'eastmoney', now()
+        from input
+        on conflict (code, trade_date) do update set
+          market = excluded.market,
+          open = excluded.open,
+          close = excluded.close,
+          high = excluded.high,
+          low = excluded.low,
+          volume = excluded.volume,
+          amount = excluded.amount,
+          amplitude = excluded.amplitude,
+          pct = excluded.pct,
+          change = excluded.change,
+          turnover = excluded.turnover,
+          source = excluded.source,
+          updated_at = now()
+      `,
+      [JSON.stringify(chunk)],
+    );
+  }
 }
 
 function findTradingIndex(rows, date, useNext = false) {

@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node work/strategy-dashboard/server.js",
     "db:schema": "node scripts/db-schema.js",
-    "db:import": "node scripts/import-signals.js"
+    "db:import": "node scripts/import-signals.js",
+    "db:import-klines": "node scripts/import-klines.js"
   },
   "dependencies": {
     "pg": "^8.16.3"

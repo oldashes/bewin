@@ -53,8 +53,29 @@ create table if not exists import_batches (
   imported_at timestamptz not null default now()
 );
 
+create table if not exists stock_daily_bars (
+  code text not null references stocks(code) on update cascade,
+  trade_date date not null,
+  market text,
+  open numeric,
+  close numeric,
+  high numeric,
+  low numeric,
+  volume numeric,
+  amount numeric,
+  amplitude numeric,
+  pct numeric,
+  change numeric,
+  turnover numeric,
+  source text not null default 'eastmoney',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (code, trade_date)
+);
+
 create index if not exists idx_strategy_signals_date on strategy_signals(signal_date desc);
 create index if not exists idx_strategy_signals_code_date on strategy_signals(code, signal_date desc);
 create index if not exists idx_strategy_signals_source_strategy_date on strategy_signals(source, strategy, signal_date desc);
 create index if not exists idx_strategy_signals_rank on strategy_signals(rank);
 create index if not exists idx_stocks_name on stocks(name);
+create index if not exists idx_stock_daily_bars_date on stock_daily_bars(trade_date desc);

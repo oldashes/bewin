@@ -25,9 +25,18 @@ DATA_MODE=csv npm start
 ```bash
 npm run db:schema
 npm run db:import
+npm run db:import-klines
 ```
 
-`db:schema` 会创建表结构，`db:import` 会把当前 CSV 信号导入 Neon。
+`db:schema` 会创建表结构，`db:import` 会把当前 CSV 信号导入 Neon，`db:import-klines` 会把策略相关股票的本地日 K 缓存导入 Neon。
+
+默认 K 线导入从 `2024-01-01` 开始，可通过环境变量调整：
+
+```bash
+KLINE_START_DATE=2025-01-01 npm run db:import-klines
+```
+
+服务端收益验证会优先读取 Neon 的 `stock_daily_bars`；如果某只股票没有入库，会临时请求东方财富 K 线并写回 Neon。
 
 ## 目录
 
