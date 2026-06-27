@@ -2,8 +2,17 @@
   "functions": {
     "api/*.js": {
       "maxDuration": 30
+    },
+    "api/cron/*.js": {
+      "maxDuration": 60
     }
   },
+  "crons": [
+    {
+      "path": "/api/cron/daily-sync",
+      "schedule": "30 8 * * 1-5"
+    }
+  ],
   "rewrites": [
     {
       "source": "/",

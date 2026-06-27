@@ -73,9 +73,24 @@ create table if not exists stock_daily_bars (
   primary key (code, trade_date)
 );
 
+create table if not exists sync_runs (
+  id bigserial primary key,
+  job_name text not null,
+  status text not null,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  selected_count integer not null default 0,
+  success_count integer not null default 0,
+  failed_count integer not null default 0,
+  details jsonb not null default '{}'::jsonb,
+  error text
+);
+
 create index if not exists idx_strategy_signals_date on strategy_signals(signal_date desc);
 create index if not exists idx_strategy_signals_code_date on strategy_signals(code, signal_date desc);
 create index if not exists idx_strategy_signals_source_strategy_date on strategy_signals(source, strategy, signal_date desc);
 create index if not exists idx_strategy_signals_rank on strategy_signals(rank);
 create index if not exists idx_stocks_name on stocks(name);
 create index if not exists idx_stock_daily_bars_date on stock_daily_bars(trade_date desc);
+create index if not exists idx_stock_daily_bars_updated on stock_daily_bars(updated_at);
+create index if not exists idx_sync_runs_job_started on sync_runs(job_name, started_at desc);

@@ -4,7 +4,7 @@ module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, "https://bewin.local");
     const query = Object.fromEntries(url.searchParams.entries());
-    const payload = await handleApiRequest(url.pathname, query);
+    const payload = await handleApiRequest(url.pathname, query, req.headers);
     res.setHeader("Cache-Control", "no-store");
     res.status(200).json(payload);
   } catch (error) {

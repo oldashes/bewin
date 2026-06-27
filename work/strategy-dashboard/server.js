@@ -19,6 +19,10 @@ const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
 const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2024-01-01";
+const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
+const DEFAULT_SYNC_MAX_STOCKS = 20;
+const DAILY_SYNC_JOB = "daily-kline-refresh";
+const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 
 const PSEUDO_BOARD_RE =
   /(百日|新高|新低|昨日|近期|最近|连板|涨停|打板|首板|触板|一字|破板|竞价|低价|高价|融资|沪股通|深股通|破净|红利|ST|季报|年报|预增|预盈|预亏|业绩|基金|重仓|成份|送转|转债|MSCI|富时|标普|证金|养老金)/;
@@ -1310,6 +1314,16 @@ function normalizeStock(input) {
   };
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = KLINE_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchKline(stock) {
   const url =
     "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
@@ -1317,7 +1331,7 @@ async function fetchKline(stock) {
     "&fields1=f1,f2,f3,f4,f5,f6" +
     "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
     "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       "User-Agent": "Mozilla/5.0",
       Referer: "https://quote.eastmoney.com/",
@@ -1475,6 +1489,247 @@ async function saveKlineToDb(stock, rows) {
   }
 }
 
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+function getHeader(headers, name) {
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() !== target) continue;
+    return Array.isArray(value) ? value[0] || "" : String(value || "");
+  }
+  return "";
+}
+
+function assertCronAuthorized(query = {}, headers = {}) {
+  const secret = process.env.CRON_SECRET;
+  const isHostedRuntime = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+  if (!secret) {
+    if (isHostedRuntime) {
+      const error = new Error("CRON_SECRET is required for hosted daily sync");
+      error.statusCode = 500;
+      throw error;
+    }
+    return { required: false };
+  }
+
+  const authorization = getHeader(headers, "authorization");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  const provided = bearer || getHeader(headers, "x-cron-secret") || String(query.secret || "");
+  if (provided !== secret) {
+    const error = new Error("Unauthorized");
+    error.statusCode = 401;
+    throw error;
+  }
+  return { required: true };
+}
+
+function requireDatabase() {
+  if (process.env.DATABASE_URL) return;
+  const error = new Error("DATABASE_URL is required for daily sync");
+  error.statusCode = 500;
+  throw error;
+}
+
+async function createSyncRun(jobName, details) {
+  const { rows } = await getDbPool().query(
+    `
+      insert into sync_runs (job_name, status, details)
+      values ($1, 'running', $2::jsonb)
+      returning id, started_at
+    `,
+    [jobName, JSON.stringify(details || {})],
+  );
+  return rows[0];
+}
+
+async function finishSyncRun(runId, status, summary, errorMessage = null) {
+  await getDbPool().query(
+    `
+      update sync_runs
+      set
+        status = $2,
+        finished_at = now(),
+        selected_count = $3,
+        success_count = $4,
+        failed_count = $5,
+        details = $6::jsonb,
+        error = $7
+      where id = $1
+    `,
+    [
+      runId,
+      status,
+      summary.selectedCount || 0,
+      summary.successCount || 0,
+      summary.failedCount || 0,
+      JSON.stringify(summary),
+      errorMessage,
+    ],
+  );
+}
+
+async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, maxStocks, force }) {
+  const { rows } = await getDbPool().query(
+    `
+      with bounds as (
+        select coalesce(max(signal_date), current_date) as max_signal_date
+        from strategy_signals
+        where source = $3
+          and ($4::text is null or strategy = $4)
+      ),
+      recent_signals as (
+        select
+          s.code,
+          max(s.name) as name,
+          max(s.signal_date) as latest_signal_date,
+          count(*)::int as signal_count
+        from strategy_signals s
+        cross join bounds b
+        where s.source = $3
+          and ($4::text is null or s.strategy = $4)
+          and s.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
+        group by s.code
+      ),
+      latest_bars as (
+        select
+          code,
+          max(trade_date) as latest_bar_date,
+          max(updated_at) as latest_bar_updated_at
+        from stock_daily_bars
+        group by code
+      )
+      select
+        rs.code,
+        rs.name,
+        rs.latest_signal_date,
+        rs.signal_count,
+        lb.latest_bar_date,
+        lb.latest_bar_updated_at
+      from recent_signals rs
+      left join latest_bars lb on lb.code = rs.code
+      where $5::boolean
+         or lb.latest_bar_updated_at is null
+         or lb.latest_bar_updated_at < now() - interval '18 hours'
+      order by lb.latest_bar_updated_at asc nulls first, rs.latest_signal_date desc, rs.signal_count desc
+      limit $2::int
+    `,
+    [lookbackDays, maxStocks, sourceKey, strategyKey || null, Boolean(force)],
+  );
+
+  return rows.map((row) => ({
+    code: row.code,
+    name: row.name || row.code,
+    latestSignalDate: normalizeDate(row.latest_signal_date),
+    signalCount: n(row.signal_count) || 0,
+    latestBarDate: normalizeDate(row.latest_bar_date),
+    latestBarUpdatedAt: row.latest_bar_updated_at ? new Date(row.latest_bar_updated_at).toISOString() : null,
+  }));
+}
+
+async function runDailyKlineSync(options = {}) {
+  requireDatabase();
+  const sourceKey = normalizeSourceKey(options.source || "em");
+  if (sourceKey !== "em") {
+    const error = new Error("当前自动同步只支持东方财富数据源");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const strategyKey = options.strategy && STRATEGIES[options.strategy] ? options.strategy : null;
+  const lookbackDays = boundedInteger(
+    options.lookbackDays ?? process.env.SYNC_LOOKBACK_DAYS,
+    DEFAULT_SYNC_LOOKBACK_DAYS,
+    1,
+    365,
+  );
+  const maxStocks = boundedInteger(
+    options.maxStocks ?? process.env.SYNC_MAX_STOCKS,
+    DEFAULT_SYNC_MAX_STOCKS,
+    1,
+    200,
+  );
+  const force = options.force === true || options.force === "1" || options.force === "true";
+  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force };
+  const startedAt = new Date().toISOString();
+  const run = await createSyncRun(DAILY_SYNC_JOB, { params, startedAt });
+  const results = [];
+
+  try {
+    const candidates = await selectDailySyncStocks(params);
+    let successCount = 0;
+    let failedCount = 0;
+
+    for (const candidate of candidates) {
+      const stock = normalizeStock(candidate.code);
+      const item = {
+        code: candidate.code,
+        name: candidate.name,
+        latestSignalDate: candidate.latestSignalDate,
+        previousLatestBarDate: candidate.latestBarDate,
+        status: "pending",
+      };
+      try {
+        const rows = await fetchKline(stock);
+        const latestRow = rows[rows.length - 1] || null;
+        item.status = "synced";
+        item.rowCount = rows.length;
+        item.latestBarDate = latestRow?.date || null;
+        successCount += 1;
+      } catch (error) {
+        item.status = "failed";
+        item.error = error.message;
+        failedCount += 1;
+      }
+      results.push(item);
+    }
+
+    const summary = {
+      jobName: DAILY_SYNC_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: candidates.length,
+      successCount,
+      failedCount,
+      results,
+    };
+    const status = failedCount ? (successCount ? "partial" : "failed") : "success";
+    await finishSyncRun(run.id, status, summary, failedCount && !successCount ? "all selected stocks failed" : null);
+    cachedDbData.clear();
+    return { ...summary, status };
+  } catch (error) {
+    const summary = {
+      jobName: DAILY_SYNC_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: results.length,
+      successCount: results.filter((item) => item.status === "synced").length,
+      failedCount: results.filter((item) => item.status === "failed").length,
+      results,
+    };
+    await finishSyncRun(run.id, "failed", summary, error.message);
+    throw error;
+  }
+}
+
+async function dailySyncPayload(query = {}, headers = {}) {
+  assertCronAuthorized(query, headers);
+  return runDailyKlineSync({
+    source: query.source,
+    strategy: query.strategy,
+    lookbackDays: query.lookbackDays,
+    maxStocks: query.maxStocks,
+    force: query.force,
+  });
+}
+
 function findTradingIndex(rows, date, useNext = false) {
   const exact = rows.findIndex((row) => row.date === date);
   if (exact >= 0) return useNext ? exact + 1 : exact;
@@ -1617,12 +1872,13 @@ function sendFile(res, requestPath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleApiRequest(pathname, query) {
+async function handleApiRequest(pathname, query, headers = {}) {
   if (pathname === "/api/overview") return overviewPayload(query);
   if (pathname === "/api/daily") return dailyPayload(query);
   if (pathname === "/api/timeline") return timelinePayload(query);
   if (pathname === "/api/stock-signals") return stockSignalsPayload(query);
   if (pathname === "/api/position") return positionPayload(query);
+  if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
   const error = new Error("Not found");
   error.statusCode = 404;
   throw error;
@@ -1633,7 +1889,7 @@ const server = http.createServer(async (req, res) => {
   const query = Object.fromEntries(parsed.searchParams.entries());
   try {
     if (parsed.pathname.startsWith("/api/")) {
-      sendJson(res, await handleApiRequest(parsed.pathname, query));
+      sendJson(res, await handleApiRequest(parsed.pathname, query, req.headers));
     } else {
       sendFile(res, parsed.pathname);
     }
@@ -1655,4 +1911,6 @@ module.exports = {
   timelinePayload,
   stockSignalsPayload,
   positionPayload,
+  dailySyncPayload,
+  runDailyKlineSync,
 };
