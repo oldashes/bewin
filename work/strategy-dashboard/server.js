@@ -3,8 +3,10 @@
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { Pool } = require("pg");
 
 const ROOT = path.resolve(__dirname, "../..");
+loadEnvFile(path.join(ROOT, ".env"));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const EVENTS_FILE = path.join(ROOT, "outputs/em-popularity-sector-filter-sweet-spot-events.csv");
 const HOT_EVENTS_FILE = path.join(ROOT, "outputs/em-popularity-backtest-events.csv");
@@ -15,6 +17,7 @@ const KLINE_DIR = path.join(ROOT, "work/cache/eastmoney-popularity-backtest/klin
 const STOCK_META_FILE = path.join(ROOT, "work/cache/strategy-dashboard/stock-meta.json");
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
+const DATA_MODE = process.env.DATA_MODE || "auto";
 
 const PSEUDO_BOARD_RE =
   /(百日|新高|新低|昨日|近期|最近|连板|涨停|打板|首板|触板|一字|破板|竞价|低价|高价|融资|沪股通|深股通|破净|红利|ST|季报|年报|预增|预盈|预亏|业绩|基金|重仓|成份|送转|转债|MSCI|富时|标普|证金|养老金)/;
@@ -46,9 +49,22 @@ const MIME_TYPES = {
 let cachedData;
 let cachedHotData;
 let cachedThsData;
+let cachedDbData = new Map();
 let cachedNames;
 let cachedStockMeta;
 let cachedTradingCalendar;
+let dbPool;
+
+function loadEnvFile(envPath) {
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key]) continue;
+    process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  }
+}
 
 const STRATEGIES = {
   early: {
@@ -236,6 +252,12 @@ function n(value) {
 }
 
 function normalizeDate(value) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
   const text = String(value || "").trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   if (/^\d{8}$/.test(text)) return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
@@ -865,10 +887,142 @@ function loadThsData() {
   return cachedThsData;
 }
 
-function loadDataForSource(rawSource, rawStrategy) {
+function shouldUseDatabase(sourceKey) {
+  return sourceKey === "em" && DATA_MODE !== "csv" && Boolean(process.env.DATABASE_URL);
+}
+
+function getDbPool() {
+  if (!dbPool) {
+    dbPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 3,
+    });
+  }
+  return dbPool;
+}
+
+async function loadDbData(sourceKey, strategyKey) {
+  const cacheKey = `${sourceKey}:${strategyKey}`;
+  if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
+
+  const { rows } = await getDbPool().query(
+    `
+      select
+        s.*,
+        st.exchange,
+        st.board,
+        st.industry,
+        st.region,
+        st.concepts,
+        st.listing_date
+      from strategy_signals s
+      left join stocks st on st.code = s.code
+      where s.source = $1 and s.strategy = $2
+      order by s.signal_date asc, s.rank asc nulls last
+    `,
+    [sourceKey, strategyKey],
+  );
+
+  const events = rows
+    .map((row) => dbRowToEvent(row, strategyKey))
+    .filter(Boolean)
+    .filter((event) => (strategyKey === "hot" ? isHotConfirmEvent(event) : true));
+
+  const data = finalizeData(events, "neon:strategy_signals", sourceKey, {
+    strategy: STRATEGIES[strategyKey],
+    description: `${DATA_SOURCES[sourceKey].label}，来自 Neon Postgres`,
+    sourceFile: "neon:strategy_signals",
+    available: events.length > 0,
+    message: events.length ? "" : "Neon 中暂无当前数据源和策略的信号记录。",
+  });
+  cachedDbData.set(cacheKey, data);
+  return data;
+}
+
+function dbRowToEvent(row, strategyKey) {
+  const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
+  const signalDate = normalizeDate(row.signal_date);
+  if (!code || !signalDate) return null;
+
+  const raw = row.raw && typeof row.raw === "object" ? row.raw : {};
+  const concepts = Array.isArray(row.concepts) ? row.concepts : [];
+  const baseName = row.name || raw.name || code;
+  const cachedMeta = enrichStockMeta(code, baseName, signalDate);
+  const meta = {
+    ...cachedMeta,
+    name: cachedMeta.name || baseName,
+    exchange: row.exchange || cachedMeta.exchange,
+    board: row.board || cachedMeta.board,
+    industry: row.industry || cachedMeta.industry,
+    region: row.region || cachedMeta.region,
+    concepts: concepts.length ? concepts : cachedMeta.concepts || [],
+    listingDate: normalizeDate(row.listing_date) || cachedMeta.listingDate,
+  };
+
+  const bestBoardType = row.best_board_type || raw.boardType || raw.bestBoardType || (meta.industry ? "industry" : "concept");
+  const bestBoardName =
+    row.best_board_name || raw.boardName || raw.bestBoardName || meta.industry || meta.concepts?.[0] || meta.board || "未分类";
+  const prev5 =
+    n(raw.prev5) ??
+    n(raw.stockPrev5) ??
+    (strategyKey === "hot" ? stockReturnBeforeSignal(code, signalDate, 5) : null);
+  const prev10 =
+    n(raw.prev10) ??
+    n(raw.stockPrev10) ??
+    (strategyKey === "hot" ? stockReturnBeforeSignal(code, signalDate, 10) : null);
+
+  const event = {
+    source: strategyKey === "hot" ? "Neon 热门确认" : raw.source === "最新候选" ? "Neon 最新候选" : "Neon 回测事件",
+    strategyKey,
+    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
+    code,
+    name: meta.name || baseName,
+    signalDate,
+    entryDate: normalizeDate(row.entry_date) || null,
+    exitDate5: normalizeDate(raw.exitDate5) || null,
+    exitDate10: normalizeDate(raw.exitDate10) || null,
+    exitDate20: normalizeDate(raw.exitDate20) || null,
+    rank: n(row.rank),
+    rank5: n(row.rank_5),
+    rank10: n(row.rank_10),
+    rank20: n(row.rank_20),
+    median5: n(raw.median5),
+    medianPrev5: n(raw.medianPrev5),
+    medianPrev10: n(raw.medianPrev10),
+    entryOpen: n(row.entry_open),
+    signalClose: n(row.signal_close),
+    prev5,
+    prev10,
+    amountRatio: n(row.amount_ratio),
+    turnover5: n(row.turnover_5),
+    ret5: n(row.ret_5),
+    ret10: n(row.ret_10),
+    ret20: n(row.ret_20),
+    boardCount: n(raw.boardCount),
+    bestBoardType,
+    bestBoardCode: row.best_board_code || raw.boardCode || raw.bestBoardCode || "",
+    bestBoardName,
+    bestBoardRet5: n(row.best_board_ret_5),
+    bestBoardRet10: n(raw.bestBoardRet10 || raw.boardRet10),
+    bestBoardAmountRatio: n(row.best_board_amount_ratio),
+    bestBoardScoreRankPct: n(raw.bestBoardScoreRankPct || raw.boardScoreRankPct),
+    hasStrongIndustry: bestBoardType === "industry" || raw.hasStrongIndustry === "true",
+    hasStrongConcept: bestBoardType === "concept" || raw.hasStrongConcept === "true",
+    meta,
+  };
+  event.strictBoard = !PSEUDO_BOARD_RE.test(event.bestBoardName || "");
+  event.score = n(row.score) ?? (strategyKey === "hot" ? scoreHotEvent(event) : scoreEvent(event));
+  event.modelScore = n(row.model_score) ?? n(raw.finalScore);
+  event.sortScore = event.modelScore ?? event.score;
+  event.riskFlags = strategyKey === "hot" ? hotRiskFlags(event) : riskFlags(event);
+  return event;
+}
+
+async function loadDataForSource(rawSource, rawStrategy) {
   const sourceKey = normalizeSourceKey(rawSource);
   const strategyKey = normalizeStrategyKey(rawStrategy);
   if (sourceKey === "ths") return loadThsData();
+  if (shouldUseDatabase(sourceKey)) return loadDbData(sourceKey, strategyKey);
   return strategyKey === "hot" ? loadHotData() : loadData();
 }
 
@@ -1003,8 +1157,8 @@ function dateStatus(requestedDate, selectedDate, tradingDates, signalDates) {
   };
 }
 
-function dailyPayload(query) {
-  const data = loadDataForSource(query.source, query.strategy);
+async function dailyPayload(query) {
+  const data = await loadDataForSource(query.source, query.strategy);
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const map = strict ? data.byDate : data.allByDate;
@@ -1040,8 +1194,8 @@ function dailyPayload(query) {
   };
 }
 
-function timelinePayload(query) {
-  const data = loadDataForSource(query.source, query.strategy);
+async function timelinePayload(query) {
+  const data = await loadDataForSource(query.source, query.strategy);
   const strict = query.strict !== "false";
   const dates = strict ? data.dates : data.allDates;
   const map = strict ? data.byDate : data.allByDate;
@@ -1056,8 +1210,8 @@ function timelinePayload(query) {
   });
 }
 
-function overviewPayload(query = {}) {
-  const data = loadDataForSource(query.source, query.strategy);
+async function overviewPayload(query = {}) {
+  const data = await loadDataForSource(query.source, query.strategy);
   const tradingDates = readTradingCalendar().filter(
     (date) => date >= (data.dates[0] || date) && date <= (data.dates[data.dates.length - 1] || date),
   );
@@ -1081,8 +1235,8 @@ function overviewPayload(query = {}) {
   };
 }
 
-function stockSignalsPayload(query = {}) {
-  const data = loadDataForSource(query.source, query.strategy);
+async function stockSignalsPayload(query = {}) {
+  const data = await loadDataForSource(query.source, query.strategy);
   const strict = query.strict !== "false";
   const rawQuery = String(query.code || query.q || "").trim();
   const code = rawQuery.match(/\d{6}/)?.[0] || "";
@@ -1345,18 +1499,18 @@ function sendFile(res, requestPath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const parsed = new URL(req.url, `http://${HOST}:${PORT}`);
   const query = Object.fromEntries(parsed.searchParams.entries());
   try {
     if (parsed.pathname === "/api/overview") {
-      sendJson(res, overviewPayload(query));
+      sendJson(res, await overviewPayload(query));
     } else if (parsed.pathname === "/api/daily") {
-      sendJson(res, dailyPayload(query));
+      sendJson(res, await dailyPayload(query));
     } else if (parsed.pathname === "/api/timeline") {
-      sendJson(res, timelinePayload(query));
+      sendJson(res, await timelinePayload(query));
     } else if (parsed.pathname === "/api/stock-signals") {
-      sendJson(res, stockSignalsPayload(query));
+      sendJson(res, await stockSignalsPayload(query));
     } else if (parsed.pathname === "/api/position") {
       positionPayload(query).then((payload) => sendJson(res, payload)).catch((error) => sendJson(res, { error: error.message }, 500));
     } else {

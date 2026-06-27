@@ -14,6 +14,21 @@ npm start
 http://127.0.0.1:4173
 ```
 
+如果根目录存在 `.env` 且配置了 `DATABASE_URL`，服务会优先从 Neon Postgres 读取策略信号。需要强制回到本地 CSV 时：
+
+```bash
+DATA_MODE=csv npm start
+```
+
+## Neon
+
+```bash
+npm run db:schema
+npm run db:import
+```
+
+`db:schema` 会创建表结构，`db:import` 会把当前 CSV 信号导入 Neon。
+
 ## 目录
 
 ```text
