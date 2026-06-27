@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>人气趋势策略看板</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!-- ===== TOP BAR ===== -->
+    <header class="topbar">
+      <div class="topbarBrand">
+        <div class="brandMark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M4 18V8l4 3 4-5 4 4 4-3v11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </div>
+        <div class="topbarLeft">
+          <p class="eyebrow">本地回测看板</p>
+          <h1>人气趋势策略</h1>
+        </div>
+      </div>
+
+      <div class="topbarControls">
+        <div class="controlGroup">
+          <div class="field">
+            <label for="dateInput">信号日期</label>
+            <input id="dateInput" type="date" />
+          </div>
+          <div class="buttonGroup" aria-label="日期切换">
+            <button id="prevDate" type="button" title="上一交易日">‹</button>
+            <button id="latestDate" type="button">最新</button>
+            <button id="nextDate" type="button" title="下一交易日">›</button>
+          </div>
+        </div>
+
+        <div class="controlDivider" aria-hidden="true"></div>
+
+        <div class="controlGroup">
+          <div class="field">
+            <label for="dataSourceSelect">数据源</label>
+            <select id="dataSourceSelect">
+              <option value="em">东方财富历史人气</option>
+              <option value="ths">同花顺本地积累</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="strategySelect">策略</label>
+            <select id="strategySelect">
+              <option value="early">早期发现</option>
+              <option value="hot">热门确认</option>
+            </select>
+          </div>
+          <label class="switch">
+            <input id="strictToggle" type="checkbox" checked />
+            <span>过滤伪板块</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="topbarRight">
+        <span id="sourceLabel" class="statusPill">读取中</span>
+        <span id="rangeLabel" class="statusPill muted">-</span>
+      </div>
+    </header>
+
+    <div id="dateStatusBanner" class="dateStatusBanner" hidden></div>
+
+    <!-- ===== DASHBOARD BODY: main + sidebar ===== -->
+    <main class="dashboard">
+      <div class="mainCol">
+        <!-- ZONE 1: At-a-glance stats -->
+        <div class="statsRow">
+          <article class="metric">
+            <span class="labelWithHelp">候选股票<button class="helpTip" type="button" data-tip="当前展示信号日下，满足策略条件并通过伪板块过滤的股票数量。">?</button></span>
+            <strong id="metricCount">-</strong>
+            <small id="metricMatured">-</small>
+          </article>
+          <article class="metric">
+            <span class="labelWithHelp">推荐板块<button class="helpTip" type="button" data-tip="按当日候选股所属最佳板块聚合后的板块数量，行业和概念分开统计。">?</button></span>
+            <strong id="metricBoards">-</strong>
+            <small>按候选股聚合</small>
+          </article>
+          <article class="metric">
+            <span class="labelWithHelp">5日均值 / 胜率<button class="helpTip" type="button" data-tip="按信号次一交易日开盘买入、持有5个交易日收盘卖出的收益统计；未到期样本不计入均值和胜率。">?</button></span>
+            <strong id="metricRet5">-</strong>
+            <small id="metricWin5">-</small>
+          </article>
+          <article class="metric">
+            <span class="labelWithHelp">20日均值 / 胜率<button class="helpTip" type="button" data-tip="按信号次一交易日开盘买入、持有20个交易日收盘卖出的收益统计；用于观察中期趋势兑现情况。">?</button></span>
+            <strong id="metricRet20">-</strong>
+            <small id="metricWin20">-</small>
+          </article>
+        </div>
+
+        <div class="signalBar">
+          <article class="signalItem">
+            <span class="labelWithHelp">首次 / 延续<button class="helpTip" type="button" data-tip="波段首次：同一股票超过15天未触发后重新触发；波段延续：15天内再次触发。">?</button></span>
+            <strong id="signalFirst">-</strong>
+            <small id="signalContinuation">-</small>
+          </article>
+          <article class="signalItem warn">
+            <span class="labelWithHelp">观察池<button class="helpTip" type="button" data-tip="延续信号、个股已加速或板块偏热时进入观察池；含义是趋势已成立但不宜机械追入。">?</button></span>
+            <strong id="signalWait">-</strong>
+            <small>不直接追</small>
+          </article>
+          <article class="signalItem">
+            <span class="labelWithHelp">过热提示<button class="helpTip" type="button" data-tip="左侧为个股已加速数量：个股近5日涨幅不低于20%；右侧为板块偏热数量：板块近5日涨幅不低于12%。">?</button></span>
+            <strong id="signalHeat">-</strong>
+            <small id="signalHeatDetail">-</small>
+          </article>
+          <article class="signalItem good">
+            <span class="labelWithHelp">二次启动<button class="helpTip" type="button" data-tip="左侧为已二次确认：观察池股票回踩后重新走强；右侧为直接走强：没有明显洗盘但继续上行。">?</button></span>
+            <strong id="signalConfirm">-</strong>
+            <small>回踩走强</small>
+          </article>
+        </div>
+
+        <!-- ZONE 2: Daily candidates table (core content) -->
+        <section class="panel tablePanel">
+          <div class="sectionHead">
+            <div>
+              <h2 id="dailyTitle">每日候选</h2>
+              <p id="dailySubtitle">-</p>
+            </div>
+            <button id="refreshButton" class="ghostButton" type="button">刷新</button>
+          </div>
+          <div class="tableWrap">
+            <table class="stockTable">
+              <thead>
+                <tr class="columnGroups">
+                  <th colspan="4" class="groupHead">标的</th>
+                  <th colspan="3" class="groupHead">人气</th>
+                  <th colspan="2" class="groupHead">板块</th>
+                  <th colspan="3" class="groupHead groupReturns">收益</th>
+                  <th class="groupHead">风险</th>
+                </tr>
+                <tr>
+                  <th>股票</th>
+                  <th>信号提示</th>
+                  <th>交易标签</th>
+                  <th>操作</th>
+                  <th>人气</th>
+                  <th>20日前</th>
+                  <th>量能</th>
+                  <th>板块</th>
+                  <th>板块5日</th>
+                  <th>5日</th>
+                  <th>10日</th>
+                  <th>20日</th>
+                  <th>风险</th>
+                </tr>
+              </thead>
+              <tbody id="stockRows"></tbody>
+            </table>
+          </div>
+          <div id="emptyState" class="emptyState" hidden>这一天没有符合当前过滤条件的候选。</div>
+        </section>
+
+        <!-- ZONE 3: Verifier (right below table — click 验证 in table, results appear here) -->
+        <section class="panel verifierPanel">
+          <div class="sectionHead">
+            <div>
+              <h2>买入收益验证</h2>
+              <p>输入股票和买入日期，计算持有收益</p>
+            </div>
+          </div>
+          <div class="verifierBody">
+            <form id="verifyForm" class="verifierToolbar" autocomplete="off">
+              <div class="field verifyField">
+                <label for="verifyCode">股票代码</label>
+                <input id="verifyCode" type="text" inputmode="numeric" placeholder="例如 605178" />
+              </div>
+              <div class="field verifyField">
+                <label for="verifyDate">买入日期</label>
+                <input id="verifyDate" type="date" />
+              </div>
+              <div class="field verifyField">
+                <label for="verifyEntry">买入方式</label>
+                <select id="verifyEntry">
+                  <option value="nextOpen">信号次日开盘</option>
+                  <option value="close">当日收盘</option>
+                  <option value="open">当日开盘</option>
+                </select>
+              </div>
+              <button id="verifyButton" class="primaryButton verifySubmit" type="submit">计算收益</button>
+            </form>
+            <div id="verifyResult" class="verifyResult">
+              <div class="emptyVerify">
+                <span class="emptyIcon" aria-hidden="true">↗</span>
+                <span>点击候选股「验证」，或输入代码与日期后计算持有收益。</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ZONE 4: Boards + Lookup -->
+        <div class="bottomRow">
+          <section class="panel">
+            <div class="sectionHead">
+              <div>
+                <h2>板块 / 行业推荐</h2>
+                <p>由当日候选股反推板块热度</p>
+              </div>
+            </div>
+            <div id="boardList" class="boardList"></div>
+          </section>
+
+          <section class="panel lookupPanel">
+            <div class="sectionHead">
+              <div>
+                <h2>股票信号查询</h2>
+                <p>查询某只股票历史是否被选中</p>
+              </div>
+            </div>
+            <div class="lookupBody">
+              <div class="lookupForm">
+                <div class="field">
+                  <label for="lookupInput">股票代码 / 名称</label>
+                  <input id="lookupInput" type="text" placeholder="例如 688519 或 南亚新材" />
+                </div>
+                <button id="lookupButton" class="primaryButton" type="button">查询信号</button>
+              </div>
+              <div id="lookupResult" class="lookupResult">
+                <div class="emptyVerify">输入股票代码或名称，查看历史命中。</div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- ===== SIDEBAR: Timeline + Rules (always visible) ===== -->
+      <aside class="sideCol">
+        <section class="panel timelinePanel">
+          <div class="sectionHead">
+            <div>
+              <h2>历史记录</h2>
+              <p>点击切换日期</p>
+            </div>
+          </div>
+          <div class="timeline" id="timeline"></div>
+        </section>
+
+        <section class="panel rulesPanel">
+          <div class="sectionHead compact">
+            <h2 id="ruleTitle">策略规则</h2>
+          </div>
+          <div class="ruleList" id="ruleList"></div>
+          <p class="note" id="ruleNote">
+            这里展示的是策略候选和事后验证，不等同于买卖建议。最近日期的 10 日、20 日结果可能还没有到期。
+          </p>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

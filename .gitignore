@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+*.log
+
+# Runtime cache. Keep locally, do not commit to GitHub.
+work/cache/
+
+# Generated screenshots and bulky visual artifacts.
+outputs/*.png
+outputs/*.jpg
+outputs/*.jpeg
+outputs/*.webp
+
+# Local environment.
+.env
+.env.*
+!.env.example
