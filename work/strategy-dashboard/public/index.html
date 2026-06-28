@@ -4,9 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>人气趋势策略看板</title>
+    <meta name="description" content="Bewin 人气趋势策略看板 — A股人气信号回测、每日候选、策略测评与收益验证" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -112,19 +113,6 @@
           </article>
         </div>
 
-        <section class="panel evaluationPanel">
-          <div class="sectionHead">
-            <div>
-              <h2>策略测评</h2>
-              <p id="evaluationSubtitle">按当前数据源、策略和过滤条件统计历史表现</p>
-            </div>
-            <button id="evaluationRefresh" class="ghostButton" type="button">重算</button>
-          </div>
-          <div id="evaluationBody" class="evaluationBody">
-            <div class="emptyState">等待加载测评结果。</div>
-          </div>
-        </section>
-
         <!-- ZONE 2: Daily candidates table (core content) -->
         <section class="panel tablePanel">
           <div class="sectionHead">
@@ -196,8 +184,8 @@
             </form>
             <div id="verifyResult" class="verifyResult">
               <div class="emptyVerify">
-                <span class="emptyIcon" aria-hidden="true">↗</span>
-                <span>点击候选股「验证」，或输入代码与日期后计算持有收益。</span>
+                <span class="emptyIcon" aria-hidden="true">⇗</span>
+                <span>点击候选股「验证」按钮，或在上方输入股票代码与买入日期，系统将自动计算持有收益、浮盈、回撤和相对指数表现。</span>
               </div>
             </div>
           </div>
@@ -231,7 +219,10 @@
                 <button id="lookupButton" class="primaryButton" type="button">查询信号</button>
               </div>
               <div id="lookupResult" class="lookupResult">
-                <div class="emptyVerify">输入股票代码或名称，查看历史命中。</div>
+                <div class="emptyVerify">
+                  <span class="emptyIcon" aria-hidden="true">🔍</span>
+                  <span>输入股票代码或名称，查看该股票在当前策略下的历史命中记录。</span>
+                </div>
               </div>
             </div>
           </section>
@@ -252,50 +243,109 @@
 
         <section class="panel rulesPanel">
           <div class="sectionHead compact">
-            <h2 id="ruleTitle">策略规则</h2>
+            <h2>策略配置</h2>
           </div>
-          <div class="ruleList" id="ruleList"></div>
-          <p class="note" id="ruleNote">
-            这里展示的是策略候选和事后验证，不等同于买卖建议。最近日期的 10 日、20 日结果可能还没有到期。
-          </p>
           <div class="strategyEditor">
             <div class="strategyEditorHead">
-              <strong>策略参数</strong>
+              <strong>当前策略</strong>
               <span id="strategyEditMode">保存后生成自定义策略</span>
             </div>
-            <div class="field">
-              <label for="strategySelect">当前策略 / 已保存策略</label>
-              <select id="strategySelect">
-                <option value="early">早期发现</option>
-                <option value="hot">热门确认</option>
-              </select>
+
+            <div class="strategyCurrentCard">
+              <div class="strategyCurrentTitle">
+                <span>当前使用</span>
+                <strong id="ruleTitle">-</strong>
+              </div>
+              <div class="field">
+                <label for="strategySelect">策略选择</label>
+                <select id="strategySelect">
+                  <option value="early">早期发现</option>
+                  <option value="hot">热门确认</option>
+                </select>
+              </div>
+              <div class="strategyModalActions">
+                <button id="openEvaluationModal" class="ghostButton" type="button">策略测评</button>
+                <button id="openAttributionModal" class="ghostButton" type="button">自归因 Agent</button>
+              </div>
+              <div id="strategyEvaluationSummary" class="strategyEvaluationSummary">测评结果加载中。</div>
             </div>
-            <div class="field">
-              <label for="strategyNameInput">策略名称</label>
-              <input id="strategyNameInput" type="text" placeholder="我的策略" />
+
+            <div class="strategyRulesSummary">
+              <div class="strategySectionTitle">
+                <strong>规则摘要</strong>
+              </div>
+              <div class="ruleList" id="ruleList"></div>
+              <p class="note" id="ruleNote">
+                这里展示的是策略候选和事后验证，不等同于买卖建议。最近日期的 10 日、20 日结果可能还没有到期。
+              </p>
             </div>
+
+            <div class="strategyParamBlock">
+              <div class="strategySectionTitle">
+                <strong>策略参数</strong>
+                <span>需要微调时再展开</span>
+              </div>
+              <div class="field">
+                <label for="strategyNameInput">策略名称</label>
+                <input id="strategyNameInput" type="text" placeholder="我的策略" />
+              </div>
+              <button id="advancedParamsToggle" class="advancedParamsToggle" type="button" aria-expanded="false">
+                展开高级参数
+              </button>
+              <div id="strategyAdvancedParams" class="strategyAdvancedParams" hidden>
+                <div id="strategyParamGrid" class="strategyParamGrid"></div>
+              </div>
+              <div class="strategyEditorActions">
+                <button id="saveStrategyButton" class="primaryButton" type="button">保存并重算</button>
+                <button id="resetStrategyButton" class="ghostButton" type="button">恢复当前策略参数</button>
+              </div>
+              <p id="strategySaveStatus" class="strategySaveStatus"></p>
+            </div>
+
             <div class="strategyPresetBlock">
               <div class="strategyPresetHead">
-                <strong>推荐预设</strong>
+                <strong>策略预设</strong>
                 <span>先选方向，再按需微调</span>
               </div>
               <div id="strategyPresetList" class="strategyPresetList"></div>
             </div>
-            <button id="advancedParamsToggle" class="advancedParamsToggle" type="button" aria-expanded="false">
-              展开高级参数
-            </button>
-            <div id="strategyAdvancedParams" class="strategyAdvancedParams" hidden>
-              <div id="strategyParamGrid" class="strategyParamGrid"></div>
-            </div>
-            <div class="strategyEditorActions">
-              <button id="saveStrategyButton" class="primaryButton" type="button">保存并重算</button>
-              <button id="resetStrategyButton" class="ghostButton" type="button">恢复当前策略参数</button>
-            </div>
-            <p id="strategySaveStatus" class="strategySaveStatus"></p>
           </div>
         </section>
       </aside>
     </main>
+
+    <div id="evaluationModal" class="modalBackdrop" hidden>
+      <section class="modalPanel" role="dialog" aria-modal="true" aria-labelledby="evaluationModalTitle">
+        <header class="modalHeader">
+          <div>
+            <h2 id="evaluationModalTitle">策略测评</h2>
+            <p id="evaluationSubtitle">按当前数据源、策略和过滤条件统计历史表现</p>
+          </div>
+          <div class="modalActions">
+            <button id="evaluationRefresh" class="ghostButton" type="button">重算</button>
+            <button class="modalClose" type="button" data-close-modal>关闭</button>
+          </div>
+        </header>
+        <div id="evaluationBody" class="evaluationBody modalBody">
+          <div class="emptyState">等待加载测评结果。</div>
+        </div>
+      </section>
+    </div>
+
+    <div id="attributionModal" class="modalBackdrop" hidden>
+      <section class="modalPanel attributionModalPanel" role="dialog" aria-modal="true" aria-labelledby="attributionModalTitle">
+        <header class="modalHeader">
+          <div>
+            <h2 id="attributionModalTitle">自归因 Agent</h2>
+            <p id="attributionSubtitle">自动分析失败样本的共同标签，用于辅助策略复盘。</p>
+          </div>
+          <button class="modalClose" type="button" data-close-modal>关闭</button>
+        </header>
+        <div id="attributionBody" class="attributionModalBody modalBody">
+          <div class="emptyState">等待加载归因结果。</div>
+        </div>
+      </section>
+    </div>
 
     <script src="/app.js"></script>
   </body>

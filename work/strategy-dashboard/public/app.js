@@ -175,6 +175,12 @@ const els = {
   evaluationSubtitle: document.querySelector("#evaluationSubtitle"),
   evaluationRefresh: document.querySelector("#evaluationRefresh"),
   evaluationBody: document.querySelector("#evaluationBody"),
+  evaluationModal: document.querySelector("#evaluationModal"),
+  attributionModal: document.querySelector("#attributionModal"),
+  openEvaluationModal: document.querySelector("#openEvaluationModal"),
+  openAttributionModal: document.querySelector("#openAttributionModal"),
+  attributionSubtitle: document.querySelector("#attributionSubtitle"),
+  attributionBody: document.querySelector("#attributionBody"),
   dailyTitle: document.querySelector("#dailyTitle"),
   dailySubtitle: document.querySelector("#dailySubtitle"),
   stockRows: document.querySelector("#stockRows"),
@@ -190,6 +196,7 @@ const els = {
   advancedParamsToggle: document.querySelector("#advancedParamsToggle"),
   strategyAdvancedParams: document.querySelector("#strategyAdvancedParams"),
   strategyEditMode: document.querySelector("#strategyEditMode"),
+  strategyEvaluationSummary: document.querySelector("#strategyEvaluationSummary"),
   saveStrategyButton: document.querySelector("#saveStrategyButton"),
   resetStrategyButton: document.querySelector("#resetStrategyButton"),
   strategySaveStatus: document.querySelector("#strategySaveStatus"),
@@ -412,15 +419,22 @@ async function loadTimeline() {
 }
 
 async function loadEvaluation() {
-  if (!els.evaluationBody) return;
-  els.evaluationBody.innerHTML = '<div class="emptyState">测评计算中...</div>';
+  if (!els.evaluationBody && !els.attributionBody) return;
+  const loadingHtml =
+    '<div class="emptyState"><span class="emptyIcon" aria-hidden="true">⚙</span><span>测评计算中，请稍候…</span></div>';
+  if (els.evaluationBody) els.evaluationBody.innerHTML = loadingHtml;
+  if (els.attributionBody) els.attributionBody.innerHTML = loadingHtml;
+  if (els.strategyEvaluationSummary) els.strategyEvaluationSummary.textContent = "测评计算中，请稍候。";
   try {
     const payload = await getJson(
       `/api/evaluation?strict=${state.strict ? "true" : "false"}&source=${encodeURIComponent(state.dataSource)}&strategy=${encodeURIComponent(state.strategy)}`,
     );
     renderEvaluation(payload);
   } catch (error) {
-    els.evaluationBody.innerHTML = `<div class="emptyState">测评失败：${html(error.message)}</div>`;
+    const errorHtml = `<div class="emptyState"><span class="emptyIcon" aria-hidden="true">!</span><span>测评失败：${html(error.message)}</span></div>`;
+    if (els.evaluationBody) els.evaluationBody.innerHTML = errorHtml;
+    if (els.attributionBody) els.attributionBody.innerHTML = errorHtml;
+    if (els.strategyEvaluationSummary) els.strategyEvaluationSummary.textContent = `测评失败：${error.message}`;
   }
 }
 
@@ -474,7 +488,7 @@ function renderDaily(payload) {
   if (!els.verifyDate.value && payload.selectedDate) els.verifyDate.value = payload.selectedDate;
   els.dailySubtitle.textContent = dateStatusText(payload);
 
-  els.stockRows.innerHTML = stocks.map(renderStockRow).join("");
+  els.stockRows.innerHTML = stocks.map((stock, index) => renderStockRow(stock, index)).join("");
   els.emptyState.hidden = stocks.length > 0;
   renderBoards(boards);
   updateNavButtons();
@@ -675,7 +689,7 @@ async function saveStrategyFromEditor() {
   }
 }
 
-function renderStockRow(stock) {
+function renderStockRow(stock, index = 0) {
   const riskItems = [...(stock.riskTags || []), ...(stock.riskFlags || [])];
   const flags = riskItems.length
     ? compactTags(riskItems, 4)
@@ -689,7 +703,7 @@ function renderStockRow(stock) {
         ? `模型 ${Math.round(stock.modelScore)} / 评分 ${stock.score}`
         : `评分 ${stock.score}`;
   return `
-    <tr data-code="${html(stock.code)}" class="${state.focusCode === stock.code ? "focusedRow" : ""}">
+    <tr data-code="${html(stock.code)}" class="animate-in ${state.focusCode === stock.code ? "focusedRow" : ""}" style="--i:${index}">
       <td>
         <div class="stockName">
           <a href="${quoteUrl(stock)}" target="_blank" rel="noreferrer">${html(stock.name)}</a>
@@ -762,12 +776,12 @@ function normalizeVerifyHorizons(horizons = []) {
 async function verifyPosition(code = els.verifyCode.value, date = els.verifyDate.value) {
   const cleanCode = String(code || "").trim();
   if (!cleanCode || !date) {
-    els.verifyResult.innerHTML = '<div class="emptyVerify">请先输入股票代码和买入日期。</div>';
+    els.verifyResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">⚠</span><span>请先输入股票代码和买入日期。</span></div>';
     return;
   }
   els.verifyCode.value = cleanCode;
   els.verifyDate.value = date;
-  els.verifyResult.innerHTML = '<div class="emptyVerify">计算中...</div>';
+  els.verifyResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">⚙</span><span>计算中，请稍候…</span></div>';
   const params = new URLSearchParams({
     code: cleanCode,
     date,
@@ -777,18 +791,18 @@ async function verifyPosition(code = els.verifyCode.value, date = els.verifyDate
     const payload = await getJson(`/api/position?${params.toString()}`);
     renderVerifyResult(payload);
   } catch (error) {
-    els.verifyResult.innerHTML = `<div class="emptyVerify">计算失败：${html(error.message)}</div>`;
+    els.verifyResult.innerHTML = `<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">!</span><span>计算失败：${html(error.message)}</span></div>`;
   }
 }
 
 async function lookupStockSignals(value = els.lookupInput.value) {
   const keyword = String(value || "").trim();
   if (!keyword) {
-    els.lookupResult.innerHTML = '<div class="emptyVerify">请输入股票代码或名称。</div>';
+    els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">⚠</span><span>请输入股票代码或名称。</span></div>';
     return;
   }
   els.lookupInput.value = keyword;
-  els.lookupResult.innerHTML = '<div class="emptyVerify">查询中...</div>';
+  els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>查询中，请稍候…</span></div>';
   const params = new URLSearchParams({
     q: keyword,
     strict: state.strict ? "true" : "false",
@@ -799,20 +813,20 @@ async function lookupStockSignals(value = els.lookupInput.value) {
     const payload = await getJson(`/api/stock-signals?${params.toString()}`);
     renderLookupResult(payload);
   } catch (error) {
-    els.lookupResult.innerHTML = `<div class="emptyVerify">查询失败：${html(error.message)}</div>`;
+    els.lookupResult.innerHTML = `<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">!</span><span>查询失败：${html(error.message)}</span></div>`;
   }
 }
 
 function renderLookupResult(payload) {
   if (!payload.count) {
-    els.lookupResult.innerHTML = `<div class="emptyVerify">${html(payload.message || "没有查到历史信号。")}</div>`;
+    els.lookupResult.innerHTML = `<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">?</span><span>${html(payload.message || "没有查到历史信号。")}</span></div>`;
     return;
   }
   const sourceName = payload.dataSource?.shortLabel || payload.dataSource?.label || "当前数据源";
   const cards = payload.matches
     .map(
-      (item) => `
-        <article class="signalHitCard">
+      (item, index) => `
+        <article class="signalHitCard animate-in" style="--i:${index}">
           <div class="signalHitTop">
             <button class="miniButton openSignal" type="button" data-date="${html(item.signalDate)}" data-code="${html(item.code)}">查看</button>
             <div class="signalHitDate">
@@ -957,16 +971,18 @@ function compactTags(tags = [], limit = 3) {
 }
 
 function renderEvaluation(payload) {
-  if (!els.evaluationBody) return;
+  if (!els.evaluationBody && !els.attributionBody) return;
   const strategyName = payload.dataStrategy?.shortLabel || payload.dataStrategy?.label || "当前策略";
   const baselineName = payload.baseline?.available ? "含随机基准" : "无随机基准";
-  els.evaluationSubtitle.textContent = `${strategyName} · ${payload.sampleCount} 个样本 · ${payload.dateCount} 个信号日 · ${baselineName}`;
+  if (els.evaluationSubtitle) {
+    els.evaluationSubtitle.textContent = `${strategyName} · ${payload.sampleCount} 个样本 · ${payload.dateCount} 个信号日 · ${baselineName}`;
+  }
   const horizonCards = (payload.horizons || [])
-    .map((item) => {
+    .map((item, index) => {
       const baseline = item.baseline || {};
       const excess = item.excess || {};
       return `
-        <article class="evaluationCard">
+        <article class="evaluationCard animate-in" style="--i:${index}">
           <header>
             <strong>${html(item.label)}</strong>
             <span>${item.maturedCount}/${item.sampleCount} 到期</span>
@@ -998,8 +1014,16 @@ function renderEvaluation(payload) {
   const feature = payload.featureStats || {};
   const worst = payload.daily?.worst20?.[0] || payload.daily?.worst5?.[0] || null;
   const best = payload.daily?.best20?.[0] || payload.daily?.best5?.[0] || null;
+  const ret5 = (payload.horizons || []).find((item) => item.key === "ret5");
   const ret20 = (payload.horizons || []).find((item) => item.key === "ret20");
   const targetPassed = (ret20?.excess?.avg ?? -Infinity) >= 0.15 && (ret20?.excess?.winRate ?? -Infinity) >= 0.15;
+  if (els.strategyEvaluationSummary) {
+    els.strategyEvaluationSummary.innerHTML = `
+      <span>5日均值 <b class="${pctClass(ret5?.avg)}">${metricValue(ret5?.avg)}</b></span>
+      <span>5日胜率 <b>${metricValue(ret5?.winRate, (value) => pct(value, 1))}</b></span>
+      <span>20日超额 <b class="${pctClass(ret20?.excess?.avg)}">${metricValue(ret20?.excess?.avg, (value) => signedPp(value, 1))}</b></span>
+    `;
+  }
   const attribution = payload.selfAttribution || {};
   const attrCounts = attribution.counts || {};
   const strengthRows = attribution.strengthBands || [];
@@ -1076,89 +1100,94 @@ function renderEvaluation(payload) {
         )
         .join("")
     : '<div class="emptyState compact">当前周期没有已到期失败样本。</div>';
-  els.evaluationBody.innerHTML = `
-    <div class="evaluationSummary">
-      <div>
-        <span>样本/日期</span>
-        <strong>${payload.sampleCount} / ${payload.dateCount}</strong>
-        <small>日均 ${number(payload.avgCandidatesPerDate, 1)} 只候选</small>
-      </div>
-      <div>
-        <span>20日超额目标</span>
-        <strong class="${targetPassed ? "up" : "neutral"}">${targetPassed ? "已达标" : "未达标"}</strong>
-        <small>收益 ${metricValue(ret20?.excess?.avg, (value) => signedPp(value, 1))} / 胜率 ${metricValue(ret20?.excess?.winRate, (value) => signedPp(value, 1))}</small>
-      </div>
-      <div>
-        <span>平均上移</span>
-        <strong>${number(feature.avgRankDelta20, 0)}</strong>
-        <small>中位 ${number(feature.medianRankDelta20, 0)}</small>
-      </div>
-      <div>
-        <span>量能中位</span>
-        <strong>${number(feature.medianAmountRatio)}x</strong>
-        <small>板块5日中位 ${metricValue(feature.medianBoardRet5)}</small>
-      </div>
-      <div>
-        <span>最好/最差日</span>
-        <strong class="${pctClass(best?.avg)}">${best ? metricValue(best.avg) : "-"}</strong>
-        <small>${best?.date || "-"} / ${worst?.date || "-"}</small>
-      </div>
-    </div>
-    <div class="evaluationCards">${horizonCards}</div>
-    <section class="attributionPanel">
-      <div class="attributionHead">
-        <div>
-          <h3>自归因 Agent</h3>
-          <p>${html(attribution.definition || "自动分析失败样本的共同标签，用于辅助策略复盘。")}</p>
+  if (els.evaluationBody) {
+    els.evaluationBody.innerHTML = `
+      <div class="evaluationSummary">
+        <div class="animate-in" style="--i:0">
+          <span>样本/日期</span>
+          <strong>${payload.sampleCount} / ${payload.dateCount}</strong>
+          <small>日均 ${number(payload.avgCandidatesPerDate, 1)} 只候选</small>
+        </div>
+        <div class="animate-in" style="--i:1">
+          <span>20日超额目标</span>
+          <strong class="${targetPassed ? "up" : "neutral"}">${targetPassed ? "已达标" : "未达标"}</strong>
+          <small>收益 ${metricValue(ret20?.excess?.avg, (value) => signedPp(value, 1))} / 胜率 ${metricValue(ret20?.excess?.winRate, (value) => signedPp(value, 1))}</small>
+        </div>
+        <div class="animate-in" style="--i:2">
+          <span>平均上移</span>
+          <strong>${number(feature.avgRankDelta20, 0)}</strong>
+          <small>中位 ${number(feature.medianRankDelta20, 0)}</small>
+        </div>
+        <div class="animate-in" style="--i:3">
+          <span>量能中位</span>
+          <strong>${number(feature.medianAmountRatio)}x</strong>
+          <small>板块5日中位 ${metricValue(feature.medianBoardRet5)}</small>
+        </div>
+        <div class="animate-in" style="--i:4">
+          <span>最好/最差日</span>
+          <strong class="${pctClass(best?.avg)}">${best ? metricValue(best.avg) : "-"}</strong>
+          <small>${best?.date || "-"} / ${worst?.date || "-"}</small>
         </div>
       </div>
-      <div class="attributionStats">
-        ${renderAttrStat("20日失败", `${attrCounts.absoluteFailureCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "绝对收益<0", "down")}
-        ${renderAttrStat("跑输市场", `${attrCounts.marketUnderperformCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "低于同日全市场基准", "down")}
-        ${renderAttrStat("弱收益", `${attrCounts.weakPositiveCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "0%-5% 区间", "neutral")}
-        ${renderAttrStat("整体超额", metricValue(attribution.overall?.marketExcessAvg, (value) => signedPp(value, 1)), "相对同日市场基准", pctClass(attribution.overall?.marketExcessAvg))}
-      </div>
-      <div class="attributionGrid">
-        <div class="attrBlock">
-          <h4>信号强度分层</h4>
-          <div class="attrTable attrTable5">
-            <div class="attrHeader"><span>等级</span><b>样本</b><b>20日</b><b>胜率</b><b>超额</b></div>
-            ${strengthHtml || '<div class="emptyState compact">暂无评分数据。</div>'}
+      <div class="evaluationCards">${horizonCards}</div>
+    `;
+  }
+
+  if (els.attributionSubtitle) {
+    els.attributionSubtitle.textContent = attribution.definition || "自动分析失败样本的共同标签，用于辅助策略复盘。";
+  }
+  if (els.attributionBody) {
+    els.attributionBody.innerHTML = `
+      <section class="attributionPanel">
+        <div class="attributionStats">
+          ${renderAttrStat("20日失败", `${attrCounts.absoluteFailureCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "绝对收益<0", "down")}
+          ${renderAttrStat("跑输市场", `${attrCounts.marketUnderperformCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "低于同日全市场基准", "down")}
+          ${renderAttrStat("弱收益", `${attrCounts.weakPositiveCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "0%-5% 区间", "neutral")}
+          ${renderAttrStat("整体超额", metricValue(attribution.overall?.marketExcessAvg, (value) => signedPp(value, 1)), "相对同日市场基准", pctClass(attribution.overall?.marketExcessAvg))}
+        </div>
+        <div class="attributionGrid">
+          <div class="attrBlock">
+            <h4>信号强度分层</h4>
+            <div class="attrTable attrTable5">
+              <div class="attrHeader"><span>等级</span><b>样本</b><b>20日</b><b>胜率</b><b>超额</b></div>
+              ${strengthHtml || '<div class="emptyState compact">暂无评分数据。</div>'}
+            </div>
+          </div>
+          <div class="attrBlock">
+            <h4>失败标签分组</h4>
+            <div class="attrTable attrTable5">
+              <div class="attrHeader"><span>标签</span><b>样本</b><b>20日</b><b>失败</b><b>超额</b></div>
+              ${tagHtml || '<div class="emptyState compact">暂无可统计标签。</div>'}
+            </div>
+          </div>
+          <div class="attrBlock">
+            <h4>可验证假设</h4>
+            <div class="hypothesisList">${hypothesisHtml}</div>
+          </div>
+          <div class="attrBlock">
+            <h4>失败样本</h4>
+            <div class="failureList">${failureHtml}</div>
           </div>
         </div>
-        <div class="attrBlock">
-          <h4>失败标签分组</h4>
-          <div class="attrTable attrTable5">
-            <div class="attrHeader"><span>标签</span><b>样本</b><b>20日</b><b>失败</b><b>超额</b></div>
-            ${tagHtml || '<div class="emptyState compact">暂无可统计标签。</div>'}
-          </div>
-        </div>
-        <div class="attrBlock">
-          <h4>可验证假设</h4>
-          <div class="hypothesisList">${hypothesisHtml}</div>
-        </div>
-        <div class="attrBlock">
-          <h4>失败样本</h4>
-          <div class="failureList">${failureHtml}</div>
-        </div>
-      </div>
-    </section>
-  `;
+      </section>
+    `;
+  }
 }
 
 function renderBoards(boards) {
   if (!boards.length) {
-    els.boardList.innerHTML = '<div class="emptyState">这一天没有板块聚合结果。</div>';
+    els.boardList.innerHTML =
+      '<div class="emptyState"><span class="emptyIcon" aria-hidden="true">-</span><span>这一天没有板块聚合结果。</span></div>';
     return;
   }
   els.boardList.innerHTML = boards
-    .map((board) => {
+    .map((board, index) => {
       const stocks = board.stocks
         .slice(0, 6)
         .map((stock) => `<span class="chip">${html(stock.name)}</span>`)
         .join("");
       return `
-        <div class="boardItem">
+        <div class="boardItem animate-in" style="--i:${index}">
           <div class="boardTitle">
             <strong>${html(board.name)}</strong>
             <small>${boardTypeLabel(board.type)} / ${board.stockCount} 只候选</small>
@@ -1184,28 +1213,29 @@ function renderBoards(boards) {
 
 function renderTimeline() {
   if (!state.timeline.length) {
-    els.timeline.innerHTML = '<div class="emptyState">暂无历史记录。</div>';
+    els.timeline.innerHTML =
+      '<div class="emptyState"><span class="emptyIcon" aria-hidden="true">-</span><span>暂无历史记录。</span></div>';
     return;
   }
   const maxCount = Math.max(...state.timeline.map((row) => row.count), 1);
   const header = `
     <div class="timelineHeader">
-      <span class="timelineHeadLabel">信号日期<button class="helpTip" type="button" data-tip="策略在该交易日生成候选股票的日期。点击某一行可以切换到该日详情。">?</button></span>
-      <span class="timelineHeadLabel">候选数<button class="helpTip" type="button" data-tip="该信号日期下，满足当前过滤条件的候选股票数量。开启过滤伪板块时，伪概念板块会被排除。">?</button></span>
-      <span class="timelineHeadLabel">候选强度<button class="helpTip" type="button" data-tip="按当前历史列表里最大候选数归一化后的条形图，用来观察每天信号密度，不代表收益强弱。">?</button></span>
-      <span class="timelineHeadLabel">5日均值<button class="helpTip" type="button" data-tip="当日全部候选按信号次一交易日开盘买入、持有5个交易日收盘卖出的平均收益；未到期样本显示为未到期。">?</button></span>
-      <span class="timelineHeadLabel">20日均值<button class="helpTip" type="button" data-tip="当日全部候选按信号次一交易日开盘买入、持有20个交易日收盘卖出的平均收益，用来观察中期兑现情况。">?</button></span>
+      <span class="timelineHeadLabel"><span class="timelineHeadText" data-short="日期">信号日期</span><button class="helpTip" type="button" data-tip="策略在该交易日生成候选股票的日期。点击某一行可以切换到该日详情。">?</button></span>
+      <span class="timelineHeadLabel"><span class="timelineHeadText" data-short="数">候选数</span><button class="helpTip" type="button" data-tip="该信号日期下，满足当前过滤条件的候选股票数量。开启过滤伪板块时，伪概念板块会被排除。">?</button></span>
+      <span class="timelineHeadLabel"><span class="timelineHeadText" data-short="强度">候选强度</span><button class="helpTip" type="button" data-tip="按当前历史列表里最大候选数归一化后的条形图，用来观察每天信号密度，不代表收益强弱。">?</button></span>
+      <span class="timelineHeadLabel"><span class="timelineHeadText" data-short="5日">5日均值</span><button class="helpTip" type="button" data-tip="当日全部候选按信号次一交易日开盘买入、持有5个交易日收盘卖出的平均收益；未到期样本显示为未到期。">?</button></span>
+      <span class="timelineHeadLabel"><span class="timelineHeadText" data-short="20日">20日均值</span><button class="helpTip" type="button" data-tip="当日全部候选按信号次一交易日开盘买入、持有20个交易日收盘卖出的平均收益，用来观察中期兑现情况。">?</button></span>
     </div>
   `;
   const rows = state.timeline
     .slice()
     .reverse()
-    .map((row) => {
+    .map((row, index) => {
       const active = row.date === state.selectedDate ? "active" : "";
       const width = Math.max(6, Math.round((row.count / maxCount) * 100));
       const boards = row.topBoards?.length ? row.topBoards.join("、") : "-";
       return `
-        <div class="timelineRow ${active}" data-date="${row.date}" role="button" tabindex="0">
+        <div class="timelineRow animate-in ${active}" data-date="${row.date}" role="button" tabindex="0" style="--i:${index}">
           <strong>${row.date}</strong>
           <span>${row.count} 只</span>
           <div title="${html(boards)}">
@@ -1244,6 +1274,23 @@ function adjacentCalendarDate(dates, current, step) {
   return earlier[earlier.length - 1] || null;
 }
 
+function openModal(modal) {
+  if (!modal) return;
+  closeModal(els.evaluationModal);
+  closeModal(els.attributionModal);
+  modal.hidden = false;
+  document.body.classList.add("modalOpen");
+  modal.querySelector(".modalClose")?.focus();
+}
+
+function closeModal(modal) {
+  if (!modal || modal.hidden) return;
+  modal.hidden = true;
+  if ([els.evaluationModal, els.attributionModal].every((item) => !item || item.hidden)) {
+    document.body.classList.remove("modalOpen");
+  }
+}
+
 async function reloadAll(date = state.selectedDate) {
   await loadOverview();
   await loadTimeline();
@@ -1260,16 +1307,28 @@ function initEvents() {
   );
   els.dataSourceSelect.addEventListener("change", async () => {
     state.dataSource = els.dataSourceSelect.value;
-    els.lookupResult.innerHTML = '<div class="emptyVerify">输入股票代码或名称，查看历史命中日期和后续收益。</div>';
+    els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>输入股票代码或名称，查看该股票在当前策略下的历史命中记录。</span></div>';
     await reloadAll(els.dateInput.value || state.selectedDate);
   });
   els.strategySelect.addEventListener("change", async () => {
     state.strategy = els.strategySelect.value;
-    els.lookupResult.innerHTML = '<div class="emptyVerify">策略模式已变化，请重新查询。</div>';
+    els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>策略模式已变化，请重新查询。</span></div>';
     await reloadAll(els.dateInput.value || state.selectedDate);
   });
   els.refreshButton.addEventListener("click", () => reloadAll(state.selectedDate));
   els.evaluationRefresh?.addEventListener("click", () => loadEvaluation());
+  els.openEvaluationModal?.addEventListener("click", () => openModal(els.evaluationModal));
+  els.openAttributionModal?.addEventListener("click", () => openModal(els.attributionModal));
+  [els.evaluationModal, els.attributionModal].forEach((modal) => {
+    modal?.addEventListener("click", (event) => {
+      if (event.target === modal || event.target.closest("[data-close-modal]")) closeModal(modal);
+    });
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    closeModal(els.evaluationModal);
+    closeModal(els.attributionModal);
+  });
   els.saveStrategyButton?.addEventListener("click", () => saveStrategyFromEditor());
   els.resetStrategyButton?.addEventListener("click", () => renderStrategyEditor(state.currentStrategy));
   els.advancedParamsToggle?.addEventListener("click", () => {
@@ -1299,7 +1358,7 @@ function initEvents() {
   });
   els.strictToggle.addEventListener("change", async () => {
     state.strict = els.strictToggle.checked;
-    els.lookupResult.innerHTML = '<div class="emptyVerify">过滤条件已变化，请重新查询。</div>';
+    els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>过滤条件已变化，请重新查询。</span></div>';
     await reloadAll(state.selectedDate);
   });
   els.timeline.addEventListener("click", (event) => {
@@ -1331,9 +1390,9 @@ async function boot() {
   try {
     await reloadAll(date);
   } catch (error) {
-    document.body.innerHTML = `<main class="layout"><section class="panel"><div class="emptyState">加载失败：${html(
+    document.body.innerHTML = `<main class="layout"><section class="panel"><div class="emptyState"><span class="emptyIcon" aria-hidden="true">!</span><span>加载失败：${html(
       error.message,
-    )}</div></section></main>`;
+    )}</span></div></section></main>`;
   }
 }
 
