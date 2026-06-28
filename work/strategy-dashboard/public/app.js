@@ -676,14 +676,18 @@ async function saveStrategyFromEditor() {
 }
 
 function renderStockRow(stock) {
-  const flags = stock.riskFlags?.length
-    ? stock.riskFlags.map((flag) => `<span class="chip warn">${html(flag)}</span>`).join("")
+  const riskItems = [...(stock.riskTags || []), ...(stock.riskFlags || [])];
+  const flags = riskItems.length
+    ? compactTags(riskItems, 4)
     : '<span class="chip">正常</span>';
   const rankDelta = stock.rank20 && stock.rank ? stock.rank20 - stock.rank : null;
+  const strength = stock.signalStrength;
   const scoreText =
-    stock.modelScore !== null && stock.modelScore !== undefined
-      ? `模型 ${Math.round(stock.modelScore)} / 评分 ${stock.score}`
-      : `评分 ${stock.score}`;
+    strength?.score !== undefined
+      ? `强度 ${strength.score} / ${strength.label}`
+      : stock.modelScore !== null && stock.modelScore !== undefined
+        ? `模型 ${Math.round(stock.modelScore)} / 评分 ${stock.score}`
+        : `评分 ${stock.score}`;
   return `
     <tr data-code="${html(stock.code)}" class="${state.focusCode === stock.code ? "focusedRow" : ""}">
       <td>
@@ -705,7 +709,7 @@ function renderStockRow(stock) {
       </td>
       <td><div class="chipRow metaChips">${renderMetaChips(stock.meta)}</div></td>
       <td><button class="miniButton verifyStock" data-code="${html(stock.code)}" data-date="${html(stock.signalDate)}" type="button">验证</button></td>
-      <td><div class="rankCell"><span>${stock.rank ?? "-"}</span><span class="score">+${rankDelta ?? "-"}</span></div></td>
+      <td><div class="rankCell"><span>${stock.rank ?? "-"}</span><span class="score ${scoreTone(strength?.score)}">${strength?.score ?? `+${rankDelta ?? "-"}`}</span></div></td>
       <td>${stock.rank20 ?? "-"}</td>
       <td>${number(stock.amountRatio)}x</td>
       <td>${html(stock.bestBoardName)} <span class="neutral">(${boardTypeLabel(stock.bestBoardType)})</span></td>
@@ -817,10 +821,10 @@ function renderLookupResult(payload) {
             </div>
             <div class="stockName">
               <a href="${quoteUrl(item)}" target="_blank" rel="noreferrer">${html(item.name)}</a>
-              <small>${html(item.code)} / ${Math.round(item.modelScore ?? item.score ?? 0)} 分</small>
+              <small>${html(item.code)} / 强度 ${item.signalStrength?.score ?? Math.round(item.modelScore ?? item.score ?? 0)} / ${html(item.signalStrength?.label || "未分层")}</small>
             </div>
           </div>
-          <div class="chipRow signalChips">${renderSignalChips(item.signalInsight)}</div>
+          <div class="chipRow signalChips">${renderSignalChips(item.signalInsight)}${compactTags(item.riskTags || [], 3)}</div>
           <div class="signalHitFacts">
             <span>人气 <b>${item.rank ?? "-"}</b></span>
             <span>上移 <b>${item.rankDelta !== null && item.rankDelta !== undefined ? `+${item.rankDelta}` : "-"}</b></span>
@@ -857,6 +861,7 @@ function renderVerifyResult(payload) {
 
   const renderHorizonCard = (item) => {
     const tone = pctClass(item.return);
+    const benchmark = item.benchmark;
     return `
       <article class="verifyCard ${item.current ? "current" : ""} ${tone}">
         <header class="verifyCardHead">
@@ -867,6 +872,12 @@ function renderVerifyResult(payload) {
         <footer class="verifyCardFoot">
           <span>收盘 <b>${price(item.exitClose)}</b></span>
           <span>当日涨跌 <b class="${pctClass(item.dayReturn)}">${signedPct(item.dayReturn)}</b></span>
+          ${
+            benchmark
+              ? `<span>${html(benchmark.name)} <b class="${pctClass(benchmark.return)}">${pct(benchmark.return)}</b></span>
+                 <span>相对指数 <b class="${pctClass(item.excessReturn)}">${signedPp(item.excessReturn)}</b></span>`
+              : ""
+          }
           <span>最高浮盈 <b class="${pctClass(item.maxReturn)}">${pct(item.maxReturn)}</b></span>
           <span>最大回撤 <b class="${pctClass(item.maxDrawdown)}">${pct(item.maxDrawdown)}</b></span>
         </footer>
@@ -908,6 +919,11 @@ function renderVerifyResult(payload) {
             <strong>${pct(current.return)}</strong>
             <small>${current.exitDate ? `${html(current.exitDate)} 收盘 ${price(current.exitClose)}` : html(current.status || "")}</small>
             <small>当日涨跌 <b class="${pctClass(current.dayReturn)}">${signedPct(current.dayReturn)}</b></small>
+            ${
+              current.benchmark
+                ? `<small>${html(current.benchmark.name)} <b class="${pctClass(current.benchmark.return)}">${pct(current.benchmark.return)}</b> / 超额 <b class="${pctClass(current.excessReturn)}">${signedPp(current.excessReturn)}</b></small>`
+                : ""
+            }
           </div>
         `
             : ""
@@ -925,6 +941,19 @@ function metricValue(value, formatter = pct) {
 
 function ratioValue(value) {
   return value === null || value === undefined || Number.isNaN(value) ? "-" : `${Number(value).toFixed(2)}x`;
+}
+
+function scoreTone(score) {
+  if (score === null || score === undefined || Number.isNaN(score)) return "neutral";
+  if (score >= 85) return "up";
+  if (score >= 70) return "neutral";
+  return "down";
+}
+
+function compactTags(tags = [], limit = 3) {
+  const visible = tags.slice(0, limit);
+  const extra = tags.length - visible.length;
+  return `${visible.map((tag) => `<span class="chip warn">${html(tag)}</span>`).join("")}${extra > 0 ? `<span class="chip">+${extra}</span>` : ""}`;
 }
 
 function renderEvaluation(payload) {
@@ -971,6 +1000,82 @@ function renderEvaluation(payload) {
   const best = payload.daily?.best20?.[0] || payload.daily?.best5?.[0] || null;
   const ret20 = (payload.horizons || []).find((item) => item.key === "ret20");
   const targetPassed = (ret20?.excess?.avg ?? -Infinity) >= 0.15 && (ret20?.excess?.winRate ?? -Infinity) >= 0.15;
+  const attribution = payload.selfAttribution || {};
+  const attrCounts = attribution.counts || {};
+  const strengthRows = attribution.strengthBands || [];
+  const tagRows = (attribution.tagStats || []).filter((row) => row.count >= 3).slice(0, 8);
+  const hypotheses = attribution.hypotheses || [];
+  const failureCases = attribution.failureCases || [];
+  const renderAttrStat = (label, value, sub, cls = "") => `
+    <div class="attrStat">
+      <span>${html(label)}</span>
+      <strong class="${cls}">${html(value)}</strong>
+      <small>${html(sub || "")}</small>
+    </div>
+  `;
+  const strengthHtml = strengthRows
+    .map(
+      (row) => `
+        <div class="attrRow">
+          <span>${html(row.label)}</span>
+          <b>${row.count}</b>
+          <b class="${pctClass(row.avg)}">${metricValue(row.avg)}</b>
+          <b>${metricValue(row.winRate, (value) => pct(value, 1))}</b>
+          <b class="${pctClass(row.marketExcessAvg)}">${metricValue(row.marketExcessAvg, (value) => signedPp(value, 1))}</b>
+        </div>
+      `,
+    )
+    .join("");
+  const tagHtml = tagRows
+    .map(
+      (row) => `
+        <div class="attrTagRow">
+          <span>${html(row.tag)}</span>
+          <b>${row.count}</b>
+          <b class="${pctClass(row.avg)}">${metricValue(row.avg)}</b>
+          <b class="${pctClass(row.failureRate)}">${metricValue(row.failureRate, (value) => pct(value, 1))}</b>
+          <b class="${pctClass(row.marketExcessAvg)}">${metricValue(row.marketExcessAvg, (value) => signedPp(value, 1))}</b>
+        </div>
+      `,
+    )
+    .join("");
+  const hypothesisHtml = hypotheses.length
+    ? hypotheses
+        .map(
+          (item) => `
+            <article class="hypothesisCard">
+              <strong>${html(item.tag)}</strong>
+              <small>${html(item.action)}</small>
+              <div>
+                <span>失败率 ${metricValue(item.failureRate, (value) => pct(value, 1))}</span>
+                <span>跑输 ${metricValue(item.marketUnderperformRate, (value) => pct(value, 1))}</span>
+                <span>超额 ${metricValue(item.marketExcessAvg, (value) => signedPp(value, 1))}</span>
+              </div>
+            </article>
+          `,
+        )
+        .join("")
+    : '<div class="emptyState compact">暂未发现足够稳定的负向标签。</div>';
+  const failureHtml = failureCases.length
+    ? failureCases
+        .map(
+          (item) => `
+            <div class="failureCase">
+              <div class="failureMain">
+                <strong>${html(item.name)} <small>${html(item.code)}</small></strong>
+                <span>${html(item.signalDate)} · ${html(item.bestBoardName || "-")}</span>
+              </div>
+              <div class="failureNums">
+                <b class="${pctClass(item.ret20)}">${metricValue(item.ret20)}</b>
+                <span>超额 <em class="${pctClass(item.excessRet20)}">${metricValue(item.excessRet20, (value) => signedPp(value, 1))}</em></span>
+                <span>强度 <em class="${scoreTone(item.signalStrength?.score)}">${item.signalStrength?.score ?? "-"}</em></span>
+              </div>
+              <div class="chipRow failureTags">${compactTags(item.riskTags || [], 4)}</div>
+            </div>
+          `,
+        )
+        .join("")
+    : '<div class="emptyState compact">当前周期没有已到期失败样本。</div>';
   els.evaluationBody.innerHTML = `
     <div class="evaluationSummary">
       <div>
@@ -1000,6 +1105,44 @@ function renderEvaluation(payload) {
       </div>
     </div>
     <div class="evaluationCards">${horizonCards}</div>
+    <section class="attributionPanel">
+      <div class="attributionHead">
+        <div>
+          <h3>自归因 Agent</h3>
+          <p>${html(attribution.definition || "自动分析失败样本的共同标签，用于辅助策略复盘。")}</p>
+        </div>
+      </div>
+      <div class="attributionStats">
+        ${renderAttrStat("20日失败", `${attrCounts.absoluteFailureCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "绝对收益<0", "down")}
+        ${renderAttrStat("跑输市场", `${attrCounts.marketUnderperformCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "低于同日全市场基准", "down")}
+        ${renderAttrStat("弱收益", `${attrCounts.weakPositiveCount ?? "-"} / ${attrCounts.matured20 ?? "-"}`, "0%-5% 区间", "neutral")}
+        ${renderAttrStat("整体超额", metricValue(attribution.overall?.marketExcessAvg, (value) => signedPp(value, 1)), "相对同日市场基准", pctClass(attribution.overall?.marketExcessAvg))}
+      </div>
+      <div class="attributionGrid">
+        <div class="attrBlock">
+          <h4>信号强度分层</h4>
+          <div class="attrTable attrTable5">
+            <div class="attrHeader"><span>等级</span><b>样本</b><b>20日</b><b>胜率</b><b>超额</b></div>
+            ${strengthHtml || '<div class="emptyState compact">暂无评分数据。</div>'}
+          </div>
+        </div>
+        <div class="attrBlock">
+          <h4>失败标签分组</h4>
+          <div class="attrTable attrTable5">
+            <div class="attrHeader"><span>标签</span><b>样本</b><b>20日</b><b>失败</b><b>超额</b></div>
+            ${tagHtml || '<div class="emptyState compact">暂无可统计标签。</div>'}
+          </div>
+        </div>
+        <div class="attrBlock">
+          <h4>可验证假设</h4>
+          <div class="hypothesisList">${hypothesisHtml}</div>
+        </div>
+        <div class="attrBlock">
+          <h4>失败样本</h4>
+          <div class="failureList">${failureHtml}</div>
+        </div>
+      </div>
+    </section>
   `;
 }
 

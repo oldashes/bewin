@@ -25,6 +25,12 @@ const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
 const DEFAULT_THS_WATCHLIST_MAX = 20;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
+const MARKET_INDEX = {
+  key: "csi300",
+  name: "沪深300",
+  code: "000300",
+  secid: "1.000300",
+};
 
 const PSEUDO_BOARD_RE =
   /(百日|新高|新低|昨日|近期|最近|连板|涨停|打板|首板|触板|一字|破板|竞价|低价|高价|融资|沪股通|深股通|破净|红利|ST|季报|年报|预增|预盈|预亏|业绩|基金|重仓|成份|送转|转债|MSCI|富时|标普|证金|养老金)/;
@@ -518,6 +524,77 @@ function hotRiskFlags(event) {
   if (event.turnover5 !== null && event.turnover5 > 25) flags.push("换手偏高");
   if (!event.strictBoard) flags.push("伪板块");
   return flags.length ? flags : ["热门确认"];
+}
+
+function signalAttributionTags(event, context = {}) {
+  const tags = [];
+  const daySignalCount = context.daySignalCount ?? event.daySignalCount;
+  if (Number.isFinite(daySignalCount) && daySignalCount >= 2) tags.push("多信号日扩散");
+  if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.8 && event.boardHotRatio < 0.9) tags.push("板块半拥挤");
+  if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.9) tags.push("板块高拥挤");
+  if (Number.isFinite(event.bestBoardAmountRatio) && event.bestBoardAmountRatio >= 1.3 && event.bestBoardAmountRatio < 1.5) {
+    tags.push("板块量能不足");
+  }
+  if (Number.isFinite(event.bestBoardAmountRatio) && event.bestBoardAmountRatio < 1.3) tags.push("板块量能边缘");
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 >= 0.03 && event.relativeRet5 < 0.06) tags.push("假前排");
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 <= -0.05) tags.push("个股落后板块");
+  if (Number.isFinite(event.boardLeaderPct) && event.boardLeaderPct > 0.65) tags.push("板块后排");
+  if (Number.isFinite(event.prev5) && event.prev5 >= 0.15 && Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.85) {
+    tags.push("短线追高");
+  }
+  if (Number.isFinite(event.amountRatio) && event.amountRatio < 1.7) tags.push("个股量能偏弱");
+  if (Number.isFinite(event.amountRatio) && event.amountRatio > 2.1) tags.push("个股量能偏高");
+  if (event.meta?.priceLimitPct >= 0.2) tags.push("20%高波动");
+
+  return [...new Set(tags)];
+}
+
+function signalStrengthScore(event, context = {}) {
+  let score = Number.isFinite(event.modelScore) ? event.modelScore : Number.isFinite(event.score) ? event.score : 50;
+  const daySignalCount = context.daySignalCount ?? event.daySignalCount;
+
+  if (event.attributionType === "resonance_leader") score += 8;
+  if (event.attributionType === "resonance_follow") score += 3;
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 >= 0.06) score += 10;
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 >= 0 && event.relativeRet5 < 0.03) score += 5;
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 >= 0.03 && event.relativeRet5 < 0.06) score -= 4;
+  if (Number.isFinite(event.relativeRet5) && event.relativeRet5 <= -0.05) score -= 8;
+
+  if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.65 && event.boardHotRatio < 0.8) score += 8;
+  if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.8 && event.boardHotRatio < 0.9) score -= 12;
+  if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.9) score += 2;
+
+  if (Number.isFinite(event.bestBoardAmountRatio) && event.bestBoardAmountRatio >= 1.5 && event.bestBoardAmountRatio <= 2.0) score += 8;
+  if (Number.isFinite(event.bestBoardAmountRatio) && event.bestBoardAmountRatio >= 1.3 && event.bestBoardAmountRatio < 1.5) score -= 8;
+  if (Number.isFinite(event.bestBoardAmountRatio) && event.bestBoardAmountRatio < 1.3) score -= 4;
+
+  if (Number.isFinite(daySignalCount) && daySignalCount === 1) score += 8;
+  if (Number.isFinite(daySignalCount) && daySignalCount >= 2) score -= 10;
+  if (Number.isFinite(event.prev5) && event.prev5 >= 0.15 && Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.85) score -= 8;
+
+  score -= Math.min((event.riskFlags || []).length * 3, 9);
+  return Math.round(clamp(score / 100, 0, 1) * 100);
+}
+
+function signalStrengthBand(score) {
+  if (!Number.isFinite(score)) return { key: "unknown", label: "未评分" };
+  if (score >= 85) return { key: "high", label: "高优先级" };
+  if (score >= 70) return { key: "watch", label: "观察池" };
+  return { key: "wait", label: "等待确认" };
+}
+
+function applySignalQuality(event, context = {}) {
+  const riskTags = signalAttributionTags(event, context);
+  const strengthScore = signalStrengthScore(event, context);
+  const band = signalStrengthBand(strengthScore);
+  event.daySignalCount = context.daySignalCount ?? event.daySignalCount ?? null;
+  event.riskTags = riskTags;
+  event.signalStrength = {
+    score: strengthScore,
+    band: band.key,
+    label: band.label,
+  };
+  return event;
 }
 
 function eventRelativeRet5(event) {
@@ -2136,6 +2213,207 @@ function expectedBaselineHorizon(events, marketStats, field, label) {
   };
 }
 
+function eventHorizonReturn(event, field = "ret20") {
+  return Number.isFinite(event[field]) ? event[field] : null;
+}
+
+function marketReturnForEvent(event, marketStats, field = "ret20") {
+  const value = marketStats.get(event.signalDate)?.[field]?.avg;
+  return Number.isFinite(value) ? value : null;
+}
+
+function daySignalCounts(events) {
+  const counts = new Map();
+  for (const event of events) counts.set(event.signalDate, (counts.get(event.signalDate) || 0) + 1);
+  return counts;
+}
+
+function enrichedEventsForAttribution(events, marketStats) {
+  const counts = daySignalCounts(events);
+  return events.map((event) =>
+    applySignalQuality(
+      { ...event },
+      {
+        daySignalCount: counts.get(event.signalDate) || 0,
+        marketRet20: marketReturnForEvent(event, marketStats, "ret20"),
+      },
+    ),
+  );
+}
+
+function groupStats(events, marketStats, field = "ret20") {
+  const matured = events.filter((event) => Number.isFinite(eventHorizonReturn(event, field)));
+  const values = matured.map((event) => eventHorizonReturn(event, field));
+  const excessValues = matured
+    .map((event) => {
+      const market = marketReturnForEvent(event, marketStats, field);
+      const ret = eventHorizonReturn(event, field);
+      return Number.isFinite(ret) && Number.isFinite(market) ? ret - market : null;
+    })
+    .filter(Number.isFinite);
+  return {
+    count: events.length,
+    maturedCount: matured.length,
+    avg: avg(values),
+    median: median(values),
+    winRate: winRate(values),
+    failureRate: values.length ? values.filter((value) => value < 0).length / values.length : null,
+    marketExcessAvg: avg(excessValues),
+    marketUnderperformRate: excessValues.length ? excessValues.filter((value) => value < 0).length / excessValues.length : null,
+  };
+}
+
+function attributionGroupRows(events, marketStats, getKey, getLabel, field = "ret20") {
+  const groups = new Map();
+  for (const event of events) {
+    const key = getKey(event);
+    if (!groups.has(key)) groups.set(key, { key, label: getLabel ? getLabel(event, key) : key, events: [] });
+    groups.get(key).events.push(event);
+  }
+  return [...groups.values()]
+    .map((group) => ({
+      key: group.key,
+      label: group.label,
+      ...groupStats(group.events, marketStats, field),
+    }))
+    .sort((a, b) => b.count - a.count || String(a.label).localeCompare(String(b.label)));
+}
+
+function buildTagStats(events, marketStats) {
+  const groups = new Map();
+  for (const event of events) {
+    const tags = event.riskTags?.length ? event.riskTags : ["无明显标签"];
+    for (const tag of tags) {
+      if (!groups.has(tag)) groups.set(tag, []);
+      groups.get(tag).push(event);
+    }
+  }
+  return [...groups.entries()]
+    .map(([tag, items]) => ({
+      tag,
+      ...groupStats(items, marketStats, "ret20"),
+    }))
+    .sort((a, b) => b.count - a.count || (b.failureRate || 0) - (a.failureRate || 0));
+}
+
+function buildAttributionHypotheses(tagStats, overall) {
+  const minCount = 3;
+  const baseFailure = overall.failureRate || 0;
+  const baseUnderperform = overall.marketUnderperformRate || 0;
+  return tagStats
+    .filter((row) => row.count >= minCount)
+    .map((row) => {
+      const failureLift = Number.isFinite(row.failureRate) ? row.failureRate - baseFailure : null;
+      const underperformLift = Number.isFinite(row.marketUnderperformRate) ? row.marketUnderperformRate - baseUnderperform : null;
+      const riskLift = Math.max(failureLift || 0, underperformLift || 0);
+      const action =
+        riskLift >= 0.15
+          ? "建议降权观察"
+          : riskLift >= 0.08
+            ? "继续跟踪验证"
+            : row.marketExcessAvg !== null && row.marketExcessAvg < 0
+              ? "保留为风险提示"
+              : "暂不调整";
+      return {
+        tag: row.tag,
+        count: row.count,
+        failureRate: row.failureRate,
+        marketUnderperformRate: row.marketUnderperformRate,
+        marketExcessAvg: row.marketExcessAvg,
+        failureLift,
+        underperformLift,
+        action,
+      };
+    })
+    .filter((row) => row.action !== "暂不调整")
+    .sort((a, b) => Math.max(b.failureLift || 0, b.underperformLift || 0) - Math.max(a.failureLift || 0, a.underperformLift || 0))
+    .slice(0, 8);
+}
+
+function buildSelfAttribution(events, marketStats) {
+  const enriched = enrichedEventsForAttribution(events, marketStats);
+  const matured = enriched.filter((event) => Number.isFinite(event.ret20));
+  const absoluteFailures = matured.filter((event) => event.ret20 < 0);
+  const weakPositives = matured.filter((event) => event.ret20 >= 0 && event.ret20 < 0.05);
+  const marketUnderperformers = matured.filter((event) => {
+    const market = marketReturnForEvent(event, marketStats, "ret20");
+    return Number.isFinite(market) && event.ret20 < market;
+  });
+  const overall = groupStats(enriched, marketStats, "ret20");
+  const tagStats = buildTagStats(enriched, marketStats);
+  const strengthBands = attributionGroupRows(
+    enriched,
+    marketStats,
+    (event) => event.signalStrength?.band || "unknown",
+    (event) => event.signalStrength?.label || "未评分",
+  );
+  const dayCountGroups = attributionGroupRows(
+    enriched,
+    marketStats,
+    (event) => (event.daySignalCount === 1 ? "single" : "multi"),
+    (event) => (event.daySignalCount === 1 ? "单信号日" : "多信号日"),
+  );
+  const boardHotGroups = attributionGroupRows(
+    enriched,
+    marketStats,
+    (event) => {
+      if (!Number.isFinite(event.boardHotRatio)) return "unknown";
+      if (event.boardHotRatio < 0.65) return "lt65";
+      if (event.boardHotRatio < 0.8) return "65-80";
+      if (event.boardHotRatio < 0.9) return "80-90";
+      return "gte90";
+    },
+    (_, key) => ({ lt65: "板块热度<65%", "65-80": "板块热度65%-80%", "80-90": "板块热度80%-90%", gte90: "板块热度≥90%" })[key] || "未知热度",
+  );
+  const failureCases = absoluteFailures
+    .slice()
+    .sort((a, b) => a.ret20 - b.ret20)
+    .slice(0, 12)
+    .map((event) => {
+      const marketRet20 = marketReturnForEvent(event, marketStats, "ret20");
+      return {
+        signalDate: event.signalDate,
+        code: event.code,
+        name: event.name,
+        ret5: event.ret5,
+        ret10: event.ret10,
+        ret20: event.ret20,
+        marketRet20,
+        excessRet20: Number.isFinite(marketRet20) ? event.ret20 - marketRet20 : null,
+        rank: event.rank,
+        prev5: event.prev5,
+        relativeRet5: event.relativeRet5,
+        amountRatio: event.amountRatio,
+        bestBoardName: event.bestBoardName,
+        bestBoardRet5: event.bestBoardRet5,
+        bestBoardAmountRatio: event.bestBoardAmountRatio,
+        boardHotRatio: event.boardHotRatio,
+        boardLeaderPct: event.boardLeaderPct,
+        attributionType: event.attributionType,
+        signalStrength: event.signalStrength,
+        riskTags: event.riskTags || [],
+      };
+    });
+
+  return {
+    definition: "20日收益<0 为绝对失败；20日收益跑输同日全市场随机基准为相对失败。",
+    overall,
+    counts: {
+      sampleCount: enriched.length,
+      matured20: matured.length,
+      absoluteFailureCount: absoluteFailures.length,
+      weakPositiveCount: weakPositives.length,
+      marketUnderperformCount: marketUnderperformers.length,
+    },
+    strengthBands,
+    tagStats,
+    dayCountGroups,
+    boardHotGroups,
+    hypotheses: buildAttributionHypotheses(tagStats, overall),
+    failureCases,
+  };
+}
+
 function dateFilteredEvents(events, from, to) {
   const start = normalizeDate(from);
   const end = normalizeDate(to);
@@ -2261,6 +2539,7 @@ async function dailyPayload(query) {
       : previousDate(tradingDates, requestedDate) || nextAvailableDate(tradingDates, requestedDate) || requestedDate;
   const exactDate = !query.date || query.date === selectedDate;
   const events = selectedDate ? [...(map.get(selectedDate) || [])].sort((a, b) => b.sortScore - a.sortScore) : [];
+  const displayEvents = events.map((event) => applySignalQuality({ ...event }, { daySignalCount: events.length }));
   return {
     selectedDate,
     requestedDate: query.date || null,
@@ -2274,10 +2553,10 @@ async function dailyPayload(query) {
     dataSource: data.dataSource,
     dataStrategy: data.dataSource.strategy,
     rule: data.dataSource.strategy?.rule || STRATEGIES.early.rule,
-    stats: summarize(events),
-    signalStats: summarizeSignals(events),
-    boards: aggregateBoards(events),
-    stocks: events,
+    stats: summarize(displayEvents),
+    signalStats: summarizeSignals(displayEvents),
+    boards: aggregateBoards(displayEvents),
+    stocks: displayEvents,
   };
 }
 
@@ -2363,6 +2642,7 @@ async function evaluationPayload(query = {}) {
     .filter(Number.isFinite);
   const amountRatios = events.map((event) => event.amountRatio).filter(Number.isFinite);
   const boardRet5 = events.map((event) => event.bestBoardRet5).filter(Number.isFinite);
+  const selfAttribution = buildSelfAttribution(events, marketStats);
 
   return {
     strict,
@@ -2402,6 +2682,7 @@ async function evaluationPayload(query = {}) {
       best20: dailyRet20.slice().sort((a, b) => (b.avg || 0) - (a.avg || 0)).slice(0, 5),
       worst20: dailyRet20.slice().sort((a, b) => (a.avg || 0) - (b.avg || 0)).slice(0, 5),
     },
+    selfAttribution,
   };
 }
 
@@ -2422,6 +2703,7 @@ async function stockSignalsPayload(query = {}) {
     : [];
   const chronological = [...matches].sort((a, b) => a.signalDate.localeCompare(b.signalDate));
   const dates = [...new Set(chronological.map((event) => event.signalDate))];
+  const dayCounts = daySignalCounts(events);
   return {
     query: rawQuery,
     code: code || null,
@@ -2432,7 +2714,9 @@ async function stockSignalsPayload(query = {}) {
     firstDate: dates[0] || null,
     latestDate: dates[dates.length - 1] || null,
     stats: summarize(matches),
-    matches: matches.map((event) => ({
+    matches: matches.map((event) => {
+      const displayEvent = applySignalQuality({ ...event }, { daySignalCount: dayCounts.get(event.signalDate) || 0 });
+      return {
       signalDate: event.signalDate,
       em: event.em,
       code: event.code,
@@ -2453,9 +2737,12 @@ async function stockSignalsPayload(query = {}) {
       score: event.score,
       modelScore: event.modelScore,
       riskFlags: event.riskFlags || [],
+      riskTags: displayEvent.riskTags || [],
+      signalStrength: displayEvent.signalStrength,
       meta: event.meta,
       signalInsight: event.signalInsight,
-    })),
+      };
+    }),
     message: !rawQuery
       ? "请输入股票代码或名称。"
       : matches.length
@@ -2551,6 +2838,49 @@ async function loadKline(stock) {
     }
   }
   return fetchKline(stock);
+}
+
+function marketIndexCacheFile(index = MARKET_INDEX) {
+  return path.join(KLINE_DIR, `index-${index.secid}.json`);
+}
+
+async function fetchMarketIndexKline(index = MARKET_INDEX) {
+  const url =
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
+    `?secid=${index.secid}` +
+    "&fields1=f1,f2,f3,f4,f5,f6" +
+    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
+    "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Referer: "https://quote.eastmoney.com/",
+    },
+  });
+  if (!response.ok) throw new Error(`${index.name} K线请求失败：${response.status}`);
+  const json = await response.json();
+  const rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
+  if (!rows.length) throw new Error(`没有找到 ${index.name} 的日 K 数据`);
+  try {
+    fs.mkdirSync(KLINE_DIR, { recursive: true });
+    fs.writeFileSync(marketIndexCacheFile(index), JSON.stringify(rows));
+  } catch {
+    // Serverless deployments may not have a writable project directory.
+  }
+  return rows;
+}
+
+async function loadMarketIndexKline(index = MARKET_INDEX) {
+  const file = marketIndexCacheFile(index);
+  if (fs.existsSync(file)) {
+    try {
+      const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (Array.isArray(rows) && rows.length) return rows.filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close));
+    } catch {
+      // Ignore a broken local cache and fetch a fresh copy.
+    }
+  }
+  return fetchMarketIndexKline(index);
 }
 
 async function loadKlineFromDb(stock) {
@@ -3347,11 +3677,44 @@ function returnAtCurrent(rows, entryIndex, entryPrice) {
   };
 }
 
+function benchmarkReturnForHorizon(rows, entryDate, entryMode, horizon) {
+  const entryIndex = rows.findIndex((row) => row.date === entryDate);
+  if (entryIndex < 0) return null;
+  const entryRow = rows[entryIndex];
+  const entryPrice = entryMode === "close" ? entryRow.close : entryRow.open;
+  if (!Number.isFinite(entryPrice)) return null;
+  return horizon.current ? returnAtCurrent(rows, entryIndex, entryPrice) : returnAt(rows, entryIndex, entryPrice, horizon);
+}
+
+function attachBenchmarkToPositionHorizons(horizons, benchmarkRows, entryDate, entryMode, benchmark = MARKET_INDEX) {
+  if (!Array.isArray(benchmarkRows) || !benchmarkRows.length) return horizons;
+  return horizons.map((horizon) => {
+    const benchmarkResult = benchmarkReturnForHorizon(benchmarkRows, entryDate, entryMode, horizon);
+    const benchmarkReturn = benchmarkResult?.return ?? null;
+    return {
+      ...horizon,
+      benchmark: benchmarkResult
+        ? {
+            key: benchmark.key,
+            name: benchmark.name,
+            exitDate: benchmarkResult.exitDate,
+            exitClose: benchmarkResult.exitClose,
+            return: benchmarkReturn,
+            dayReturn: benchmarkResult.dayReturn,
+            status: benchmarkResult.status,
+          }
+        : null,
+      excessReturn: Number.isFinite(horizon.return) && Number.isFinite(benchmarkReturn) ? horizon.return - benchmarkReturn : null,
+    };
+  });
+}
+
 async function positionPayload(query) {
   const stock = normalizeStock(query.code);
   if (!query.date) throw new Error("请输入买入日期");
   const entryMode = query.entry || "nextOpen";
   const rows = await loadKline(stock);
+  const benchmarkRows = await loadMarketIndexKline().catch(() => []);
   const names = readStockNames();
   const storedMeta = readStockMeta().get(stock.code);
   const displayName = await resolveStockDisplayName(stock.code, storedMeta?.name || names.get(stock.code));
@@ -3370,7 +3733,12 @@ async function positionPayload(query) {
     { days: 5, label: "1周" },
     { days: 10, label: "2周" },
   ];
-  const horizons = [returnAtCurrent(rows, entryIndex, entryPrice), ...horizonDefs.map((horizon) => returnAt(rows, entryIndex, entryPrice, horizon))];
+  const horizons = attachBenchmarkToPositionHorizons(
+    [returnAtCurrent(rows, entryIndex, entryPrice), ...horizonDefs.map((horizon) => returnAt(rows, entryIndex, entryPrice, horizon))],
+    benchmarkRows,
+    entryRow.date,
+    entryMode,
+  );
   return {
     code: stock.code,
     em: stock.em,
@@ -3383,6 +3751,7 @@ async function positionPayload(query) {
     entryPrice,
     entryOpen: entryRow.open,
     entryClose: entryRow.close,
+    benchmark: MARKET_INDEX,
     horizons,
     latestDate: rows[rows.length - 1]?.date || null,
   };
