@@ -208,6 +208,12 @@ const STRATEGY_PARAM_DEFS = [
     type: "boolean",
     help: "要求行业或概念板块满足强度条件。",
   },
+  {
+    key: "requireResonance",
+    label: "必须个股板块共振",
+    type: "boolean",
+    help: "要求个股与所属强板块同步走强，并排除孤立异动和明显过热。",
+  },
 ];
 
 const STRATEGY_PARAM_DEFAULTS = {
@@ -225,6 +231,7 @@ const STRATEGY_PARAM_DEFAULTS = {
     boardAmountRatioMax: 2,
     maxPerDate: 0,
     requireStrongBoard: true,
+    requireResonance: false,
   },
   hot: {
     rankMin: 1,
@@ -240,6 +247,7 @@ const STRATEGY_PARAM_DEFAULTS = {
     boardAmountRatioMax: 20,
     maxPerDate: 0,
     requireStrongBoard: false,
+    requireResonance: false,
   },
 };
 
@@ -510,6 +518,50 @@ function hotRiskFlags(event) {
   if (event.turnover5 !== null && event.turnover5 > 25) flags.push("换手偏高");
   if (!event.strictBoard) flags.push("伪板块");
   return flags.length ? flags : ["热门确认"];
+}
+
+function eventRelativeRet5(event) {
+  if (!Number.isFinite(event.prev5) || !Number.isFinite(event.bestBoardRet5)) return null;
+  return event.prev5 - event.bestBoardRet5;
+}
+
+function eventAttributionType(event) {
+  const prev5 = event.prev5;
+  const amountRatio = event.amountRatio;
+  const boardRet5 = event.bestBoardRet5;
+  const boardAmountRatio = event.bestBoardAmountRatio;
+  const relativeRet5 = eventRelativeRet5(event);
+
+  const stockStrong =
+    Number.isFinite(prev5) && prev5 >= 0.05 && prev5 <= 0.25 && Number.isFinite(amountRatio) && amountRatio >= 1.5 && amountRatio <= 3;
+  const boardStrong =
+    Number.isFinite(boardRet5) &&
+    boardRet5 >= 0.08 &&
+    boardRet5 <= 0.2 &&
+    Number.isFinite(boardAmountRatio) &&
+    boardAmountRatio >= 1.2 &&
+    boardAmountRatio <= 2;
+  const stockOverheated = Number.isFinite(prev5) && (prev5 > 0.25 || (Number.isFinite(amountRatio) && amountRatio > 3));
+  const boardOverheated = Number.isFinite(boardRet5) && (boardRet5 > 0.2 || (Number.isFinite(boardAmountRatio) && boardAmountRatio > 2));
+
+  if (stockStrong && boardStrong) return relativeRet5 !== null && relativeRet5 >= 0.03 ? "resonance_leader" : "resonance_follow";
+  if (stockOverheated && boardOverheated) return "overheated_resonance";
+  if (stockOverheated) return "overheated_stock";
+  if (boardStrong && (!Number.isFinite(prev5) || prev5 < 0.03)) return "board_led_lag";
+  if (stockStrong && (!Number.isFinite(boardRet5) || boardRet5 < 0.03)) return "isolated_stock";
+  if (boardStrong) return "board_led";
+  if (stockStrong) return "stock_led";
+  return "weak_or_early";
+}
+
+function assignAttribution(event) {
+  event.relativeRet5 = eventRelativeRet5(event);
+  event.attributionType = eventAttributionType(event);
+  return event;
+}
+
+function isResonanceEvent(event) {
+  return event.attributionType === "resonance_leader" || event.attributionType === "resonance_follow";
 }
 
 function readKlineRowsSync(code) {
@@ -817,6 +869,7 @@ function loadData() {
       event.score = scoreEvent(event);
       event.modelScore = null;
       event.sortScore = event.score;
+      assignAttribution(event);
       event.riskFlags = riskFlags(event);
       return event;
     })
@@ -867,6 +920,7 @@ function loadData() {
         event.score = scoreEvent(event);
         event.modelScore = n(row.finalScore) ?? n(row.score);
         event.sortScore = event.modelScore ?? event.score;
+        assignAttribution(event);
         event.riskFlags = riskFlags(event);
         return event;
       })
@@ -937,6 +991,7 @@ function loadHotData() {
       event.score = scoreHotEvent(event);
       event.modelScore = null;
       event.sortScore = event.score;
+      assignAttribution(event);
       event.riskFlags = hotRiskFlags(event);
       return event;
     })
@@ -1060,6 +1115,7 @@ function normalizeStrategyParams(input = {}, baseKey = "early") {
     boardAmountRatioMax: asNumber(input.boardAmountRatioMax, defaults.boardAmountRatioMax, { min: 0, max: 20 }),
     maxPerDate: asNumber(input.maxPerDate, defaults.maxPerDate, { min: 0, max: 100, integer: true }),
     requireStrongBoard: asBoolean(input.requireStrongBoard, defaults.requireStrongBoard),
+    requireResonance: asBoolean(input.requireResonance, defaults.requireResonance),
   };
 
   if (params.rankMin > params.rankMax) [params.rankMin, params.rankMax] = [params.rankMax, params.rankMin];
@@ -1098,6 +1154,7 @@ function paramsToRuleItems(params) {
     `板块量能 ${params.boardAmountRatioMin}-${params.boardAmountRatioMax}`,
     params.maxPerDate ? `每日最多 ${params.maxPerDate} 只` : "每日候选不限数量",
     params.requireStrongBoard ? "必须匹配强板块" : "不强制强板块",
+    params.requireResonance ? "必须个股板块共振" : "不强制共振归因",
   ];
 }
 
@@ -1252,6 +1309,7 @@ function loadThsData() {
       event.score = scoreEvent(event);
       event.modelScore = n(row.finalScore) ?? n(row.score);
       event.sortScore = event.modelScore ?? event.score;
+      assignAttribution(event);
       event.riskFlags = riskFlags(event);
       return event;
     })
@@ -1498,6 +1556,7 @@ function dbRowToEvent(row, strategyKey) {
   event.score = n(row.score) ?? (strategyKey === "hot" ? scoreHotEvent(event) : scoreEvent(event));
   event.modelScore = n(row.model_score) ?? n(raw.finalScore);
   event.sortScore = event.modelScore ?? event.score;
+  assignAttribution(event);
   event.riskFlags = strategyKey === "hot" ? hotRiskFlags(event) : riskFlags(event);
   return event;
 }
@@ -1568,6 +1627,7 @@ function featureRowToEvent(row, config) {
   event.score = n(row.score) ?? scoreEvent(event);
   event.modelScore = null;
   event.sortScore = event.score;
+  assignAttribution(event);
   event.riskFlags = riskFlags(event);
   return event;
 }
@@ -1646,6 +1706,7 @@ async function loadCustomStrategyData(sourceKey, strategyKey) {
   );
 
   let events = rows.map((row) => featureRowToEvent(row, config)).filter(Boolean);
+  if (params.requireResonance) events = events.filter(isResonanceEvent);
   events = filterMaxPerDate(events, params.maxPerDate);
   await backfillDbEventReturns(events);
   const strategy = customStrategyDescriptor(config);
@@ -2051,6 +2112,8 @@ async function stockSignalsPayload(query = {}) {
       bestBoardType: event.bestBoardType,
       bestBoardName: event.bestBoardName,
       bestBoardRet5: event.bestBoardRet5,
+      relativeRet5: event.relativeRet5,
+      attributionType: event.attributionType,
       ret5: event.ret5,
       ret10: event.ret10,
       ret20: event.ret20,
