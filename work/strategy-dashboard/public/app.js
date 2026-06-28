@@ -68,6 +68,12 @@ function pct(value, digits = 2) {
   return `${(value * 100).toFixed(digits)}%`;
 }
 
+function signedPct(value, digits = 2, fallback = "-") {
+  if (value === null || value === undefined || Number.isNaN(value)) return fallback;
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${(value * 100).toFixed(digits)}%`;
+}
+
 function pctValue(value, digits = 2, fallback = "-") {
   if (value === null || value === undefined || Number.isNaN(value)) return fallback;
   return `${(value * 100).toFixed(digits)}%`;
@@ -507,6 +513,7 @@ function renderVerifyResult(payload) {
         <strong class="verifyCardReturn ${tone}">${pct(item.return)}</strong>
         <footer class="verifyCardFoot">
           <span>收盘 <b>${price(item.exitClose)}</b></span>
+          <span>当日涨跌 <b class="${pctClass(item.dayReturn)}">${signedPct(item.dayReturn)}</b></span>
           <span>最高浮盈 <b class="${pctClass(item.maxReturn)}">${pct(item.maxReturn)}</b></span>
           <span>最大回撤 <b class="${pctClass(item.maxDrawdown)}">${pct(item.maxDrawdown)}</b></span>
         </footer>
@@ -547,6 +554,7 @@ function renderVerifyResult(payload) {
             <span>当前收益</span>
             <strong>${pct(current.return)}</strong>
             <small>${current.exitDate ? `${html(current.exitDate)} 收盘 ${price(current.exitClose)}` : html(current.status || "")}</small>
+            <small>当日涨跌 <b class="${pctClass(current.dayReturn)}">${signedPct(current.dayReturn)}</b></small>
           </div>
         `
             : ""

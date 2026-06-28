@@ -955,6 +955,42 @@ function getDbPool() {
   return dbPool;
 }
 
+async function resolveStockDisplayName(code, fallbackName) {
+  const fallback = String(fallbackName || "").trim();
+  if (fallback && fallback !== code) return fallback;
+  if (!process.env.DATABASE_URL) return fallback || code;
+
+  try {
+    const { rows } = await getDbPool().query(
+      `
+        with candidates as (
+          select name, 1 as priority
+          from stocks
+          where code = $1
+          union all
+          select name, 2 as priority
+          from strategy_signals
+          where code = $1
+          union all
+          select name, 3 as priority
+          from popularity_snapshots
+          where code = $1
+        )
+        select name
+        from candidates
+        where nullif(trim(name), '') is not null
+          and trim(name) <> $1
+        order by priority asc
+        limit 1
+      `,
+      [code],
+    );
+    return rows[0]?.name || fallback || code;
+  } catch {
+    return fallback || code;
+  }
+}
+
 function dbBarRowToKline(row) {
   return {
     date: normalizeDate(row.trade_date),
@@ -2211,6 +2247,17 @@ function findTradingIndex(rows, date, useNext = false) {
   return rows.findIndex((row) => row.date > date);
 }
 
+function dailyReturnAt(rows, index) {
+  const row = rows[index];
+  if (!row) return null;
+  if (Number.isFinite(row.pct)) return row.pct / 100;
+  const prev = rows[index - 1];
+  if (prev && Number.isFinite(prev.close) && prev.close !== 0 && Number.isFinite(row.close)) {
+    return (row.close - prev.close) / prev.close;
+  }
+  return null;
+}
+
 function returnAt(rows, entryIndex, entryPrice, horizon) {
   const days = typeof horizon === "number" ? horizon : horizon.days;
   const exitIndex = entryIndex + days;
@@ -2221,6 +2268,7 @@ function returnAt(rows, entryIndex, entryPrice, horizon) {
       exitDate: null,
       exitClose: null,
       return: null,
+      dayReturn: null,
       maxReturn: null,
       maxDrawdown: null,
       status: "未到期",
@@ -2242,6 +2290,7 @@ function returnAt(rows, entryIndex, entryPrice, horizon) {
     exitDate: exit.date,
     exitClose: exit.close,
     return: (exit.close - entryPrice) / entryPrice,
+    dayReturn: dailyReturnAt(rows, exitIndex),
     maxReturn: Number.isFinite(maxHigh) ? (maxHigh - entryPrice) / entryPrice : null,
     maxDrawdown: Number.isFinite(minLow) ? (minLow - entryPrice) / entryPrice : null,
     status: "已到期",
@@ -2256,6 +2305,7 @@ function returnAtCurrent(rows, entryIndex, entryPrice) {
       exitDate: null,
       exitClose: null,
       return: null,
+      dayReturn: null,
       maxReturn: null,
       maxDrawdown: null,
       status: "暂无当前数据",
@@ -2277,6 +2327,7 @@ function returnAtCurrent(rows, entryIndex, entryPrice) {
     exitDate: exit.date,
     exitClose: exit.close,
     return: (exit.close - entryPrice) / entryPrice,
+    dayReturn: dailyReturnAt(rows, exitIndex),
     maxReturn: Number.isFinite(maxHigh) ? (maxHigh - entryPrice) / entryPrice : null,
     maxDrawdown: Number.isFinite(minLow) ? (minLow - entryPrice) / entryPrice : null,
     status: "最新收盘",
@@ -2291,12 +2342,13 @@ async function positionPayload(query) {
   const rows = await loadKline(stock);
   const names = readStockNames();
   const storedMeta = readStockMeta().get(stock.code);
+  const displayName = await resolveStockDisplayName(stock.code, storedMeta?.name || names.get(stock.code));
   const useNextTradingDay = entryMode === "nextOpen";
   const entryIndex = findTradingIndex(rows, query.date, useNextTradingDay);
   if (entryIndex < 0 || entryIndex >= rows.length) throw new Error(`找不到 ${query.date} 之后的交易日`);
   const entryRow = rows[entryIndex];
   const entryPrice = entryMode === "close" ? entryRow.close : entryRow.open;
-  const meta = enrichStockMeta(stock.code, storedMeta?.name || names.get(stock.code) || stock.code, query.date);
+  const meta = enrichStockMeta(stock.code, displayName || stock.code, query.date);
   const horizonDefs = [
     { days: 1, label: "1天" },
     { days: 2, label: "2天" },
@@ -2310,7 +2362,7 @@ async function positionPayload(query) {
   return {
     code: stock.code,
     em: stock.em,
-    name: meta.name || names.get(stock.code) || stock.code,
+    name: meta.name || displayName || stock.code,
     meta,
     requestedDate: query.date,
     entryMode,
