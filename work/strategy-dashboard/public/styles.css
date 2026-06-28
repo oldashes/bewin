@@ -78,6 +78,35 @@ h1, h2, p { margin: 0; }
   display: none !important;
 }
 
+.pageLoading {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 12px;
+  color: var(--blue-hi);
+  background: rgba(239, 246, 255, 0.96);
+  border: 1px solid rgba(59, 130, 246, 0.24);
+  border-radius: 999px;
+  box-shadow: var(--shadow-md);
+  backdrop-filter: blur(12px);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.loadingSpinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(37, 99, 235, 0.18);
+  border-top-color: var(--blue);
+  border-radius: 999px;
+  animation: spin 800ms linear infinite;
+}
+
 h1 {
   font-size: 18px;
   font-weight: 700;
@@ -199,6 +228,12 @@ h2 {
   font-weight: 500;
 }
 
+.statusPill.loading {
+  color: var(--blue-hi);
+  background: var(--blue-bg);
+  border-color: rgba(59, 130, 246, 0.22);
+}
+
 /* --- Date status banner --- */
 .dateStatusBanner {
   max-width: 1600px;
@@ -303,8 +338,13 @@ select option { background: #fff; color: var(--text); }
 }
 
 .buttonGroup button:last-child { border-right: 0; }
-.buttonGroup button:hover:not(:disabled), .ghostButton:hover { color: var(--text); background: var(--bg-hover); }
-.buttonGroup button:disabled { opacity: 0.35; cursor: not-allowed; }
+.buttonGroup button:hover:not(:disabled), .ghostButton:hover:not(:disabled) { color: var(--text); background: var(--bg-hover); }
+.buttonGroup button:disabled, .ghostButton:disabled, .primaryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  filter: none;
+  box-shadow: none;
+}
 
 .buttonGroup button#latestDate {
   min-width: 52px;
@@ -908,12 +948,12 @@ select option { background: #fff; color: var(--text); }
   transition: transform var(--fast), box-shadow var(--fast), filter var(--fast);
 }
 
-.primaryButton:hover {
+.primaryButton:hover:not(:disabled) {
   filter: brightness(1.06);
   box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
 }
 
-.primaryButton:active { transform: translateY(1px); }
+.primaryButton:active:not(:disabled) { transform: translateY(1px); }
 
 .miniButton {
   height: 26px;
@@ -1167,6 +1207,15 @@ tr.focusedRow td {
 
 /* --- Loading skeleton --- */
 .isLoading .tableWrap { opacity: 0.55; pointer-events: none; }
+
+.pageIsLoading .metric,
+.pageIsLoading .signalItem,
+.pageIsLoading #timeline,
+.pageIsLoading #boardList,
+.pageIsLoading .strategyEvaluationSummary {
+  opacity: 0.64;
+  transition: opacity var(--fast);
+}
 
 .skeletonRow td {
   height: 44px;
@@ -2406,6 +2455,10 @@ body.modalOpen {
 @keyframes shimmer {
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .statsRow .metric { animation: fadeIn 280ms var(--ease) both; }

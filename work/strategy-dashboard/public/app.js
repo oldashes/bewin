@@ -149,6 +149,8 @@ const STRATEGY_PRESETS = [
 ];
 
 const els = {
+  pageLoading: document.querySelector("#pageLoading"),
+  pageLoadingText: document.querySelector("#pageLoadingText"),
   sourceLabel: document.querySelector("#sourceLabel"),
   rangeLabel: document.querySelector("#rangeLabel"),
   dateInput: document.querySelector("#dateInput"),
@@ -292,6 +294,64 @@ function setTableLoading(loading) {
   if (loading) {
     els.stockRows.innerHTML = skeletonRows();
     els.emptyState.hidden = true;
+  }
+}
+
+function setPageLoading(loading, message = "数据刷新中...") {
+  document.body.classList.toggle("pageIsLoading", loading);
+  if (els.pageLoading) {
+    els.pageLoading.hidden = !loading;
+  }
+  if (els.pageLoadingText) {
+    els.pageLoadingText.textContent = message;
+  }
+  const controls = [
+    els.dateInput,
+    els.dataSourceSelect,
+    els.strategySelect,
+    els.strictToggle,
+    els.prevDate,
+    els.nextDate,
+    els.latestDate,
+    els.refreshButton,
+    els.saveStrategyButton,
+    els.resetStrategyButton,
+  ];
+
+  controls.forEach((control) => {
+    if (!control) return;
+    if (loading) {
+      if (!control.disabled) control.dataset.loadingDisabled = "1";
+      control.disabled = true;
+      return;
+    }
+    if (control.dataset.loadingDisabled === "1") {
+      control.disabled = false;
+      delete control.dataset.loadingDisabled;
+    }
+  });
+
+  if (loading) {
+    setTableLoading(true);
+    if (els.sourceLabel) {
+      els.sourceLabel.textContent = "刷新中";
+      els.sourceLabel.classList.add("loading");
+    }
+    if (els.dailySubtitle) {
+      els.dailySubtitle.textContent = message;
+    }
+  } else if (els.sourceLabel) {
+    els.sourceLabel.classList.remove("loading");
+    updateNavButtons();
+  }
+}
+
+async function withPageLoading(message, task) {
+  setPageLoading(true, message);
+  try {
+    return await task();
+  } finally {
+    setPageLoading(false);
   }
 }
 
@@ -680,7 +740,7 @@ async function saveStrategyFromEditor() {
     });
     state.strategy = payload.strategy?.key || `custom:${payload.config.id}`;
     els.strategySaveStatus.textContent = "已保存，正在重算...";
-    await reloadAll(state.selectedDate);
+    await withPageLoading("正在按新策略重算候选池...", () => reloadAll(state.selectedDate));
     els.strategySaveStatus.textContent = "已保存并重算";
   } catch (error) {
     els.strategySaveStatus.textContent = `保存失败：${error.message}`;
@@ -1262,7 +1322,7 @@ function updateNavButtons() {
 function moveDate(step) {
   const dates = state.tradingDates.length ? state.tradingDates : state.availableDates;
   const next = adjacentCalendarDate(dates, els.dateInput.value || state.selectedDate, step);
-  if (next) loadDaily(next);
+  if (next) withPageLoading("正在切换信号日期...", () => loadDaily(next));
 }
 
 function adjacentCalendarDate(dates, current, step) {
@@ -1299,23 +1359,25 @@ async function reloadAll(date = state.selectedDate) {
 }
 
 function initEvents() {
-  els.dateInput.addEventListener("change", () => loadDaily(els.dateInput.value));
+  els.dateInput.addEventListener("change", () => withPageLoading("正在切换信号日期...", () => loadDaily(els.dateInput.value)));
   els.prevDate.addEventListener("click", () => moveDate(-1));
   els.nextDate.addEventListener("click", () => moveDate(1));
   els.latestDate.addEventListener("click", () =>
-    loadDaily(state.availableDates[state.availableDates.length - 1] || els.dateInput.value || state.selectedDate),
+    withPageLoading("正在切换到最新信号日...", () =>
+      loadDaily(state.availableDates[state.availableDates.length - 1] || els.dateInput.value || state.selectedDate),
+    ),
   );
   els.dataSourceSelect.addEventListener("change", async () => {
     state.dataSource = els.dataSourceSelect.value;
     els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>输入股票代码或名称，查看该股票在当前策略下的历史命中记录。</span></div>';
-    await reloadAll(els.dateInput.value || state.selectedDate);
+    await withPageLoading("正在切换数据源并刷新候选池...", () => reloadAll(els.dateInput.value || state.selectedDate));
   });
   els.strategySelect.addEventListener("change", async () => {
     state.strategy = els.strategySelect.value;
     els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>策略模式已变化，请重新查询。</span></div>';
-    await reloadAll(els.dateInput.value || state.selectedDate);
+    await withPageLoading("正在切换策略并刷新候选池...", () => reloadAll(els.dateInput.value || state.selectedDate));
   });
-  els.refreshButton.addEventListener("click", () => reloadAll(state.selectedDate));
+  els.refreshButton.addEventListener("click", () => withPageLoading("正在刷新当前看板...", () => reloadAll(state.selectedDate)));
   els.evaluationRefresh?.addEventListener("click", () => loadEvaluation());
   els.openEvaluationModal?.addEventListener("click", () => openModal(els.evaluationModal));
   els.openAttributionModal?.addEventListener("click", () => openModal(els.attributionModal));
@@ -1359,7 +1421,7 @@ function initEvents() {
   els.strictToggle.addEventListener("change", async () => {
     state.strict = els.strictToggle.checked;
     els.lookupResult.innerHTML = '<div class="emptyVerify"><span class="emptyIcon" aria-hidden="true">🔍</span><span>过滤条件已变化，请重新查询。</span></div>';
-    await reloadAll(state.selectedDate);
+    await withPageLoading("正在按过滤条件刷新候选池...", () => reloadAll(state.selectedDate));
   });
   els.timeline.addEventListener("click", (event) => {
     const row = event.target.closest(".timelineRow");
@@ -1388,7 +1450,7 @@ async function boot() {
   els.strategySelect.value = state.strategy;
   const date = params.get("date");
   try {
-    await reloadAll(date);
+    await withPageLoading("正在加载策略看板...", () => reloadAll(date));
   } catch (error) {
     document.body.innerHTML = `<main class="layout"><section class="panel"><div class="emptyState"><span class="emptyIcon" aria-hidden="true">!</span><span>加载失败：${html(
       error.message,
