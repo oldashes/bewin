@@ -955,6 +955,75 @@ function getDbPool() {
   return dbPool;
 }
 
+function dbBarRowToKline(row) {
+  return {
+    date: normalizeDate(row.trade_date),
+    open: n(row.open),
+    close: n(row.close),
+    high: n(row.high),
+    low: n(row.low),
+  };
+}
+
+function fillEventReturnsFromRows(event, rows) {
+  if (!rows.length) return event;
+  const entryIndex = findTradingIndexSync(rows, event.signalDate, true);
+  const entry = rows[entryIndex];
+  if (!entry || !Number.isFinite(entry.open)) return event;
+
+  event.entryDate = event.entryDate || entry.date;
+  event.entryOpen = event.entryOpen ?? entry.open;
+  event.signalClose = event.signalClose ?? rows.find((row) => row.date === event.signalDate)?.close ?? null;
+
+  for (const days of [5, 10, 20]) {
+    const result = returnAtSync(rows, entryIndex, entry.open, days);
+    if (!result) continue;
+    if (event[`ret${days}`] === null) event[`ret${days}`] = result.return;
+    if (!event[`exitDate${days}`]) event[`exitDate${days}`] = result.exitDate;
+  }
+  return event;
+}
+
+function eventNeedsDbReturnBackfill(event) {
+  return event.ret5 === null || event.ret10 === null || event.ret20 === null || !event.entryDate || !Number.isFinite(event.entryOpen);
+}
+
+async function backfillDbEventReturns(events) {
+  const targets = events.filter(eventNeedsDbReturnBackfill);
+  if (!targets.length) return events;
+
+  const codes = [...new Set(targets.map((event) => event.code).filter(Boolean))];
+  const minSignalDate = targets
+    .map((event) => event.signalDate)
+    .filter(Boolean)
+    .sort()[0];
+  if (!codes.length || !minSignalDate) return events;
+
+  const { rows } = await getDbPool().query(
+    `
+      select code, trade_date, open, close, high, low
+      from stock_daily_bars
+      where code = any($1) and trade_date >= $2::date
+      order by code asc, trade_date asc
+    `,
+    [codes, minSignalDate],
+  );
+
+  const rowsByCode = new Map();
+  for (const row of rows) {
+    const code = String(row.code || "");
+    const kline = dbBarRowToKline(row);
+    if (!code || !kline.date || !Number.isFinite(kline.open) || !Number.isFinite(kline.close)) continue;
+    if (!rowsByCode.has(code)) rowsByCode.set(code, []);
+    rowsByCode.get(code).push(kline);
+  }
+
+  for (const event of targets) {
+    fillEventReturnsFromRows(event, rowsByCode.get(event.code) || []);
+  }
+  return events;
+}
+
 async function loadDbData(sourceKey, strategyKey) {
   const cacheKey = `${sourceKey}:${strategyKey}`;
   if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
@@ -981,6 +1050,7 @@ async function loadDbData(sourceKey, strategyKey) {
     .map((row) => dbRowToEvent(row, strategyKey))
     .filter(Boolean)
     .filter((event) => (strategyKey === "hot" ? isHotConfirmEvent(event) : true));
+  await backfillDbEventReturns(events);
 
   const data = finalizeData(events, "neon:strategy_signals", sourceKey, {
     strategy: STRATEGIES[strategyKey],
