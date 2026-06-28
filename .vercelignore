@@ -1,0 +1,23 @@
+.git
+.vercel
+.DS_Store
+node_modules
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime/cache data. Production reads tracked outputs and Neon.
+work/cache
+
+# Bulky generated media
+outputs/*.png
+outputs/*.jpg
+outputs/*.jpeg
+outputs/*.webp
+
+# Logs and temp files
+*.log
+tmp
+temp
