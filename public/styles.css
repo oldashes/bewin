@@ -1522,6 +1522,111 @@ tr.focusedRow td {
   font-size: 10px;
 }
 
+.strategyPresetBlock {
+  display: grid;
+  gap: 8px;
+}
+
+.strategyPresetHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.strategyPresetHead strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.strategyPresetHead span {
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+.strategyPresetList {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 7px;
+}
+
+.strategyPreset {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 11px;
+  color: var(--text-2);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color var(--fast), background var(--fast), box-shadow var(--fast);
+}
+
+.strategyPreset:hover {
+  background: #fff;
+  border-color: var(--border-hover);
+}
+
+.strategyPreset.active {
+  background: var(--blue-bg);
+  border-color: rgba(59, 130, 246, 0.35);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.presetTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.presetTop strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.presetTop em {
+  padding: 2px 6px;
+  color: var(--blue-hi);
+  background: #fff;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  border-radius: 999px;
+  font-size: 10px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.strategyPreset span:not(.presetTop),
+.strategyPreset small {
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.strategyPreset small {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.advancedParamsToggle {
+  width: 100%;
+  height: 32px;
+  color: var(--blue-hi);
+  background: var(--blue-bg);
+  border: 1px solid rgba(59, 130, 246, 0.22);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.strategyAdvancedParams[hidden] {
+  display: none;
+}
+
 .strategyParamGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1531,6 +1636,12 @@ tr.focusedRow td {
 .paramField input {
   width: 100%;
   min-width: 0;
+}
+
+.paramField small {
+  color: var(--text-3);
+  font-size: 9px;
+  line-height: 1.35;
 }
 
 .paramToggle {

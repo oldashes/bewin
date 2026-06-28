@@ -12,6 +12,97 @@ const state = {
   currentStrategy: null,
 };
 
+const STRATEGY_PRESETS = [
+  {
+    key: "early",
+    title: "早期发现",
+    badge: "默认",
+    description: "从冷门区升温，适合作为观察池。",
+    summary: "400-1200 / 量能1.0-2.5 / 板块3%-15%",
+    params: {
+      rankMin: 400,
+      rankMax: 1200,
+      rankDelta20Min: 1,
+      amountRatioMin: 1,
+      amountRatioMax: 2.5,
+      stockPrev5MinPct: -20,
+      stockPrev5MaxPct: 35,
+      boardRet5MinPct: 3,
+      boardRet5MaxPct: 15,
+      boardAmountRatioMin: 1.2,
+      boardAmountRatioMax: 2,
+      maxPerDate: 0,
+      requireStrongBoard: true,
+    },
+  },
+  {
+    key: "conservative",
+    title: "稳健过滤",
+    badge: "少而精",
+    description: "减少噪声和追高，更适合每日少量跟踪。",
+    summary: "350-900 / 上移≥500 / 每日≤5",
+    params: {
+      rankMin: 350,
+      rankMax: 900,
+      rankDelta20Min: 500,
+      amountRatioMin: 1.1,
+      amountRatioMax: 2.2,
+      stockPrev5MinPct: -8,
+      stockPrev5MaxPct: 22,
+      boardRet5MinPct: 4,
+      boardRet5MaxPct: 12,
+      boardAmountRatioMin: 1.2,
+      boardAmountRatioMax: 1.8,
+      maxPerDate: 5,
+      requireStrongBoard: true,
+    },
+  },
+  {
+    key: "loose",
+    title: "宽松观察",
+    badge: "复盘池",
+    description: "扩大候选范围，适合人工复盘找线索。",
+    summary: "300-1500 / 量能0.8-3.2 / 每日≤12",
+    params: {
+      rankMin: 300,
+      rankMax: 1500,
+      rankDelta20Min: 1,
+      amountRatioMin: 0.8,
+      amountRatioMax: 3.2,
+      stockPrev5MinPct: -20,
+      stockPrev5MaxPct: 45,
+      boardRet5MinPct: 1,
+      boardRet5MaxPct: 18,
+      boardAmountRatioMin: 0.9,
+      boardAmountRatioMax: 2.5,
+      maxPerDate: 12,
+      requireStrongBoard: false,
+    },
+  },
+  {
+    key: "hot",
+    title: "热门确认",
+    badge: "趋势确认",
+    description: "已经进入前100，侧重确认而不是提前发现。",
+    summary: "1-100 / 上移≥300 / 个股≤35%",
+    params: {
+      rankMin: 1,
+      rankMax: 100,
+      rankDelta20Min: 300,
+      amountRatioMin: 0.8,
+      amountRatioMax: 3.5,
+      stockPrev5MinPct: -20,
+      stockPrev5MaxPct: 35,
+      boardRet5MinPct: -100,
+      boardRet5MaxPct: 300,
+      boardAmountRatioMin: 0,
+      boardAmountRatioMax: 20,
+      maxPerDate: 0,
+      requireStrongBoard: false,
+    },
+  },
+];
+
 const els = {
   sourceLabel: document.querySelector("#sourceLabel"),
   rangeLabel: document.querySelector("#rangeLabel"),
@@ -50,6 +141,9 @@ const els = {
   ruleNote: document.querySelector("#ruleNote"),
   strategyNameInput: document.querySelector("#strategyNameInput"),
   strategyParamGrid: document.querySelector("#strategyParamGrid"),
+  strategyPresetList: document.querySelector("#strategyPresetList"),
+  advancedParamsToggle: document.querySelector("#advancedParamsToggle"),
+  strategyAdvancedParams: document.querySelector("#strategyAdvancedParams"),
   strategyEditMode: document.querySelector("#strategyEditMode"),
   saveStrategyButton: document.querySelector("#saveStrategyButton"),
   resetStrategyButton: document.querySelector("#resetStrategyButton"),
@@ -210,8 +304,8 @@ async function loadOverview() {
   const overview = await getJson(`/api/overview?source=${encodeURIComponent(state.dataSource)}&strategy=${encodeURIComponent(state.strategy)}`);
   state.availableStrategies = overview.availableStrategies || [];
   state.strategyParamDefs = overview.strategyParamDefs || [];
-  state.currentStrategy = overview.dataStrategy || null;
   renderStrategyOptions();
+  state.currentStrategy = resolveCurrentStrategy(overview.dataStrategy);
   renderStrategyEditor(state.currentStrategy);
   const sourceName = overview.dataSource?.shortLabel || overview.dataSource?.label || "数据源";
   const strategyName = overview.dataStrategy?.shortLabel || overview.dataSource?.strategy?.shortLabel || "策略";
@@ -223,6 +317,15 @@ async function loadOverview() {
   else els.dateInput.removeAttribute("min");
   if (maxDate) els.dateInput.max = maxDate;
   else els.dateInput.removeAttribute("max");
+}
+
+function resolveCurrentStrategy(dataStrategy = {}) {
+  const selected = state.availableStrategies.find((item) => item.key === state.strategy) || {};
+  return {
+    ...dataStrategy,
+    ...selected,
+    params: dataStrategy?.params || selected?.params || {},
+  };
 }
 
 function renderStrategyOptions() {
@@ -394,6 +497,57 @@ function strategyDisplayName(strategy = {}) {
   return strategy.custom ? strategy.label || "我的策略" : `${strategy.shortLabel || strategy.label || "策略"} 调整版`;
 }
 
+function sameParams(left = {}, right = {}) {
+  const keys = Object.keys(right);
+  return keys.length > 0 && keys.every((key) => String(left[key]) === String(right[key]));
+}
+
+function activePresetKey(params = {}) {
+  const match = STRATEGY_PRESETS.find((preset) => sameParams(params, preset.params));
+  return match?.key || "";
+}
+
+function renderStrategyPresets(params = {}) {
+  if (!els.strategyPresetList) return;
+  const active = activePresetKey(params);
+  els.strategyPresetList.innerHTML = STRATEGY_PRESETS.map(
+    (preset) => `
+      <button class="strategyPreset ${preset.key === active ? "active" : ""}" type="button" data-preset="${html(preset.key)}">
+        <span class="presetTop">
+          <strong>${html(preset.title)}</strong>
+          <em>${html(preset.badge)}</em>
+        </span>
+        <span>${html(preset.description)}</span>
+        <small>${html(preset.summary)}</small>
+      </button>
+    `,
+  ).join("");
+}
+
+function setAdvancedParamsExpanded(expanded) {
+  if (!els.strategyAdvancedParams || !els.advancedParamsToggle) return;
+  els.strategyAdvancedParams.hidden = !expanded;
+  els.advancedParamsToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  els.advancedParamsToggle.textContent = expanded ? "收起高级参数" : "展开高级参数";
+}
+
+function setEditorParams(params = {}) {
+  for (const input of els.strategyParamGrid.querySelectorAll("[data-param]")) {
+    const key = input.dataset.param;
+    if (input.type === "checkbox") input.checked = Boolean(params[key]);
+    else input.value = params[key] ?? "";
+  }
+  renderStrategyPresets(readStrategyParamsFromEditor());
+}
+
+function applyStrategyPreset(presetKey) {
+  const preset = STRATEGY_PRESETS.find((item) => item.key === presetKey);
+  if (!preset) return;
+  els.strategyNameInput.value = `${preset.title} 调整版`;
+  setEditorParams(preset.params);
+  els.strategySaveStatus.textContent = `已套用「${preset.title}」，保存后才会重算候选池。`;
+}
+
 function renderStrategyEditor(strategy = state.currentStrategy || {}) {
   if (!els.strategyParamGrid) return;
   const params = strategy.params || {};
@@ -422,12 +576,16 @@ function renderStrategyEditor(strategy = state.currentStrategy || {}) {
             max="${html(def.max ?? "")}"
             step="${html(def.step ?? (def.type === "integer" ? 1 : 0.01))}"
             value="${html(value ?? "")}"
+            placeholder="${html(value ?? "")}"
             title="${html(def.help || "")}"
           />
+          <small>${html(def.help || "")}</small>
         </div>
       `;
     })
     .join("");
+  renderStrategyPresets(params);
+  setAdvancedParamsExpanded(false);
   els.strategySaveStatus.textContent = "";
 }
 
@@ -899,6 +1057,16 @@ function initEvents() {
   els.evaluationRefresh?.addEventListener("click", () => loadEvaluation());
   els.saveStrategyButton?.addEventListener("click", () => saveStrategyFromEditor());
   els.resetStrategyButton?.addEventListener("click", () => renderStrategyEditor(state.currentStrategy));
+  els.advancedParamsToggle?.addEventListener("click", () => {
+    setAdvancedParamsExpanded(els.strategyAdvancedParams.hidden);
+  });
+  els.strategyPresetList?.addEventListener("click", (event) => {
+    const button = event.target.closest(".strategyPreset");
+    if (button?.dataset.preset) applyStrategyPreset(button.dataset.preset);
+  });
+  els.strategyParamGrid?.addEventListener("input", () => {
+    renderStrategyPresets(readStrategyParamsFromEditor());
+  });
   const verifyForm = document.querySelector("#verifyForm");
   verifyForm?.addEventListener("submit", (event) => {
     event.preventDefault();

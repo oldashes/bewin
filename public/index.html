@@ -274,7 +274,19 @@
               <label for="strategyNameInput">策略名称</label>
               <input id="strategyNameInput" type="text" placeholder="我的策略" />
             </div>
-            <div id="strategyParamGrid" class="strategyParamGrid"></div>
+            <div class="strategyPresetBlock">
+              <div class="strategyPresetHead">
+                <strong>推荐预设</strong>
+                <span>先选方向，再按需微调</span>
+              </div>
+              <div id="strategyPresetList" class="strategyPresetList"></div>
+            </div>
+            <button id="advancedParamsToggle" class="advancedParamsToggle" type="button" aria-expanded="false">
+              展开高级参数
+            </button>
+            <div id="strategyAdvancedParams" class="strategyAdvancedParams" hidden>
+              <div id="strategyParamGrid" class="strategyParamGrid"></div>
+            </div>
             <div class="strategyEditorActions">
               <button id="saveStrategyButton" class="primaryButton" type="button">保存并重算</button>
               <button id="resetStrategyButton" class="ghostButton" type="button">恢复当前策略参数</button>
