@@ -1504,6 +1504,13 @@ tr.focusedRow td {
   background: var(--bg-surface);
 }
 
+.strategyEditor .field select,
+.strategyEditor .field input[type="text"],
+.strategyEditor .field input[type="number"] {
+  width: 100%;
+  min-width: 0;
+}
+
 .strategyEditorHead {
   display: flex;
   align-items: baseline;

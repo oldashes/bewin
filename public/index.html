@@ -47,13 +47,6 @@
               <option value="ths">同花顺本地积累</option>
             </select>
           </div>
-          <div class="field">
-            <label for="strategySelect">策略</label>
-            <select id="strategySelect">
-              <option value="early">早期发现</option>
-              <option value="hot">热门确认</option>
-            </select>
-          </div>
           <label class="switch">
             <input id="strictToggle" type="checkbox" checked />
             <span>过滤伪板块</span>
@@ -269,6 +262,13 @@
             <div class="strategyEditorHead">
               <strong>策略参数</strong>
               <span id="strategyEditMode">保存后生成自定义策略</span>
+            </div>
+            <div class="field">
+              <label for="strategySelect">当前策略 / 已保存策略</label>
+              <select id="strategySelect">
+                <option value="early">早期发现</option>
+                <option value="hot">热门确认</option>
+              </select>
             </div>
             <div class="field">
               <label for="strategyNameInput">策略名称</label>
