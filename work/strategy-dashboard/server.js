@@ -1653,6 +1653,8 @@ function featureRowToEvent(row, config) {
   const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
   const signalDate = normalizeDate(row.signal_date);
   if (!code || !signalDate) return null;
+  const strategyKey = config.key || (config.id ? `${CUSTOM_STRATEGY_PREFIX}${config.id}` : "early");
+  const strategySource = config.sourceName || config.name || STRATEGIES[strategyKey]?.shortLabel || "动态策略";
 
   const raw = row.raw && typeof row.raw === "object" ? row.raw : {};
   const concepts = Array.isArray(row.concepts) ? row.concepts : [];
@@ -1673,8 +1675,8 @@ function featureRowToEvent(row, config) {
   const bestBoardName =
     row.best_board_name || raw.bestBoardName || raw.boardName || meta.industry || meta.concepts?.[0] || meta.board || "未分类";
   const event = {
-    source: config.name || "自定义策略",
-    strategyKey: `${CUSTOM_STRATEGY_PREFIX}${config.id}`,
+    source: strategySource,
+    strategyKey,
     em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
     code,
     name: meta.name || baseName,
@@ -1719,11 +1721,11 @@ function featureRowToEvent(row, config) {
     meta,
   };
   event.strictBoard = !PSEUDO_BOARD_RE.test(event.bestBoardName || "");
-  event.score = n(row.score) ?? scoreEvent(event);
+  event.score = n(row.score) ?? (strategyKey === "hot" ? scoreHotEvent(event) : scoreEvent(event));
   event.modelScore = null;
   event.sortScore = event.score;
   assignAttribution(event);
-  event.riskFlags = riskFlags(event);
+  event.riskFlags = strategyKey === "hot" ? hotRiskFlags(event) : riskFlags(event);
   return event;
 }
 
@@ -1741,19 +1743,14 @@ function filterMaxPerDate(events, maxPerDate) {
   );
 }
 
-async function loadCustomStrategyData(sourceKey, strategyKey) {
-  const id = customStrategyId(strategyKey);
-  if (!id || !process.env.DATABASE_URL) {
-    return emptyData(sourceKey, "neon:strategy_feature_events", "自定义策略需要先连接数据库并保存策略参数。");
+async function loadDynamicStrategyData(sourceKey, strategyKey, config, descriptor, baseKey = "early") {
+  if (!process.env.DATABASE_URL) {
+    return emptyData(sourceKey, "neon:strategy_feature_events", "动态策略计算需要先连接数据库。");
   }
-  const cacheKey = `${sourceKey}:${strategyKey}`;
+  const cacheKey = `${sourceKey}:dynamic:${strategyKey}`;
   if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
 
-  const config = await getStrategyConfig(id, sourceKey);
-  if (!config) {
-    return emptyData(sourceKey, "neon:strategy_feature_events", "没有找到这个自定义策略，请重新保存策略参数。");
-  }
-  const params = normalizeStrategyParams(config.params || {}, "early");
+  const params = normalizeStrategyParams(config.params || {}, baseKey);
   const { rows } = await getDbPool().query(
     `
       select
@@ -1800,17 +1797,72 @@ async function loadCustomStrategyData(sourceKey, strategyKey) {
     ],
   );
 
-  let events = rows.map((row) => featureRowToEvent(row, config)).filter(Boolean);
+  let events = rows.map((row) => featureRowToEvent(row, { ...config, params, key: strategyKey })).filter(Boolean);
   if (params.requireResonance) events = events.filter(isResonanceEvent);
   events = filterMaxPerDate(events, params.maxPerDate);
   await backfillDbEventReturns(events);
-  const strategy = customStrategyDescriptor(config);
   const data = finalizeData(events, "neon:strategy_feature_events", sourceKey, {
-    strategy,
-    description: `${DATA_SOURCES[sourceKey]?.label || sourceKey}，自定义策略基于完整特征池重算`,
+    strategy: descriptor,
+    description: `${DATA_SOURCES[sourceKey]?.label || sourceKey}，${descriptor.custom ? "自定义策略" : "内置策略"}基于完整特征池动态重算`,
     sourceFile: "neon:strategy_feature_events",
     available: events.length > 0,
-    message: events.length ? "" : "当前参数没有筛出候选。可以放宽排名、量能或板块条件后重新保存。",
+    message: events.length ? "" : "当前策略没有筛出候选。可以切换策略或放宽参数后重新计算。",
+  });
+  cachedDbData.set(cacheKey, data);
+  return data;
+}
+
+async function loadCustomStrategyData(sourceKey, strategyKey) {
+  const id = customStrategyId(strategyKey);
+  if (!id || !process.env.DATABASE_URL) {
+    return emptyData(sourceKey, "neon:strategy_feature_events", "自定义策略需要先连接数据库并保存策略参数。");
+  }
+
+  const config = await getStrategyConfig(id, sourceKey);
+  if (!config) {
+    return emptyData(sourceKey, "neon:strategy_feature_events", "没有找到这个自定义策略，请重新保存策略参数。");
+  }
+  const descriptor = customStrategyDescriptor(config);
+  return loadDynamicStrategyData(
+    sourceKey,
+    strategyKey,
+    {
+      ...config,
+      key: strategyKey,
+      sourceName: config.name || descriptor.shortLabel || descriptor.label,
+    },
+    descriptor,
+    "early",
+  );
+}
+
+async function loadBuiltinDynamicStrategyData(sourceKey, strategyKey) {
+  const cacheKey = `${sourceKey}:dynamic-merged:${strategyKey}`;
+  if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
+
+  const descriptor = builtinStrategyDescriptor(strategyKey);
+  const dynamicData = await loadDynamicStrategyData(
+    sourceKey,
+    strategyKey,
+    {
+      id: strategyKey,
+      key: strategyKey,
+      name: descriptor.label,
+      sourceName: descriptor.shortLabel || descriptor.label,
+      description: descriptor.description,
+      params: descriptor.params,
+    },
+    descriptor,
+    strategyKey,
+  );
+  const materializedData = await loadDbData(sourceKey, strategyKey);
+  const events = [...materializedData.events, ...dynamicData.events];
+  const data = finalizeData(events, "neon:strategy_feature_events + neon:strategy_signals", sourceKey, {
+    strategy: descriptor,
+    description: `${DATA_SOURCES[sourceKey]?.label || sourceKey}，内置策略基于完整特征池动态重算，并用物化信号补齐近期覆盖`,
+    sourceFile: "neon:strategy_feature_events + neon:strategy_signals",
+    available: events.length > 0,
+    message: events.length ? "" : "当前策略没有筛出候选；已尝试动态特征池和物化信号兜底。",
   });
   cachedDbData.set(cacheKey, data);
   return data;
@@ -1821,7 +1873,7 @@ async function loadDataForSource(rawSource, rawStrategy) {
   const strategyKey = normalizeStrategyKey(rawStrategy);
   if (sourceKey === "ths") return loadThsData();
   if (isCustomStrategyKey(strategyKey)) return loadCustomStrategyData(sourceKey, strategyKey);
-  if (shouldUseDatabase(sourceKey)) return loadDbData(sourceKey, strategyKey);
+  if (shouldUseDatabase(sourceKey)) return loadBuiltinDynamicStrategyData(sourceKey, strategyKey);
   return strategyKey === "hot" ? loadHotData() : loadData();
 }
 
@@ -2420,6 +2472,16 @@ function dateFilteredEvents(events, from, to) {
   return events.filter((event) => (!start || event.signalDate >= start) && (!end || event.signalDate <= end));
 }
 
+function displayDateRange(signalDates, requestedDate = null) {
+  const calendar = readTradingCalendar();
+  if (!calendar.length) return signalDates;
+  const normalizedRequest = normalizeDate(requestedDate);
+  const start = signalDates[0] || normalizedRequest || calendar[0];
+  const endCandidates = [signalDates[signalDates.length - 1], normalizedRequest, calendar[calendar.length - 1]].filter(Boolean);
+  const end = endCandidates.sort().at(-1);
+  return calendar.filter((date) => date >= start && date <= end);
+}
+
 async function availableStrategiesForSource(sourceKey) {
   const customConfigs = await listStrategyConfigs(sourceKey);
   return {
@@ -2527,26 +2589,25 @@ async function dailyPayload(query) {
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const map = strict ? data.byDate : data.allByDate;
-  const tradingDates = readTradingCalendar().filter(
-    (date) => date >= (signalDates[0] || date) && date <= (signalDates[signalDates.length - 1] || date),
-  );
-  const requestedDate = query.date || signalDates[signalDates.length - 1] || null;
+  const requestedDate = normalizeDate(query.date) || signalDates[signalDates.length - 1] || null;
+  const tradingDates = displayDateRange(signalDates, requestedDate);
   const isTradingDate = !requestedDate || !tradingDates.length || tradingDates.includes(requestedDate);
   const selectedDate = !requestedDate
-    ? signalDates[signalDates.length - 1] || null
+    ? tradingDates[tradingDates.length - 1] || signalDates[signalDates.length - 1] || null
     : isTradingDate
       ? requestedDate
       : previousDate(tradingDates, requestedDate) || nextAvailableDate(tradingDates, requestedDate) || requestedDate;
-  const exactDate = !query.date || query.date === selectedDate;
+  const exactDate = !query.date || normalizeDate(query.date) === selectedDate;
   const events = selectedDate ? [...(map.get(selectedDate) || [])].sort((a, b) => b.sortScore - a.sortScore) : [];
   const displayEvents = events.map((event) => applySignalQuality({ ...event }, { daySignalCount: events.length }));
   return {
     selectedDate,
     requestedDate: query.date || null,
     exactDate,
-    nextAvailableDate: exactDate ? null : nextAvailableDate(signalDates, query.date),
+    nextAvailableDate: exactDate ? null : nextAvailableDate(tradingDates, query.date),
     strict,
-    availableDates: signalDates,
+    availableDates: tradingDates,
+    signalDates,
     tradingDates,
     dateStatus: dateStatus(query.date || null, selectedDate, tradingDates, signalDates),
     source: data.dataSource.description,
@@ -2563,7 +2624,8 @@ async function dailyPayload(query) {
 async function timelinePayload(query) {
   const data = await loadDataForSource(query.source, query.strategy);
   const strict = query.strict !== "false";
-  const dates = strict ? data.dates : data.allDates;
+  const signalDates = strict ? data.dates : data.allDates;
+  const dates = displayDateRange(signalDates, query.date);
   const map = strict ? data.byDate : data.allByDate;
   return dates.map((date) => {
     const events = map.get(date) || [];
