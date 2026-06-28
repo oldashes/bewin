@@ -479,7 +479,7 @@ select option { background: #fff; color: var(--text); }
 
 .evaluationSummary {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 8px;
 }
 
@@ -504,6 +504,10 @@ select option { background: #fff; color: var(--text); }
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
+
+.evaluationSummary strong.up { color: var(--red-hi); }
+.evaluationSummary strong.down { color: var(--green-hi); }
+.evaluationSummary strong.neutral { color: var(--text); }
 
 .evaluationSummary small {
   color: var(--text-3);
@@ -538,6 +542,35 @@ select option { background: #fff; color: var(--text); }
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
+
+.evaluationMainPair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.evaluationMainPair > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.evaluationMainPair span {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.evaluationMainPair strong {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.evaluationMainPair strong.up { color: var(--red-hi); }
+.evaluationMainPair strong.down { color: var(--green-hi); }
+.evaluationMainPair strong.neutral { color: var(--text-2); }
 
 .evaluationGrid {
   display: grid;

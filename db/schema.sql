@@ -126,6 +126,26 @@ create table if not exists stock_daily_bars (
   primary key (code, trade_date)
 );
 
+create table if not exists market_daily_baselines (
+  source text not null default 'em',
+  universe text not null default 'local-kline-a-share',
+  trade_date date not null,
+  horizon text not null,
+  sample_count integer not null,
+  avg_return numeric,
+  median_return numeric,
+  win_rate numeric,
+  avg_win numeric,
+  avg_loss numeric,
+  payoff_ratio numeric,
+  profit_factor numeric,
+  best_return numeric,
+  worst_return numeric,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (source, universe, trade_date, horizon)
+);
+
 create table if not exists popularity_snapshots (
   id bigserial primary key,
   source text not null,
@@ -174,6 +194,7 @@ create index if not exists idx_strategy_configs_source_updated on strategy_confi
 create index if not exists idx_stocks_name on stocks(name);
 create index if not exists idx_stock_daily_bars_date on stock_daily_bars(trade_date desc);
 create index if not exists idx_stock_daily_bars_updated on stock_daily_bars(updated_at);
+create index if not exists idx_market_daily_baselines_date on market_daily_baselines(source, universe, trade_date desc);
 create index if not exists idx_popularity_snapshots_source_date on popularity_snapshots(source, category, metric, snapshot_date desc);
 create index if not exists idx_popularity_snapshots_code_date on popularity_snapshots(source, code, snapshot_date desc);
 create index if not exists idx_popularity_snapshots_time on popularity_snapshots(snapshot_time desc);

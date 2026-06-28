@@ -531,26 +531,30 @@ function eventAttributionType(event) {
   const boardRet5 = event.bestBoardRet5;
   const boardAmountRatio = event.bestBoardAmountRatio;
   const relativeRet5 = eventRelativeRet5(event);
+  const breadthOk = !Number.isFinite(event.boardPositiveRatio) || event.boardPositiveRatio >= 0.42;
+  const leaderOk = !Number.isFinite(event.boardLeaderPct) || event.boardLeaderPct <= 0.35;
 
-  const stockStrong =
-    Number.isFinite(prev5) && prev5 >= 0.05 && prev5 <= 0.25 && Number.isFinite(amountRatio) && amountRatio >= 1.5 && amountRatio <= 3;
+  const stockStrong = Number.isFinite(prev5) && prev5 >= 0.03 && Number.isFinite(amountRatio) && amountRatio >= 1.1;
+  const stockVeryStrong = Number.isFinite(prev5) && prev5 >= 0.08 && Number.isFinite(amountRatio) && amountRatio >= 1.2;
   const boardStrong =
-    Number.isFinite(boardRet5) &&
-    boardRet5 >= 0.08 &&
-    boardRet5 <= 0.2 &&
-    Number.isFinite(boardAmountRatio) &&
-    boardAmountRatio >= 1.2 &&
-    boardAmountRatio <= 2;
-  const stockOverheated = Number.isFinite(prev5) && (prev5 > 0.25 || (Number.isFinite(amountRatio) && amountRatio > 3));
-  const boardOverheated = Number.isFinite(boardRet5) && (boardRet5 > 0.2 || (Number.isFinite(boardAmountRatio) && boardAmountRatio > 2));
+    Number.isFinite(boardRet5) && boardRet5 >= 0.04 && Number.isFinite(boardAmountRatio) && boardAmountRatio >= 1.2 && breadthOk;
+  const boardVeryStrong =
+    Number.isFinite(boardRet5) && boardRet5 >= 0.08 && Number.isFinite(boardAmountRatio) && boardAmountRatio >= 1.4;
+  const outperformsBoard = relativeRet5 !== null && (relativeRet5 >= 0.03 || (leaderOk && relativeRet5 >= 0));
+  const lagsBoard = relativeRet5 !== null && relativeRet5 <= -0.03;
+  const overheated =
+    (Number.isFinite(prev5) && prev5 >= 0.18) ||
+    (Number.isFinite(amountRatio) && amountRatio >= 2.8) ||
+    (Number.isFinite(boardRet5) && boardRet5 >= 0.16);
 
-  if (stockStrong && boardStrong) return relativeRet5 !== null && relativeRet5 >= 0.03 ? "resonance_leader" : "resonance_follow";
-  if (stockOverheated && boardOverheated) return "overheated_resonance";
-  if (stockOverheated) return "overheated_stock";
-  if (boardStrong && (!Number.isFinite(prev5) || prev5 < 0.03)) return "board_led_lag";
-  if (stockStrong && (!Number.isFinite(boardRet5) || boardRet5 < 0.03)) return "isolated_stock";
+  if (overheated && boardStrong && stockStrong) return "overheated_resonance";
+  if (overheated) return "overheated_stock";
+  if (boardStrong && stockStrong && outperformsBoard) return "resonance_leader";
+  if (boardStrong && stockStrong) return "resonance_follow";
+  if (boardVeryStrong && lagsBoard) return "board_led_lag";
+  if (stockVeryStrong && (!boardStrong || outperformsBoard)) return "stock_led";
+  if (stockStrong && (!Number.isFinite(boardRet5) || boardRet5 < 0.02)) return "isolated_stock";
   if (boardStrong) return "board_led";
-  if (stockStrong) return "stock_led";
   return "weak_or_early";
 }
 
@@ -1548,6 +1552,13 @@ function dbRowToEvent(row, strategyKey) {
     bestBoardRet10: n(raw.bestBoardRet10 || raw.boardRet10),
     bestBoardAmountRatio: n(row.best_board_amount_ratio),
     bestBoardScoreRankPct: n(raw.bestBoardScoreRankPct || raw.boardScoreRankPct),
+    boardPositiveRatio: n(raw.boardPositiveRatio),
+    boardHotRatio: n(raw.boardHotRatio),
+    boardStrongRatio: n(raw.boardStrongRatio),
+    boardLeaderPct: n(raw.boardLeaderPct),
+    boardLeaderRank: n(raw.boardLeaderRank),
+    boardMemberExcessRet5: n(raw.boardMemberExcessRet5),
+    boardValidMemberCount: n(raw.boardValidMemberCount),
     hasStrongIndustry: bestBoardType === "industry" || raw.hasStrongIndustry === "true",
     hasStrongConcept: bestBoardType === "concept" || raw.hasStrongConcept === "true",
     meta,
@@ -1619,6 +1630,13 @@ function featureRowToEvent(row, config) {
     bestBoardRet10: n(row.best_board_ret_10),
     bestBoardAmountRatio: n(row.best_board_amount_ratio),
     bestBoardScoreRankPct: n(row.best_board_score_rank_pct),
+    boardPositiveRatio: n(raw.boardPositiveRatio),
+    boardHotRatio: n(raw.boardHotRatio),
+    boardStrongRatio: n(raw.boardStrongRatio),
+    boardLeaderPct: n(raw.boardLeaderPct),
+    boardLeaderRank: n(raw.boardLeaderRank),
+    boardMemberExcessRet5: n(raw.boardMemberExcessRet5),
+    boardValidMemberCount: n(raw.boardValidMemberCount),
     hasStrongIndustry: row.has_strong_industry === true || bestBoardType === "industry",
     hasStrongConcept: row.has_strong_concept === true || bestBoardType === "concept",
     meta,
@@ -1814,6 +1832,308 @@ function dailyEvaluation(events, field) {
       winRate: winRate(values),
     }))
     .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function diffOrNull(left, right) {
+  return Number.isFinite(left) && Number.isFinite(right) ? left - right : null;
+}
+
+function attachBaselineToHorizon(strategyHorizon, baselineHorizon) {
+  return {
+    ...strategyHorizon,
+    baseline: baselineHorizon,
+    excess: {
+      avg: diffOrNull(strategyHorizon.avg, baselineHorizon?.avg),
+      median: diffOrNull(strategyHorizon.median, baselineHorizon?.median),
+      winRate: diffOrNull(strategyHorizon.winRate, baselineHorizon?.winRate),
+      profitFactor: diffOrNull(strategyHorizon.profitFactor, baselineHorizon?.profitFactor),
+      payoffRatio: diffOrNull(strategyHorizon.payoffRatio, baselineHorizon?.payoffRatio),
+    },
+  };
+}
+
+function localMarketUniverse() {
+  if (!fs.existsSync(KLINE_DIR)) return [];
+  return fs
+    .readdirSync(KLINE_DIR)
+    .filter((file) => file.endsWith(".json"))
+    .map((file) => {
+      const code = path.basename(file, ".json").split(".")[1] || "";
+      if (!/^(00|30|60|68)/.test(code)) return null;
+      try {
+        const rows = JSON.parse(fs.readFileSync(path.join(KLINE_DIR, file), "utf8"));
+        if (!Array.isArray(rows) || rows.length < 40) return null;
+        return {
+          code,
+          rows: rows.filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close)),
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function marketReturnFromRows(rows, signalDate, days) {
+  const entryIndex = findTradingIndexSync(rows, signalDate, true);
+  const entry = rows[entryIndex];
+  if (!entry || !Number.isFinite(entry.open)) return null;
+  return returnAtSync(rows, entryIndex, entry.open, days)?.return ?? null;
+}
+
+function summarizeMarketValues(values) {
+  const valid = values.filter(Number.isFinite);
+  const wins = valid.filter((value) => value > 0);
+  const losses = valid.filter((value) => value < 0);
+  const gain = sum(wins);
+  const loss = Math.abs(sum(losses));
+  return {
+    count: valid.length,
+    avg: avg(valid),
+    median: median(valid),
+    winRate: winRate(valid),
+    avgWin: avg(wins),
+    avgLoss: avg(losses),
+    payoffRatio: avg(losses) ? Math.abs((avg(wins) || 0) / avg(losses)) : null,
+    profitFactor: loss ? gain / loss : gain ? null : null,
+    best: valid.length ? Math.max(...valid) : null,
+    worst: valid.length ? Math.min(...valid) : null,
+  };
+}
+
+function marketDailyStatsFromLocal(dates) {
+  const universe = localMarketUniverse();
+  const stats = new Map();
+  if (!universe.length) return stats;
+  for (const date of dates) {
+    const ret5 = universe.map((item) => marketReturnFromRows(item.rows, date, 5));
+    const ret10 = universe.map((item) => marketReturnFromRows(item.rows, date, 10));
+    const ret20 = universe.map((item) => marketReturnFromRows(item.rows, date, 20));
+    stats.set(date, {
+      ret5: summarizeMarketValues(ret5),
+      ret10: summarizeMarketValues(ret10),
+      ret20: summarizeMarketValues(ret20),
+    });
+  }
+  return stats;
+}
+
+function dbMarketStatsForRow(row, key) {
+  const count = n(row[`${key}_count`]);
+  const gain = n(row[`${key}_gain`]);
+  const loss = n(row[`${key}_loss`]);
+  const avgWin = n(row[`${key}_avg_win`]);
+  const avgLoss = n(row[`${key}_avg_loss`]);
+  return {
+    count: count ?? 0,
+    avg: n(row[`${key}_avg`]),
+    median: n(row[`${key}_median`]),
+    winRate: n(row[`${key}_win_rate`]),
+    avgWin,
+    avgLoss,
+    payoffRatio: avgLoss ? Math.abs((avgWin || 0) / avgLoss) : null,
+    profitFactor: loss ? (gain || 0) / loss : gain ? null : null,
+    best: n(row[`${key}_best`]),
+    worst: n(row[`${key}_worst`]),
+  };
+}
+
+function baselineTableStatsForRow(row) {
+  const avgWin = n(row.avg_win);
+  const avgLoss = n(row.avg_loss);
+  return {
+    count: n(row.sample_count) ?? 0,
+    avg: n(row.avg_return),
+    median: n(row.median_return),
+    winRate: n(row.win_rate),
+    avgWin,
+    avgLoss,
+    payoffRatio: n(row.payoff_ratio),
+    profitFactor: n(row.profit_factor),
+    best: n(row.best_return),
+    worst: n(row.worst_return),
+  };
+}
+
+async function marketDailyStatsFromBaselineTable(dates) {
+  if (!dates.length || !process.env.DATABASE_URL) return new Map();
+  const { rows } = await getDbPool().query(
+    `
+      select trade_date, horizon, sample_count, avg_return, median_return, win_rate,
+             avg_win, avg_loss, payoff_ratio, profit_factor, best_return, worst_return
+      from market_daily_baselines
+      where source = 'em'
+        and universe = 'local-kline-a-share'
+        and trade_date = any($1::date[])
+    `,
+    [dates],
+  );
+  const stats = new Map();
+  for (const row of rows) {
+    const date = normalizeDate(row.trade_date);
+    const horizon = row.horizon;
+    if (!date || !horizon) continue;
+    if (!stats.has(date)) stats.set(date, {});
+    stats.get(date)[horizon] = baselineTableStatsForRow(row);
+  }
+  return stats;
+}
+
+async function marketDailyStatsFromDb(dates) {
+  if (!dates.length || !process.env.DATABASE_URL) return new Map();
+
+  const valueSql = dates.map((_, index) => `($${index + 1}::date)`).join(", ");
+  const minDateParam = dates.length + 1;
+  const maxDateParam = dates.length + 2;
+  const params = [...dates, dates[0], dates[dates.length - 1]];
+
+  const { rows } = await getDbPool().query(
+    `
+      with requested(signal_date) as (
+        values ${valueSql}
+      ),
+      bars as (
+        select
+          code,
+          trade_date,
+          lead(open, 1) over w as entry_open,
+          lead(close, 6) over w as exit5_close,
+          lead(close, 11) over w as exit10_close,
+          lead(close, 21) over w as exit20_close
+        from stock_daily_bars
+        where code ~ '^(00|30|60|68)'
+          and trade_date >= $${minDateParam}::date
+          and trade_date <= $${maxDateParam}::date + interval '45 days'
+        window w as (partition by code order by trade_date)
+      ),
+      returns as (
+        select
+          r.signal_date,
+          b.code,
+          case when b.entry_open > 0 and b.exit5_close is not null then (b.exit5_close - b.entry_open) / b.entry_open end as ret5,
+          case when b.entry_open > 0 and b.exit10_close is not null then (b.exit10_close - b.entry_open) / b.entry_open end as ret10,
+          case when b.entry_open > 0 and b.exit20_close is not null then (b.exit20_close - b.entry_open) / b.entry_open end as ret20
+        from requested r
+        join bars b on b.trade_date = r.signal_date
+        where b.entry_open is not null
+      )
+      select
+        signal_date,
+        count(ret5)::int as ret5_count,
+        avg(ret5) as ret5_avg,
+        percentile_cont(0.5) within group (order by ret5) filter (where ret5 is not null) as ret5_median,
+        avg(case when ret5 > 0 then 1.0 else 0.0 end) filter (where ret5 is not null) as ret5_win_rate,
+        avg(ret5) filter (where ret5 > 0) as ret5_avg_win,
+        avg(ret5) filter (where ret5 < 0) as ret5_avg_loss,
+        coalesce(sum(ret5) filter (where ret5 > 0), 0) as ret5_gain,
+        abs(coalesce(sum(ret5) filter (where ret5 < 0), 0)) as ret5_loss,
+        max(ret5) as ret5_best,
+        min(ret5) as ret5_worst,
+        count(ret10)::int as ret10_count,
+        avg(ret10) as ret10_avg,
+        percentile_cont(0.5) within group (order by ret10) filter (where ret10 is not null) as ret10_median,
+        avg(case when ret10 > 0 then 1.0 else 0.0 end) filter (where ret10 is not null) as ret10_win_rate,
+        avg(ret10) filter (where ret10 > 0) as ret10_avg_win,
+        avg(ret10) filter (where ret10 < 0) as ret10_avg_loss,
+        coalesce(sum(ret10) filter (where ret10 > 0), 0) as ret10_gain,
+        abs(coalesce(sum(ret10) filter (where ret10 < 0), 0)) as ret10_loss,
+        max(ret10) as ret10_best,
+        min(ret10) as ret10_worst,
+        count(ret20)::int as ret20_count,
+        avg(ret20) as ret20_avg,
+        percentile_cont(0.5) within group (order by ret20) filter (where ret20 is not null) as ret20_median,
+        avg(case when ret20 > 0 then 1.0 else 0.0 end) filter (where ret20 is not null) as ret20_win_rate,
+        avg(ret20) filter (where ret20 > 0) as ret20_avg_win,
+        avg(ret20) filter (where ret20 < 0) as ret20_avg_loss,
+        coalesce(sum(ret20) filter (where ret20 > 0), 0) as ret20_gain,
+        abs(coalesce(sum(ret20) filter (where ret20 < 0), 0)) as ret20_loss,
+        max(ret20) as ret20_best,
+        min(ret20) as ret20_worst
+      from returns
+      group by signal_date
+      order by signal_date asc
+    `,
+    params,
+  );
+
+  const stats = new Map();
+  for (const row of rows) {
+    const date = normalizeDate(row.signal_date);
+    if (!date) continue;
+    stats.set(date, {
+      ret5: dbMarketStatsForRow(row, "ret5"),
+      ret10: dbMarketStatsForRow(row, "ret10"),
+      ret20: dbMarketStatsForRow(row, "ret20"),
+    });
+  }
+  return stats;
+}
+
+async function marketDailyStats(dates) {
+  if (!dates.length) return new Map();
+  if (process.env.DATABASE_URL) {
+    try {
+      const baselineStats = await marketDailyStatsFromBaselineTable(dates);
+      if (baselineStats.size) return baselineStats;
+    } catch (error) {
+      console.warn(`Market baseline table query failed: ${error.message}`);
+    }
+    try {
+      const dbStats = await marketDailyStatsFromDb(dates);
+      if (dbStats.size) return dbStats;
+    } catch (error) {
+      console.warn(`Market baseline DB query failed: ${error.message}`);
+    }
+  }
+  return marketDailyStatsFromLocal(dates);
+}
+
+function expectedBaselineHorizon(events, marketStats, field, label) {
+  const byDate = new Map();
+  for (const event of events) {
+    if (!Number.isFinite(event[field])) continue;
+    if (!byDate.has(event.signalDate)) byDate.set(event.signalDate, 0);
+    byDate.set(event.signalDate, byDate.get(event.signalDate) + 1);
+  }
+
+  let avgNumerator = 0;
+  let medianNumerator = 0;
+  let winNumerator = 0;
+  let profitFactorNumerator = 0;
+  let payoffNumerator = 0;
+  let best = null;
+  let worst = null;
+  let weight = 0;
+  for (const [date, count] of byDate.entries()) {
+    const stats = marketStats.get(date)?.[field];
+    if (!stats || !Number.isFinite(stats.avg) || !Number.isFinite(stats.winRate)) continue;
+    avgNumerator += stats.avg * count;
+    if (Number.isFinite(stats.median)) medianNumerator += stats.median * count;
+    winNumerator += stats.winRate * count;
+    if (Number.isFinite(stats.profitFactor)) profitFactorNumerator += stats.profitFactor * count;
+    if (Number.isFinite(stats.payoffRatio)) payoffNumerator += stats.payoffRatio * count;
+    if (Number.isFinite(stats.best)) best = best === null ? stats.best : Math.max(best, stats.best);
+    if (Number.isFinite(stats.worst)) worst = worst === null ? stats.worst : Math.min(worst, stats.worst);
+    weight += count;
+  }
+
+  return {
+    key: field,
+    label,
+    sampleCount: events.length,
+    maturedCount: weight,
+    pendingCount: events.length - weight,
+    coverage: events.length ? weight / events.length : null,
+    avg: weight ? avgNumerator / weight : null,
+    median: weight ? medianNumerator / weight : null,
+    winRate: weight ? winNumerator / weight : null,
+    avgWin: null,
+    avgLoss: null,
+    payoffRatio: weight ? payoffNumerator / weight : null,
+    profitFactor: weight ? profitFactorNumerator / weight : null,
+    best,
+    worst,
+  };
 }
 
 function dateFilteredEvents(events, from, to) {
@@ -2024,11 +2344,18 @@ async function evaluationPayload(query = {}) {
   const baseEvents = strict ? data.strictEvents : data.events;
   const events = dateFilteredEvents(baseEvents, query.from, query.to);
   const dates = [...new Set(events.map((event) => event.signalDate))].sort();
-  const horizons = [
+  const marketStats = await marketDailyStats(dates);
+  const strategyHorizons = [
     horizonEvaluation(events, "ret5", "5日"),
     horizonEvaluation(events, "ret10", "10日"),
     horizonEvaluation(events, "ret20", "20日"),
   ];
+  const baselineHorizons = [
+    expectedBaselineHorizon(events, marketStats, "ret5", "5日"),
+    expectedBaselineHorizon(events, marketStats, "ret10", "10日"),
+    expectedBaselineHorizon(events, marketStats, "ret20", "20日"),
+  ];
+  const horizons = strategyHorizons.map((item, index) => attachBaselineToHorizon(item, baselineHorizons[index]));
   const dailyRet5 = dailyEvaluation(events, "ret5");
   const dailyRet20 = dailyEvaluation(events, "ret20");
   const rankDeltas = events
@@ -2052,6 +2379,12 @@ async function evaluationPayload(query = {}) {
     sampleCount: events.length,
     dateCount: dates.length,
     avgCandidatesPerDate: dates.length ? events.length / dates.length : null,
+    baseline: {
+      available: marketStats.size > 0,
+      method: marketStats.size ? "same-date full-market expected random A-share basket" : "unavailable",
+      sampleCount: baselineHorizons[0]?.maturedCount || 0,
+      dateCount: marketStats.size,
+    },
     horizons,
     featureStats: {
       avgRankDelta20: avg(rankDeltas),

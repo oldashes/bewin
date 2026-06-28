@@ -230,6 +230,12 @@ function pctValue(value, digits = 2, fallback = "-") {
   return `${(value * 100).toFixed(digits)}%`;
 }
 
+function signedPp(value, digits = 2, fallback = "-") {
+  if (value === null || value === undefined || Number.isNaN(value)) return fallback;
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${(value * 100).toFixed(digits)}pp`;
+}
+
 function number(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(value)) return "-";
   return Number(value).toFixed(digits);
@@ -924,37 +930,58 @@ function ratioValue(value) {
 function renderEvaluation(payload) {
   if (!els.evaluationBody) return;
   const strategyName = payload.dataStrategy?.shortLabel || payload.dataStrategy?.label || "当前策略";
-  els.evaluationSubtitle.textContent = `${strategyName} · ${payload.sampleCount} 个样本 · ${payload.dateCount} 个信号日`;
+  const baselineName = payload.baseline?.available ? "含随机基准" : "无随机基准";
+  els.evaluationSubtitle.textContent = `${strategyName} · ${payload.sampleCount} 个样本 · ${payload.dateCount} 个信号日 · ${baselineName}`;
   const horizonCards = (payload.horizons || [])
-    .map(
-      (item) => `
+    .map((item) => {
+      const baseline = item.baseline || {};
+      const excess = item.excess || {};
+      return `
         <article class="evaluationCard">
           <header>
             <strong>${html(item.label)}</strong>
             <span>${item.maturedCount}/${item.sampleCount} 到期</span>
           </header>
-          <div class="evaluationMain ${pctClass(item.avg)}">${metricValue(item.avg)}</div>
+          <div class="evaluationMainPair">
+            <div>
+              <span>策略均值</span>
+              <strong class="${pctClass(item.avg)}">${metricValue(item.avg)}</strong>
+            </div>
+            <div>
+              <span>超额均值</span>
+              <strong class="${pctClass(excess.avg)}">${metricValue(excess.avg, (value) => signedPp(value, 1))}</strong>
+            </div>
+          </div>
           <div class="evaluationGrid">
+            <span>随机均值 <b class="${pctClass(baseline.avg)}">${metricValue(baseline.avg)}</b></span>
+            <span>策略胜率 <b>${metricValue(item.winRate, (value) => pct(value, 1))}</b></span>
+            <span>随机胜率 <b>${metricValue(baseline.winRate, (value) => pct(value, 1))}</b></span>
+            <span>胜率超额 <b class="${pctClass(excess.winRate)}">${metricValue(excess.winRate, (value) => signedPp(value, 1))}</b></span>
             <span>中位 <b class="${pctClass(item.median)}">${metricValue(item.median)}</b></span>
-            <span>胜率 <b>${metricValue(item.winRate, (value) => pct(value, 1))}</b></span>
             <span>盈亏比 <b>${ratioValue(item.profitFactor)}</b></span>
-            <span>赔率 <b>${ratioValue(item.payoffRatio)}</b></span>
             <span>最好 <b class="${pctClass(item.best)}">${metricValue(item.best)}</b></span>
             <span>最差 <b class="${pctClass(item.worst)}">${metricValue(item.worst)}</b></span>
           </div>
         </article>
-      `,
-    )
+      `;
+    })
     .join("");
   const feature = payload.featureStats || {};
   const worst = payload.daily?.worst20?.[0] || payload.daily?.worst5?.[0] || null;
   const best = payload.daily?.best20?.[0] || payload.daily?.best5?.[0] || null;
+  const ret20 = (payload.horizons || []).find((item) => item.key === "ret20");
+  const targetPassed = (ret20?.excess?.avg ?? -Infinity) >= 0.15 && (ret20?.excess?.winRate ?? -Infinity) >= 0.15;
   els.evaluationBody.innerHTML = `
     <div class="evaluationSummary">
       <div>
         <span>样本/日期</span>
         <strong>${payload.sampleCount} / ${payload.dateCount}</strong>
         <small>日均 ${number(payload.avgCandidatesPerDate, 1)} 只候选</small>
+      </div>
+      <div>
+        <span>20日超额目标</span>
+        <strong class="${targetPassed ? "up" : "neutral"}">${targetPassed ? "已达标" : "未达标"}</strong>
+        <small>收益 ${metricValue(ret20?.excess?.avg, (value) => signedPp(value, 1))} / 胜率 ${metricValue(ret20?.excess?.winRate, (value) => signedPp(value, 1))}</small>
       </div>
       <div>
         <span>平均上移</span>

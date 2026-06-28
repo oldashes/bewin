@@ -9,6 +9,7 @@
     "db:import": "node scripts/import-signals.js",
     "db:import-features": "node scripts/import-feature-events.js",
     "db:import-klines": "node scripts/import-klines.js",
+    "db:import-market-baseline": "node scripts/import-market-baseline.js",
     "db:import-ths": "node scripts/import-ths-history.js",
     "lab:strategy": "node scripts/strategy-lab.js",
     "sync:daily": "node scripts/daily-sync.js",

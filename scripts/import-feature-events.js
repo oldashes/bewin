@@ -5,6 +5,8 @@ const path = require("path");
 const { Client } = require("pg");
 
 const ROOT = path.resolve(__dirname, "..");
+const KLINE_DIR = path.join(ROOT, "work/cache/eastmoney-popularity-backtest/kline");
+const BOARD_MEMBER_DIR = path.join(ROOT, "work/cache/sector-filter-backtest/board-members");
 const FEATURE_IMPORTS = [
   {
     file: "outputs/em-popularity-sector-filter-all-enriched.csv",
@@ -23,6 +25,8 @@ async function main() {
   await client.connect();
   try {
     const stockMeta = readStockMeta();
+    const klineByCode = loadKlineByCode(KLINE_DIR);
+    const boardContext = createBoardContext(loadBoardMembers(BOARD_MEMBER_DIR), klineByCode);
     for (const item of FEATURE_IMPORTS) {
       const fullPath = path.join(ROOT, item.file);
       if (!fs.existsSync(fullPath)) {
@@ -30,7 +34,7 @@ async function main() {
         continue;
       }
       const rows = parseCsv(fs.readFileSync(fullPath, "utf8"));
-      const count = await importFeatureRows(client, item, rows, stockMeta);
+      const count = await importFeatureRows(client, item, rows, stockMeta, boardContext);
       console.log(`Imported ${count} feature rows from ${item.file}`);
     }
   } finally {
@@ -38,7 +42,7 @@ async function main() {
   }
 }
 
-async function importFeatureRows(client, item, rows, stockMeta) {
+async function importFeatureRows(client, item, rows, stockMeta, boardContext) {
   const stockRecordsByCode = new Map();
   const featureRecords = [];
 
@@ -62,6 +66,7 @@ async function importFeatureRows(client, item, rows, stockMeta) {
 
     const rank = int(row.rank);
     const rank20 = int(row.rank20);
+    const boardStats = attachBoardContext(row, signalDate, boardContext);
     featureRecords.push({
       source: item.source,
       feature_set: item.featureSet,
@@ -98,7 +103,7 @@ async function importFeatureRows(client, item, rows, stockMeta) {
       best_board_amount_ratio: num(row.bestBoardAmountRatio || row.boardAmountRatio),
       best_board_score_rank_pct: num(row.bestBoardScoreRankPct || row.boardScoreRankPct),
       score: num(row.score || row.finalScore || row.modelScore),
-      raw: row,
+      raw: { ...row, ...boardStats },
     });
   }
 
@@ -343,6 +348,142 @@ function bool(value) {
   if (value === true || value === "true" || value === "1") return true;
   if (value === false || value === "false" || value === "0") return false;
   return null;
+}
+
+function loadKlineByCode(dir) {
+  const map = new Map();
+  if (!fs.existsSync(dir)) return map;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const code = path.basename(file, ".json").split(".")[1] || "";
+    if (!/^(00|30|60|68)/.test(code)) continue;
+    try {
+      const rows = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+      if (!Array.isArray(rows) || rows.length < 40) continue;
+      map.set(
+        code,
+        rows.filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close)),
+      );
+    } catch {
+      // Ignore malformed cache files.
+    }
+  }
+  return map;
+}
+
+function loadBoardMembers(dir) {
+  const map = new Map();
+  if (!fs.existsSync(dir)) return map;
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const boardCode = path.basename(file, ".json");
+    try {
+      const members = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+      if (!Array.isArray(members)) continue;
+      map.set(
+        boardCode,
+        members
+          .map((member) => String(member.code || "").match(/\d{6}/)?.[0] || "")
+          .filter((code) => /^(00|30|60|68)/.test(code)),
+      );
+    } catch {
+      // Ignore malformed board cache files.
+    }
+  }
+  return map;
+}
+
+function average(values) {
+  const valid = values.filter(Number.isFinite);
+  return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : null;
+}
+
+function median(values) {
+  const valid = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!valid.length) return null;
+  const mid = Math.floor(valid.length / 2);
+  return valid.length % 2 ? valid[mid] : (valid[mid - 1] + valid[mid]) / 2;
+}
+
+function stockPrevReturn(rows, signalDate, days = 5) {
+  if (!Array.isArray(rows) || !signalDate) return null;
+  let index = rows.findIndex((row) => row.date === signalDate);
+  if (index < 0) index = rows.findIndex((row) => row.date > signalDate);
+  if (index < days || index < 0) return null;
+  const current = rows[index];
+  const before = rows[index - days];
+  if (!current || !before || !Number.isFinite(current.close) || !Number.isFinite(before.close) || before.close <= 0) {
+    return null;
+  }
+  return (current.close - before.close) / before.close;
+}
+
+function emptyBoardStats() {
+  return {
+    boardMemberCount: null,
+    boardValidMemberCount: null,
+    boardPositiveRatio: null,
+    boardHotRatio: null,
+    boardStrongRatio: null,
+    boardMemberAvgRet5: null,
+    boardMemberMedianRet5: null,
+    memberReturns: [],
+  };
+}
+
+function createBoardContext(boardMembers, klineByCode) {
+  const cache = new Map();
+  return {
+    stats(boardCode, signalDate) {
+      if (!boardCode || !signalDate) return emptyBoardStats();
+      const key = `${boardCode}:${signalDate}`;
+      if (cache.has(key)) return cache.get(key);
+      const members = boardMembers.get(boardCode) || [];
+      const returns = members
+        .map((code) => ({ code, ret5: stockPrevReturn(klineByCode.get(code), signalDate, 5) }))
+        .filter((item) => Number.isFinite(item.ret5));
+      const values = returns.map((item) => item.ret5);
+      const stats = {
+        boardMemberCount: members.length,
+        boardValidMemberCount: returns.length,
+        boardPositiveRatio: values.length ? values.filter((value) => value > 0).length / values.length : null,
+        boardHotRatio: values.length ? values.filter((value) => value >= 0.03).length / values.length : null,
+        boardStrongRatio: values.length ? values.filter((value) => value >= 0.08).length / values.length : null,
+        boardMemberAvgRet5: average(values),
+        boardMemberMedianRet5: median(values),
+        memberReturns: returns,
+      };
+      cache.set(key, stats);
+      return stats;
+    },
+  };
+}
+
+function attachBoardContext(row, signalDate, boardContext) {
+  const stats = boardContext.stats(text(row.bestBoardCode || row.boardCode), signalDate);
+  const memberReturns = stats.memberReturns || [];
+  const candidateRet = num(row.prev5 || row.stockPrev5);
+  let boardLeaderPct = null;
+  let boardLeaderRank = null;
+  if (Number.isFinite(candidateRet) && memberReturns.length) {
+    const sorted = memberReturns.map((item) => item.ret5).sort((a, b) => b - a);
+    const betterCount = sorted.filter((value) => value > candidateRet).length;
+    boardLeaderRank = betterCount + 1;
+    boardLeaderPct = boardLeaderRank / sorted.length;
+  }
+  return {
+    boardMemberCount: stats.boardMemberCount,
+    boardValidMemberCount: stats.boardValidMemberCount,
+    boardPositiveRatio: stats.boardPositiveRatio,
+    boardHotRatio: stats.boardHotRatio,
+    boardStrongRatio: stats.boardStrongRatio,
+    boardMemberAvgRet5: stats.boardMemberAvgRet5,
+    boardMemberMedianRet5: stats.boardMemberMedianRet5,
+    boardLeaderRank,
+    boardLeaderPct,
+    boardMemberExcessRet5:
+      Number.isFinite(candidateRet) && Number.isFinite(stats.boardMemberMedianRet5) ? candidateRet - stats.boardMemberMedianRet5 : null,
+  };
 }
 
 main().catch((error) => {
