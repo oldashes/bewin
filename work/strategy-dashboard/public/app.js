@@ -7,6 +7,9 @@ const state = {
   strategy: "early",
   focusCode: null,
   timeline: [],
+  availableStrategies: [],
+  strategyParamDefs: [],
+  currentStrategy: null,
 };
 
 const els = {
@@ -33,6 +36,9 @@ const els = {
   signalHeat: document.querySelector("#signalHeat"),
   signalHeatDetail: document.querySelector("#signalHeatDetail"),
   signalConfirm: document.querySelector("#signalConfirm"),
+  evaluationSubtitle: document.querySelector("#evaluationSubtitle"),
+  evaluationRefresh: document.querySelector("#evaluationRefresh"),
+  evaluationBody: document.querySelector("#evaluationBody"),
   dailyTitle: document.querySelector("#dailyTitle"),
   dailySubtitle: document.querySelector("#dailySubtitle"),
   stockRows: document.querySelector("#stockRows"),
@@ -42,6 +48,12 @@ const els = {
   ruleTitle: document.querySelector("#ruleTitle"),
   ruleList: document.querySelector("#ruleList"),
   ruleNote: document.querySelector("#ruleNote"),
+  strategyNameInput: document.querySelector("#strategyNameInput"),
+  strategyParamGrid: document.querySelector("#strategyParamGrid"),
+  strategyEditMode: document.querySelector("#strategyEditMode"),
+  saveStrategyButton: document.querySelector("#saveStrategyButton"),
+  resetStrategyButton: document.querySelector("#resetStrategyButton"),
+  strategySaveStatus: document.querySelector("#strategySaveStatus"),
   verifyCode: document.querySelector("#verifyCode"),
   verifyDate: document.querySelector("#verifyDate"),
   verifyEntry: document.querySelector("#verifyEntry"),
@@ -172,6 +184,19 @@ async function getJson(path) {
   return response.json();
 }
 
+async function postJson(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || response.statusText);
+  }
+  return response.json();
+}
+
 function query(date = state.selectedDate) {
   const params = new URLSearchParams();
   if (date) params.set("date", date);
@@ -183,6 +208,11 @@ function query(date = state.selectedDate) {
 
 async function loadOverview() {
   const overview = await getJson(`/api/overview?source=${encodeURIComponent(state.dataSource)}&strategy=${encodeURIComponent(state.strategy)}`);
+  state.availableStrategies = overview.availableStrategies || [];
+  state.strategyParamDefs = overview.strategyParamDefs || [];
+  state.currentStrategy = overview.dataStrategy || null;
+  renderStrategyOptions();
+  renderStrategyEditor(state.currentStrategy);
   const sourceName = overview.dataSource?.shortLabel || overview.dataSource?.label || "数据源";
   const strategyName = overview.dataStrategy?.shortLabel || overview.dataSource?.strategy?.shortLabel || "策略";
   els.sourceLabel.textContent = `${sourceName} · ${strategyName} · ${overview.strictCount ? `${overview.strictCount} 条样本` : "暂无样本"}`;
@@ -195,11 +225,49 @@ async function loadOverview() {
   else els.dateInput.removeAttribute("max");
 }
 
+function renderStrategyOptions() {
+  if (!els.strategySelect || !state.availableStrategies.length) return;
+  const current = state.strategy;
+  const groups = [
+    ["内置策略", state.availableStrategies.filter((item) => !item.custom)],
+    ["自定义策略", state.availableStrategies.filter((item) => item.custom)],
+  ];
+  els.strategySelect.innerHTML = groups
+    .filter(([, items]) => items.length)
+    .map(
+      ([label, items]) => `
+        <optgroup label="${html(label)}">
+          ${items.map((item) => `<option value="${html(item.key)}">${html(item.shortLabel || item.label)}</option>`).join("")}
+        </optgroup>
+      `,
+    )
+    .join("");
+  if (state.availableStrategies.some((item) => item.key === current)) {
+    els.strategySelect.value = current;
+  } else {
+    state.strategy = state.availableStrategies[0]?.key || "early";
+    els.strategySelect.value = state.strategy;
+  }
+}
+
 async function loadTimeline() {
   state.timeline = await getJson(
     `/api/timeline?strict=${state.strict ? "true" : "false"}&source=${encodeURIComponent(state.dataSource)}&strategy=${encodeURIComponent(state.strategy)}`,
   );
   renderTimeline();
+}
+
+async function loadEvaluation() {
+  if (!els.evaluationBody) return;
+  els.evaluationBody.innerHTML = '<div class="emptyState">测评计算中...</div>';
+  try {
+    const payload = await getJson(
+      `/api/evaluation?strict=${state.strict ? "true" : "false"}&source=${encodeURIComponent(state.dataSource)}&strategy=${encodeURIComponent(state.strategy)}`,
+    );
+    renderEvaluation(payload);
+  } catch (error) {
+    els.evaluationBody.innerHTML = `<div class="emptyState">测评失败：${html(error.message)}</div>`;
+  }
 }
 
 async function loadDaily(date) {
@@ -320,6 +388,82 @@ function renderRule(strategy = {}) {
   els.ruleNote.textContent =
     strategy.note ||
     "这里展示的是策略候选和事后验证，不等同于买卖建议。最近日期的 10 日、20 日结果可能还没有到期。";
+}
+
+function strategyDisplayName(strategy = {}) {
+  return strategy.custom ? strategy.label || "我的策略" : `${strategy.shortLabel || strategy.label || "策略"} 调整版`;
+}
+
+function renderStrategyEditor(strategy = state.currentStrategy || {}) {
+  if (!els.strategyParamGrid) return;
+  const params = strategy.params || {};
+  els.strategyNameInput.value = strategyDisplayName(strategy);
+  els.strategyEditMode.textContent = strategy.custom ? "保存后更新当前自定义策略" : "保存后生成自定义策略";
+  els.strategyParamGrid.innerHTML = (state.strategyParamDefs || [])
+    .map((def) => {
+      const value = params[def.key];
+      if (def.type === "boolean") {
+        return `
+          <label class="paramToggle">
+            <input data-param="${html(def.key)}" type="checkbox" ${value ? "checked" : ""} />
+            <span>${html(def.label)}</span>
+            <small>${html(def.help || "")}</small>
+          </label>
+        `;
+      }
+      return `
+        <div class="field paramField">
+          <label for="param-${html(def.key)}">${html(def.label)}</label>
+          <input
+            id="param-${html(def.key)}"
+            data-param="${html(def.key)}"
+            type="number"
+            min="${html(def.min ?? "")}"
+            max="${html(def.max ?? "")}"
+            step="${html(def.step ?? (def.type === "integer" ? 1 : 0.01))}"
+            value="${html(value ?? "")}"
+            title="${html(def.help || "")}"
+          />
+        </div>
+      `;
+    })
+    .join("");
+  els.strategySaveStatus.textContent = "";
+}
+
+function readStrategyParamsFromEditor() {
+  const params = {};
+  for (const input of els.strategyParamGrid.querySelectorAll("[data-param]")) {
+    const key = input.dataset.param;
+    params[key] = input.type === "checkbox" ? input.checked : Number(input.value);
+  }
+  return params;
+}
+
+async function saveStrategyFromEditor() {
+  if (!els.strategyParamGrid) return;
+  const current = state.currentStrategy || {};
+  const customId = current.custom ? current.id || state.strategy.replace(/^custom:/, "") : "";
+  els.strategySaveStatus.textContent = "保存中...";
+  els.saveStrategyButton.disabled = true;
+  try {
+    const payload = await postJson(`/api/strategy-configs?source=${encodeURIComponent(state.dataSource)}`, {
+      id: customId || undefined,
+      source: state.dataSource,
+      baseStrategy: current.custom ? "early" : current.key || state.strategy,
+      name: els.strategyNameInput.value,
+      description: current.custom ? current.description || "" : `${current.label || "内置策略"} 的自定义参数版本`,
+      params: readStrategyParamsFromEditor(),
+    });
+    state.strategy = payload.strategy?.key || `custom:${payload.config.id}`;
+    els.strategySaveStatus.textContent = "已保存，正在重算...";
+    await reloadAll(state.selectedDate);
+    els.strategySaveStatus.textContent = "已保存并重算";
+  } catch (error) {
+    els.strategySaveStatus.textContent = `保存失败：${error.message}`;
+  } finally {
+    els.saveStrategyButton.disabled = false;
+  }
 }
 
 function renderStockRow(stock) {
@@ -566,6 +710,69 @@ function renderVerifyResult(payload) {
   `;
 }
 
+function metricValue(value, formatter = pct) {
+  return value === null || value === undefined || Number.isNaN(value) ? "-" : formatter(value);
+}
+
+function ratioValue(value) {
+  return value === null || value === undefined || Number.isNaN(value) ? "-" : `${Number(value).toFixed(2)}x`;
+}
+
+function renderEvaluation(payload) {
+  if (!els.evaluationBody) return;
+  const strategyName = payload.dataStrategy?.shortLabel || payload.dataStrategy?.label || "当前策略";
+  els.evaluationSubtitle.textContent = `${strategyName} · ${payload.sampleCount} 个样本 · ${payload.dateCount} 个信号日`;
+  const horizonCards = (payload.horizons || [])
+    .map(
+      (item) => `
+        <article class="evaluationCard">
+          <header>
+            <strong>${html(item.label)}</strong>
+            <span>${item.maturedCount}/${item.sampleCount} 到期</span>
+          </header>
+          <div class="evaluationMain ${pctClass(item.avg)}">${metricValue(item.avg)}</div>
+          <div class="evaluationGrid">
+            <span>中位 <b class="${pctClass(item.median)}">${metricValue(item.median)}</b></span>
+            <span>胜率 <b>${metricValue(item.winRate, (value) => pct(value, 1))}</b></span>
+            <span>盈亏比 <b>${ratioValue(item.profitFactor)}</b></span>
+            <span>赔率 <b>${ratioValue(item.payoffRatio)}</b></span>
+            <span>最好 <b class="${pctClass(item.best)}">${metricValue(item.best)}</b></span>
+            <span>最差 <b class="${pctClass(item.worst)}">${metricValue(item.worst)}</b></span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+  const feature = payload.featureStats || {};
+  const worst = payload.daily?.worst20?.[0] || payload.daily?.worst5?.[0] || null;
+  const best = payload.daily?.best20?.[0] || payload.daily?.best5?.[0] || null;
+  els.evaluationBody.innerHTML = `
+    <div class="evaluationSummary">
+      <div>
+        <span>样本/日期</span>
+        <strong>${payload.sampleCount} / ${payload.dateCount}</strong>
+        <small>日均 ${number(payload.avgCandidatesPerDate, 1)} 只候选</small>
+      </div>
+      <div>
+        <span>平均上移</span>
+        <strong>${number(feature.avgRankDelta20, 0)}</strong>
+        <small>中位 ${number(feature.medianRankDelta20, 0)}</small>
+      </div>
+      <div>
+        <span>量能中位</span>
+        <strong>${number(feature.medianAmountRatio)}x</strong>
+        <small>板块5日中位 ${metricValue(feature.medianBoardRet5)}</small>
+      </div>
+      <div>
+        <span>最好/最差日</span>
+        <strong class="${pctClass(best?.avg)}">${best ? metricValue(best.avg) : "-"}</strong>
+        <small>${best?.date || "-"} / ${worst?.date || "-"}</small>
+      </div>
+    </div>
+    <div class="evaluationCards">${horizonCards}</div>
+  `;
+}
+
 function renderBoards(boards) {
   if (!boards.length) {
     els.boardList.innerHTML = '<div class="emptyState">这一天没有板块聚合结果。</div>';
@@ -667,6 +874,7 @@ function adjacentCalendarDate(dates, current, step) {
 async function reloadAll(date = state.selectedDate) {
   await loadOverview();
   await loadTimeline();
+  await loadEvaluation();
   await loadDaily(date);
 }
 
@@ -688,6 +896,9 @@ function initEvents() {
     await reloadAll(els.dateInput.value || state.selectedDate);
   });
   els.refreshButton.addEventListener("click", () => reloadAll(state.selectedDate));
+  els.evaluationRefresh?.addEventListener("click", () => loadEvaluation());
+  els.saveStrategyButton?.addEventListener("click", () => saveStrategyFromEditor());
+  els.resetStrategyButton?.addEventListener("click", () => renderStrategyEditor(state.currentStrategy));
   const verifyForm = document.querySelector("#verifyForm");
   verifyForm?.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -729,7 +940,7 @@ async function boot() {
   const params = new URLSearchParams(window.location.search);
   state.strict = params.get("strict") !== "0";
   state.dataSource = params.get("source") === "ths" ? "ths" : "em";
-  state.strategy = params.get("strategy") === "hot" ? "hot" : "early";
+  state.strategy = params.get("strategy") || "early";
   els.strictToggle.checked = state.strict;
   els.dataSourceSelect.value = state.dataSource;
   els.strategySelect.value = state.strategy;

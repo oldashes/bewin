@@ -7,6 +7,7 @@
     "start": "node work/strategy-dashboard/server.js",
     "db:schema": "node scripts/db-schema.js",
     "db:import": "node scripts/import-signals.js",
+    "db:import-features": "node scripts/import-feature-events.js",
     "db:import-klines": "node scripts/import-klines.js",
     "db:import-ths": "node scripts/import-ths-history.js",
     "sync:daily": "node scripts/daily-sync.js",

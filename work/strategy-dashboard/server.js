@@ -94,6 +94,155 @@ const STRATEGIES = {
   },
 };
 
+const FEATURE_SET = "em-sector-filter-v1";
+const CUSTOM_STRATEGY_PREFIX = "custom:";
+
+const STRATEGY_PARAM_DEFS = [
+  {
+    key: "rankMin",
+    label: "人气排名下限",
+    type: "integer",
+    min: 1,
+    max: 5000,
+    help: "数值越小越热门。早期发现通常不看前100，而看从冷门区上移的股票。",
+  },
+  {
+    key: "rankMax",
+    label: "人气排名上限",
+    type: "integer",
+    min: 1,
+    max: 5000,
+    help: "与下限一起形成排名区间，例如 400-1200。",
+  },
+  {
+    key: "rankDelta20Min",
+    label: "20日前上移至少",
+    type: "integer",
+    min: 0,
+    max: 5000,
+    help: "20日前排名减去当前排名，越大代表人气上升越明显。",
+  },
+  {
+    key: "amountRatioMin",
+    label: "个股量能下限",
+    type: "number",
+    min: 0,
+    max: 20,
+    step: 0.1,
+    help: "当前成交额相对过去均值的倍数，下限太低会引入无量信号。",
+  },
+  {
+    key: "amountRatioMax",
+    label: "个股量能上限",
+    type: "number",
+    min: 0,
+    max: 20,
+    step: 0.1,
+    help: "上限太高容易追到短线已拥挤的股票。",
+  },
+  {
+    key: "stockPrev5MinPct",
+    label: "个股5日涨幅下限",
+    type: "percent",
+    min: -100,
+    max: 300,
+    step: 0.5,
+    help: "信号日前5个交易日的个股涨跌幅，百分比输入。",
+  },
+  {
+    key: "stockPrev5MaxPct",
+    label: "个股5日涨幅上限",
+    type: "percent",
+    min: -100,
+    max: 300,
+    step: 0.5,
+    help: "用于排除已经明显加速的股票。",
+  },
+  {
+    key: "boardRet5MinPct",
+    label: "板块5日涨幅下限",
+    type: "percent",
+    min: -100,
+    max: 300,
+    step: 0.5,
+    help: "板块趋势过滤，百分比输入。",
+  },
+  {
+    key: "boardRet5MaxPct",
+    label: "板块5日涨幅上限",
+    type: "percent",
+    min: -100,
+    max: 300,
+    step: 0.5,
+    help: "用于避免板块已经过热。",
+  },
+  {
+    key: "boardAmountRatioMin",
+    label: "板块量能下限",
+    type: "number",
+    min: 0,
+    max: 20,
+    step: 0.1,
+    help: "板块成交量能相对均值的倍数。",
+  },
+  {
+    key: "boardAmountRatioMax",
+    label: "板块量能上限",
+    type: "number",
+    min: 0,
+    max: 20,
+    step: 0.1,
+    help: "上限用于过滤板块短线过热。",
+  },
+  {
+    key: "maxPerDate",
+    label: "每日最多候选",
+    type: "integer",
+    min: 0,
+    max: 100,
+    help: "0 表示不过滤；大于 0 时按评分排序截取。",
+  },
+  {
+    key: "requireStrongBoard",
+    label: "必须有强板块",
+    type: "boolean",
+    help: "要求行业或概念板块满足强度条件。",
+  },
+];
+
+const STRATEGY_PARAM_DEFAULTS = {
+  early: {
+    rankMin: 400,
+    rankMax: 1200,
+    rankDelta20Min: 1,
+    amountRatioMin: 1,
+    amountRatioMax: 2.5,
+    stockPrev5MinPct: -20,
+    stockPrev5MaxPct: 35,
+    boardRet5MinPct: 3,
+    boardRet5MaxPct: 15,
+    boardAmountRatioMin: 1.2,
+    boardAmountRatioMax: 2,
+    maxPerDate: 0,
+    requireStrongBoard: true,
+  },
+  hot: {
+    rankMin: 1,
+    rankMax: 100,
+    rankDelta20Min: 300,
+    amountRatioMin: 0.8,
+    amountRatioMax: 3.5,
+    stockPrev5MinPct: -20,
+    stockPrev5MaxPct: 35,
+    boardRet5MinPct: -100,
+    boardRet5MaxPct: 300,
+    boardAmountRatioMin: 0,
+    boardAmountRatioMax: 20,
+    maxPerDate: 0,
+    requireStrongBoard: false,
+  },
+};
+
 function parseCsv(text) {
   const lines = text.trim().split(/\r?\n/).filter(Boolean);
   if (!lines.length) return [];
@@ -865,8 +1014,183 @@ function normalizeSourceKey(raw) {
   return DATA_SOURCES[raw] ? raw : "em";
 }
 
+function isCustomStrategyKey(raw) {
+  return String(raw || "").startsWith(CUSTOM_STRATEGY_PREFIX);
+}
+
+function customStrategyId(raw) {
+  return isCustomStrategyKey(raw) ? String(raw).slice(CUSTOM_STRATEGY_PREFIX.length) : "";
+}
+
 function normalizeStrategyKey(raw) {
+  if (isCustomStrategyKey(raw) && customStrategyId(raw)) return String(raw);
   return STRATEGIES[raw] ? raw : "early";
+}
+
+function asNumber(value, fallback, { min = -Infinity, max = Infinity, integer = false } = {}) {
+  const parsed = Number(value);
+  const safe = Number.isFinite(parsed) ? parsed : fallback;
+  const clamped = Math.min(max, Math.max(min, safe));
+  return integer ? Math.trunc(clamped) : clamped;
+}
+
+function asBoolean(value, fallback = false) {
+  if (value === true || value === "true" || value === "1" || value === 1) return true;
+  if (value === false || value === "false" || value === "0" || value === 0) return false;
+  return fallback;
+}
+
+function defaultParamsForStrategy(strategyKey = "early") {
+  return { ...(STRATEGY_PARAM_DEFAULTS[strategyKey] || STRATEGY_PARAM_DEFAULTS.early) };
+}
+
+function normalizeStrategyParams(input = {}, baseKey = "early") {
+  const defaults = defaultParamsForStrategy(baseKey);
+  const params = {
+    rankMin: asNumber(input.rankMin, defaults.rankMin, { min: 1, max: 5000, integer: true }),
+    rankMax: asNumber(input.rankMax, defaults.rankMax, { min: 1, max: 5000, integer: true }),
+    rankDelta20Min: asNumber(input.rankDelta20Min, defaults.rankDelta20Min, { min: 0, max: 5000, integer: true }),
+    amountRatioMin: asNumber(input.amountRatioMin, defaults.amountRatioMin, { min: 0, max: 20 }),
+    amountRatioMax: asNumber(input.amountRatioMax, defaults.amountRatioMax, { min: 0, max: 20 }),
+    stockPrev5MinPct: asNumber(input.stockPrev5MinPct, defaults.stockPrev5MinPct, { min: -100, max: 300 }),
+    stockPrev5MaxPct: asNumber(input.stockPrev5MaxPct, defaults.stockPrev5MaxPct, { min: -100, max: 300 }),
+    boardRet5MinPct: asNumber(input.boardRet5MinPct, defaults.boardRet5MinPct, { min: -100, max: 300 }),
+    boardRet5MaxPct: asNumber(input.boardRet5MaxPct, defaults.boardRet5MaxPct, { min: -100, max: 300 }),
+    boardAmountRatioMin: asNumber(input.boardAmountRatioMin, defaults.boardAmountRatioMin, { min: 0, max: 20 }),
+    boardAmountRatioMax: asNumber(input.boardAmountRatioMax, defaults.boardAmountRatioMax, { min: 0, max: 20 }),
+    maxPerDate: asNumber(input.maxPerDate, defaults.maxPerDate, { min: 0, max: 100, integer: true }),
+    requireStrongBoard: asBoolean(input.requireStrongBoard, defaults.requireStrongBoard),
+  };
+
+  if (params.rankMin > params.rankMax) [params.rankMin, params.rankMax] = [params.rankMax, params.rankMin];
+  if (params.amountRatioMin > params.amountRatioMax) {
+    [params.amountRatioMin, params.amountRatioMax] = [params.amountRatioMax, params.amountRatioMin];
+  }
+  if (params.stockPrev5MinPct > params.stockPrev5MaxPct) {
+    [params.stockPrev5MinPct, params.stockPrev5MaxPct] = [params.stockPrev5MaxPct, params.stockPrev5MinPct];
+  }
+  if (params.boardRet5MinPct > params.boardRet5MaxPct) {
+    [params.boardRet5MinPct, params.boardRet5MaxPct] = [params.boardRet5MaxPct, params.boardRet5MinPct];
+  }
+  if (params.boardAmountRatioMin > params.boardAmountRatioMax) {
+    [params.boardAmountRatioMin, params.boardAmountRatioMax] = [params.boardAmountRatioMax, params.boardAmountRatioMin];
+  }
+  return params;
+}
+
+function createCustomStrategyId() {
+  return `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function percentRule(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return `${number.toFixed(Math.abs(number) % 1 ? 1 : 0)}%`;
+}
+
+function paramsToRuleItems(params) {
+  return [
+    `人气排名 ${params.rankMin}-${params.rankMax}`,
+    `人气相对 20 日前上移 ≥${params.rankDelta20Min}`,
+    `个股温和放量 ${params.amountRatioMin}-${params.amountRatioMax}`,
+    `个股5日 ${percentRule(params.stockPrev5MinPct)}-${percentRule(params.stockPrev5MaxPct)}`,
+    `板块5日 ${percentRule(params.boardRet5MinPct)}-${percentRule(params.boardRet5MaxPct)}`,
+    `板块量能 ${params.boardAmountRatioMin}-${params.boardAmountRatioMax}`,
+    params.maxPerDate ? `每日最多 ${params.maxPerDate} 只` : "每日候选不限数量",
+    params.requireStrongBoard ? "必须匹配强板块" : "不强制强板块",
+  ];
+}
+
+function customStrategyDescriptor(config) {
+  const params = normalizeStrategyParams(config.params || {}, "early");
+  const label = config.name || "自定义策略";
+  return {
+    key: `${CUSTOM_STRATEGY_PREFIX}${config.id}`,
+    id: config.id,
+    label,
+    shortLabel: label,
+    description: config.description || "基于完整特征池动态重算的自定义策略",
+    rule: paramsToRuleItems(params).slice(0, 6).join(" + "),
+    ruleItems: paramsToRuleItems(params),
+    note: config.description || "自定义策略基于特征池重新筛选候选；保存后会按参数重新计算候选池和测评结果。",
+    custom: true,
+    params,
+  };
+}
+
+function builtinStrategyDescriptor(strategyKey) {
+  const strategy = STRATEGIES[strategyKey] || STRATEGIES.early;
+  return {
+    ...strategy,
+    custom: false,
+    params: normalizeStrategyParams(STRATEGY_PARAM_DEFAULTS[strategyKey] || STRATEGY_PARAM_DEFAULTS.early, strategyKey),
+  };
+}
+
+function strategyConfigRowToObject(row) {
+  return {
+    id: row.id,
+    source: row.source || "em",
+    name: row.name,
+    description: row.description || "",
+    params: normalizeStrategyParams(row.params || {}, "early"),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+async function listStrategyConfigs(sourceKey = "em") {
+  if (!process.env.DATABASE_URL) return [];
+  const { rows } = await getDbPool().query(
+    `
+      select id, source, name, description, params, created_at, updated_at
+      from strategy_configs
+      where source = $1
+      order by updated_at desc
+    `,
+    [sourceKey],
+  );
+  return rows.map(strategyConfigRowToObject);
+}
+
+async function getStrategyConfig(id, sourceKey = "em") {
+  if (!process.env.DATABASE_URL) return null;
+  const { rows } = await getDbPool().query(
+    `
+      select id, source, name, description, params, created_at, updated_at
+      from strategy_configs
+      where id = $1 and source = $2
+      limit 1
+    `,
+    [id, sourceKey],
+  );
+  return rows[0] ? strategyConfigRowToObject(rows[0]) : null;
+}
+
+async function saveStrategyConfigPayload(body = {}) {
+  requireDatabase();
+  const sourceKey = normalizeSourceKey(body.source || "em");
+  const id = String(body.id || "").match(/^[a-zA-Z0-9:_-]{3,80}$/) ? String(body.id) : createCustomStrategyId();
+  const name = String(body.name || "").trim().slice(0, 80) || "我的策略";
+  const description = String(body.description || "").trim().slice(0, 500);
+  const params = normalizeStrategyParams(body.params || {}, body.baseStrategy || "early");
+  const { rows } = await getDbPool().query(
+    `
+      insert into strategy_configs (id, source, name, description, params, updated_at)
+      values ($1, $2, $3, $4, $5::jsonb, now())
+      on conflict (id) do update set
+        source = excluded.source,
+        name = excluded.name,
+        description = excluded.description,
+        params = excluded.params,
+        updated_at = now()
+      returning id, source, name, description, params, created_at, updated_at
+    `,
+    [id, sourceKey, name, description, JSON.stringify(params)],
+  );
+  cachedDbData.delete(`${sourceKey}:${CUSTOM_STRATEGY_PREFIX}${id}`);
+  const config = strategyConfigRowToObject(rows[0]);
+  return { config, strategy: customStrategyDescriptor(config) };
 }
 
 function loadThsData() {
@@ -1178,10 +1502,169 @@ function dbRowToEvent(row, strategyKey) {
   return event;
 }
 
+function featureRowToEvent(row, config) {
+  const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
+  const signalDate = normalizeDate(row.signal_date);
+  if (!code || !signalDate) return null;
+
+  const raw = row.raw && typeof row.raw === "object" ? row.raw : {};
+  const concepts = Array.isArray(row.concepts) ? row.concepts : [];
+  const baseName = row.name || raw.name || code;
+  const cachedMeta = enrichStockMeta(code, baseName, signalDate);
+  const meta = {
+    ...cachedMeta,
+    name: cachedMeta.name || baseName,
+    exchange: row.exchange || cachedMeta.exchange,
+    board: row.board || cachedMeta.board,
+    industry: row.industry || cachedMeta.industry,
+    region: row.region || cachedMeta.region,
+    concepts: concepts.length ? concepts : cachedMeta.concepts || [],
+    listingDate: normalizeDate(row.listing_date) || cachedMeta.listingDate,
+  };
+
+  const bestBoardType = row.best_board_type || raw.bestBoardType || raw.boardType || (meta.industry ? "industry" : "concept");
+  const bestBoardName =
+    row.best_board_name || raw.bestBoardName || raw.boardName || meta.industry || meta.concepts?.[0] || meta.board || "未分类";
+  const event = {
+    source: config.name || "自定义策略",
+    strategyKey: `${CUSTOM_STRATEGY_PREFIX}${config.id}`,
+    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
+    code,
+    name: meta.name || baseName,
+    signalDate,
+    entryDate: normalizeDate(row.entry_date) || null,
+    exitDate5: normalizeDate(raw.exitDate5) || null,
+    exitDate10: normalizeDate(raw.exitDate10) || null,
+    exitDate20: normalizeDate(raw.exitDate20) || null,
+    rank: n(row.rank),
+    rank5: n(row.rank_5),
+    rank10: n(row.rank_10),
+    rank20: n(row.rank_20),
+    median5: n(row.median_5),
+    medianPrev5: n(row.median_prev_5),
+    medianPrev10: n(row.median_prev_10),
+    entryOpen: n(row.entry_open),
+    signalClose: n(row.signal_close),
+    prev5: n(row.prev_5),
+    prev10: n(row.prev_10),
+    amountRatio: n(row.amount_ratio),
+    turnover5: n(row.turnover_5),
+    ret5: n(row.ret_5),
+    ret10: n(row.ret_10),
+    ret20: n(row.ret_20),
+    boardCount: n(row.board_count),
+    bestBoardType,
+    bestBoardCode: row.best_board_code || raw.bestBoardCode || raw.boardCode || "",
+    bestBoardName,
+    bestBoardRet5: n(row.best_board_ret_5),
+    bestBoardRet10: n(row.best_board_ret_10),
+    bestBoardAmountRatio: n(row.best_board_amount_ratio),
+    bestBoardScoreRankPct: n(row.best_board_score_rank_pct),
+    hasStrongIndustry: row.has_strong_industry === true || bestBoardType === "industry",
+    hasStrongConcept: row.has_strong_concept === true || bestBoardType === "concept",
+    meta,
+  };
+  event.strictBoard = !PSEUDO_BOARD_RE.test(event.bestBoardName || "");
+  event.score = n(row.score) ?? scoreEvent(event);
+  event.modelScore = null;
+  event.sortScore = event.score;
+  event.riskFlags = riskFlags(event);
+  return event;
+}
+
+function filterMaxPerDate(events, maxPerDate) {
+  if (!maxPerDate) return events;
+  const byDate = new Map();
+  for (const event of events) {
+    if (!byDate.has(event.signalDate)) byDate.set(event.signalDate, []);
+    byDate.get(event.signalDate).push(event);
+  }
+  return [...byDate.values()].flatMap((items) =>
+    items
+      .sort((a, b) => b.sortScore - a.sortScore || (a.rank || 99999) - (b.rank || 99999))
+      .slice(0, maxPerDate),
+  );
+}
+
+async function loadCustomStrategyData(sourceKey, strategyKey) {
+  const id = customStrategyId(strategyKey);
+  if (!id || !process.env.DATABASE_URL) {
+    return emptyData(sourceKey, "neon:strategy_feature_events", "自定义策略需要先连接数据库并保存策略参数。");
+  }
+  const cacheKey = `${sourceKey}:${strategyKey}`;
+  if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
+
+  const config = await getStrategyConfig(id, sourceKey);
+  if (!config) {
+    return emptyData(sourceKey, "neon:strategy_feature_events", "没有找到这个自定义策略，请重新保存策略参数。");
+  }
+  const params = normalizeStrategyParams(config.params || {}, "early");
+  const { rows } = await getDbPool().query(
+    `
+      select
+        f.*,
+        st.exchange,
+        st.board,
+        st.industry,
+        st.region,
+        st.concepts,
+        st.listing_date
+      from strategy_feature_events f
+      left join stocks st on st.code = f.code
+      where f.source = $1
+        and f.feature_set = $2
+        and f.rank between $3 and $4
+        and coalesce(f.rank_delta_20, f.rank_20 - f.rank) >= $5
+        and f.amount_ratio between $6 and $7
+        and f.prev_5 between $8 and $9
+        and f.best_board_ret_5 between $10 and $11
+        and f.best_board_amount_ratio between $12 and $13
+        and (
+          $14::boolean = false
+          or f.has_strong_board is true
+          or f.has_strong_industry is true
+          or f.has_strong_concept is true
+        )
+      order by f.signal_date asc, f.rank asc nulls last
+    `,
+    [
+      sourceKey,
+      FEATURE_SET,
+      params.rankMin,
+      params.rankMax,
+      params.rankDelta20Min,
+      params.amountRatioMin,
+      params.amountRatioMax,
+      params.stockPrev5MinPct / 100,
+      params.stockPrev5MaxPct / 100,
+      params.boardRet5MinPct / 100,
+      params.boardRet5MaxPct / 100,
+      params.boardAmountRatioMin,
+      params.boardAmountRatioMax,
+      params.requireStrongBoard,
+    ],
+  );
+
+  let events = rows.map((row) => featureRowToEvent(row, config)).filter(Boolean);
+  events = filterMaxPerDate(events, params.maxPerDate);
+  await backfillDbEventReturns(events);
+  const strategy = customStrategyDescriptor(config);
+  const data = finalizeData(events, "neon:strategy_feature_events", sourceKey, {
+    strategy,
+    description: `${DATA_SOURCES[sourceKey]?.label || sourceKey}，自定义策略基于完整特征池重算`,
+    sourceFile: "neon:strategy_feature_events",
+    available: events.length > 0,
+    message: events.length ? "" : "当前参数没有筛出候选。可以放宽排名、量能或板块条件后重新保存。",
+  });
+  cachedDbData.set(cacheKey, data);
+  return data;
+}
+
 async function loadDataForSource(rawSource, rawStrategy) {
   const sourceKey = normalizeSourceKey(rawSource);
   const strategyKey = normalizeStrategyKey(rawStrategy);
   if (sourceKey === "ths") return loadThsData();
+  if (isCustomStrategyKey(strategyKey)) return loadCustomStrategyData(sourceKey, strategyKey);
   if (shouldUseDatabase(sourceKey)) return loadDbData(sourceKey, strategyKey);
   return strategyKey === "hot" ? loadHotData() : loadData();
 }
@@ -1221,6 +1704,69 @@ function summarize(events) {
     matured5: events.filter((event) => event.ret5 !== null).length,
     matured10: events.filter((event) => event.ret10 !== null).length,
     matured20: events.filter((event) => event.ret20 !== null).length,
+  };
+}
+
+function sum(values) {
+  return values.filter(Number.isFinite).reduce((total, value) => total + value, 0);
+}
+
+function horizonEvaluation(events, field, label) {
+  const matured = events.filter((event) => Number.isFinite(event[field]));
+  const values = matured.map((event) => event[field]);
+  const wins = values.filter((value) => value > 0);
+  const losses = values.filter((value) => value < 0);
+  const gain = sum(wins);
+  const loss = Math.abs(sum(losses));
+  return {
+    key: field,
+    label,
+    sampleCount: events.length,
+    maturedCount: matured.length,
+    pendingCount: events.length - matured.length,
+    coverage: events.length ? matured.length / events.length : null,
+    avg: avg(values),
+    median: median(values),
+    winRate: winRate(values),
+    avgWin: avg(wins),
+    avgLoss: avg(losses),
+    payoffRatio: avg(losses) ? Math.abs((avg(wins) || 0) / avg(losses)) : null,
+    profitFactor: loss ? gain / loss : gain ? null : null,
+    best: values.length ? Math.max(...values) : null,
+    worst: values.length ? Math.min(...values) : null,
+  };
+}
+
+function dailyEvaluation(events, field) {
+  const byDate = new Map();
+  for (const event of events) {
+    if (!Number.isFinite(event[field])) continue;
+    if (!byDate.has(event.signalDate)) byDate.set(event.signalDate, []);
+    byDate.get(event.signalDate).push(event[field]);
+  }
+  return [...byDate.entries()]
+    .map(([date, values]) => ({
+      date,
+      count: values.length,
+      avg: avg(values),
+      median: median(values),
+      winRate: winRate(values),
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function dateFilteredEvents(events, from, to) {
+  const start = normalizeDate(from);
+  const end = normalizeDate(to);
+  return events.filter((event) => (!start || event.signalDate >= start) && (!end || event.signalDate <= end));
+}
+
+async function availableStrategiesForSource(sourceKey) {
+  const customConfigs = await listStrategyConfigs(sourceKey);
+  return {
+    builtIn: Object.values(STRATEGIES).map((strategy) => builtinStrategyDescriptor(strategy.key)),
+    custom: customConfigs.map(customStrategyDescriptor),
+    customConfigs,
   };
 }
 
@@ -1372,6 +1918,7 @@ async function timelinePayload(query) {
 
 async function overviewPayload(query = {}) {
   const data = await loadDataForSource(query.source, query.strategy);
+  const strategies = await availableStrategiesForSource(data.sourceKey);
   const tradingDates = readTradingCalendar().filter(
     (date) => date >= (data.dates[0] || date) && date <= (data.dates[data.dates.length - 1] || date),
   );
@@ -1381,7 +1928,9 @@ async function overviewPayload(query = {}) {
     sourceKey: data.sourceKey,
     dataSource: data.dataSource,
     availableSources: Object.values(DATA_SOURCES),
-    availableStrategies: Object.values(STRATEGIES),
+    availableStrategies: [...strategies.builtIn, ...strategies.custom],
+    customStrategies: strategies.custom,
+    strategyParamDefs: STRATEGY_PARAM_DEFS,
     dataStrategy: data.dataSource.strategy,
     strictCount: data.strictEvents.length,
     rawCount: data.events.length,
@@ -1392,6 +1941,73 @@ async function overviewPayload(query = {}) {
     tradingMinDate: tradingDates[0] || null,
     tradingMaxDate: tradingDates[tradingDates.length - 1] || null,
     overall: summarize(data.strictEvents),
+  };
+}
+
+async function strategyConfigsPayload(query = {}) {
+  const sourceKey = normalizeSourceKey(query.source);
+  const strategies = await availableStrategiesForSource(sourceKey);
+  return {
+    sourceKey,
+    builtIn: strategies.builtIn,
+    custom: strategies.custom,
+    configs: strategies.customConfigs,
+    paramDefs: STRATEGY_PARAM_DEFS,
+    defaults: STRATEGY_PARAM_DEFAULTS,
+  };
+}
+
+async function evaluationPayload(query = {}) {
+  const data = await loadDataForSource(query.source, query.strategy);
+  const strict = query.strict !== "false";
+  const baseEvents = strict ? data.strictEvents : data.events;
+  const events = dateFilteredEvents(baseEvents, query.from, query.to);
+  const dates = [...new Set(events.map((event) => event.signalDate))].sort();
+  const horizons = [
+    horizonEvaluation(events, "ret5", "5日"),
+    horizonEvaluation(events, "ret10", "10日"),
+    horizonEvaluation(events, "ret20", "20日"),
+  ];
+  const dailyRet5 = dailyEvaluation(events, "ret5");
+  const dailyRet20 = dailyEvaluation(events, "ret20");
+  const rankDeltas = events
+    .map((event) => (event.rank20 && event.rank ? event.rank20 - event.rank : null))
+    .filter(Number.isFinite);
+  const amountRatios = events.map((event) => event.amountRatio).filter(Number.isFinite);
+  const boardRet5 = events.map((event) => event.bestBoardRet5).filter(Number.isFinite);
+
+  return {
+    strict,
+    requestedRange: {
+      from: normalizeDate(query.from) || null,
+      to: normalizeDate(query.to) || null,
+    },
+    actualRange: {
+      from: dates[0] || null,
+      to: dates[dates.length - 1] || null,
+    },
+    dataSource: data.dataSource,
+    dataStrategy: data.dataSource.strategy,
+    sampleCount: events.length,
+    dateCount: dates.length,
+    avgCandidatesPerDate: dates.length ? events.length / dates.length : null,
+    horizons,
+    featureStats: {
+      avgRankDelta20: avg(rankDeltas),
+      medianRankDelta20: median(rankDeltas),
+      avgAmountRatio: avg(amountRatios),
+      medianAmountRatio: median(amountRatios),
+      avgBoardRet5: avg(boardRet5),
+      medianBoardRet5: median(boardRet5),
+    },
+    daily: {
+      ret5: dailyRet5,
+      ret20: dailyRet20,
+      best5: dailyRet5.slice().sort((a, b) => (b.avg || 0) - (a.avg || 0)).slice(0, 5),
+      worst5: dailyRet5.slice().sort((a, b) => (a.avg || 0) - (b.avg || 0)).slice(0, 5),
+      best20: dailyRet20.slice().sort((a, b) => (b.avg || 0) - (a.avg || 0)).slice(0, 5),
+      worst20: dailyRet20.slice().sort((a, b) => (a.avg || 0) - (b.avg || 0)).slice(0, 5),
+    },
   };
 }
 
@@ -2399,10 +3015,38 @@ function sendFile(res, requestPath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleApiRequest(pathname, query, headers = {}) {
+function normalizeRequestBody(body) {
+  if (!body) return {};
+  if (typeof body === "object" && !Buffer.isBuffer(body)) return body;
+  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const wrapped = new Error("请求体不是合法 JSON");
+    wrapped.statusCode = 400;
+    throw wrapped;
+  }
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("error", reject);
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+async function handleApiRequest(pathname, query, headers = {}, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const body = normalizeRequestBody(options.body);
   if (pathname === "/api/overview") return overviewPayload(query);
   if (pathname === "/api/daily") return dailyPayload(query);
   if (pathname === "/api/timeline") return timelinePayload(query);
+  if (pathname === "/api/evaluation") return evaluationPayload(query);
+  if (pathname === "/api/strategy-configs" && method === "GET") return strategyConfigsPayload(query);
+  if (pathname === "/api/strategy-configs" && method === "POST") return saveStrategyConfigPayload({ ...body, source: body.source || query.source });
   if (pathname === "/api/stock-signals") return stockSignalsPayload(query);
   if (pathname === "/api/position") return positionPayload(query);
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
@@ -2417,7 +3061,8 @@ const server = http.createServer(async (req, res) => {
   const query = Object.fromEntries(parsed.searchParams.entries());
   try {
     if (parsed.pathname.startsWith("/api/")) {
-      sendJson(res, await handleApiRequest(parsed.pathname, query, req.headers));
+      const body = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await readRequestBody(req) : "";
+      sendJson(res, await handleApiRequest(parsed.pathname, query, req.headers, { method: req.method, body }));
     } else {
       sendFile(res, parsed.pathname);
     }
@@ -2439,6 +3084,8 @@ module.exports = {
   timelinePayload,
   stockSignalsPayload,
   positionPayload,
+  strategyConfigsPayload,
+  evaluationPayload,
   dailySyncPayload,
   runDailyKlineSync,
   thsSyncPayload,
