@@ -61,7 +61,7 @@ const MIME_TYPES = {
 
 let cachedData;
 let cachedHotData;
-let cachedThsData;
+let cachedThsData = new Map();
 let cachedDbData = new Map();
 let cachedNames;
 let cachedStockMeta;
@@ -1331,15 +1331,19 @@ async function saveStrategyConfigPayload(body = {}) {
   return { config, strategy: customStrategyDescriptor(config) };
 }
 
-function loadThsData() {
-  if (cachedThsData) return cachedThsData;
+async function loadThsData(strategyKey = "early") {
+  if (strategyKey === "hot") return loadThsSnapshotHotData({ sourceKey: "ths" });
+
+  const cacheKey = `ths:${strategyKey}`;
+  if (cachedThsData.has(cacheKey)) return cachedThsData.get(cacheKey);
   if (!fs.existsSync(THS_CANDIDATES_FILE)) {
-    cachedThsData = emptyData(
+    const data = emptyData(
       "ths",
       THS_CANDIDATES_FILE,
       "同花顺历史人气数据尚未积累。开始每日采集后，把统一格式文件写入 outputs/ths-popularity-strategy-candidates.csv 即可在这里回测。",
     );
-    return cachedThsData;
+    cachedThsData.set(cacheKey, data);
+    return data;
   }
 
   const names = readStockNames();
@@ -1396,12 +1400,13 @@ function loadThsData() {
     })
     .filter(Boolean);
 
-  cachedThsData = finalizeData(events, THS_CANDIDATES_FILE, "ths", {
+  const data = finalizeData(events, THS_CANDIDATES_FILE, "ths", {
     strategy: STRATEGIES.early,
     available: events.length > 0,
     message: events.length ? "" : "同花顺统一数据文件存在，但没有可用候选记录。",
   });
-  return cachedThsData;
+  cachedThsData.set(cacheKey, data);
+  return data;
 }
 
 function shouldUseDatabase(sourceKey) {
@@ -1461,6 +1466,34 @@ function dbBarRowToKline(row) {
     close: n(row.close),
     high: n(row.high),
     low: n(row.low),
+    volume: n(row.volume),
+    amount: n(row.amount),
+    turnover: n(row.turnover),
+    pct: n(row.pct),
+  };
+}
+
+function stockPreSignalMetricsFromRows(rows, signalDate) {
+  const index = rows.findIndex((row) => row.date === signalDate);
+  if (index < 0) return {};
+  const current = rows[index];
+  const prev5Row = index >= 5 ? rows[index - 5] : null;
+  const prev10Row = index >= 10 ? rows[index - 10] : null;
+  const amountBaseRows = rows.slice(Math.max(0, index - 20), index).filter((row) => Number.isFinite(row.amount) && row.amount > 0);
+  const turnoverRows = rows.slice(Math.max(0, index - 4), index + 1).filter((row) => Number.isFinite(row.turnover));
+  const amountBase = avg(amountBaseRows.map((row) => row.amount));
+  return {
+    prev5:
+      prev5Row && Number.isFinite(current.close) && Number.isFinite(prev5Row.close) && prev5Row.close
+        ? (current.close - prev5Row.close) / prev5Row.close
+        : null,
+    prev10:
+      prev10Row && Number.isFinite(current.close) && Number.isFinite(prev10Row.close) && prev10Row.close
+        ? (current.close - prev10Row.close) / prev10Row.close
+        : null,
+    amountRatio: amountBase && Number.isFinite(current.amount) ? current.amount / amountBase : null,
+    turnover5: avg(turnoverRows.map((row) => row.turnover)),
+    signalClose: Number.isFinite(current.close) ? current.close : null,
   };
 }
 
@@ -1523,6 +1556,68 @@ async function backfillDbEventReturns(events) {
   return events;
 }
 
+function eventNeedsDbPreSignalMetrics(event) {
+  return (
+    event.prev5 === null ||
+    event.prev10 === null ||
+    event.amountRatio === null ||
+    event.turnover5 === null ||
+    event.signalClose === null
+  );
+}
+
+async function attachDbPreSignalMetrics(events) {
+  const targets = events.filter(eventNeedsDbPreSignalMetrics);
+  if (!targets.length) return events;
+
+  const codes = [...new Set(targets.map((event) => event.code).filter(Boolean))];
+  const minSignalDate = targets
+    .map((event) => event.signalDate)
+    .filter(Boolean)
+    .sort()[0];
+  const maxSignalDate = targets
+    .map((event) => event.signalDate)
+    .filter(Boolean)
+    .sort()
+    .at(-1);
+  if (!codes.length || !minSignalDate || !maxSignalDate) return events;
+
+  const { rows } = await getDbPool().query(
+    `
+      select code, trade_date, open, close, high, low, volume, amount, turnover, pct
+      from stock_daily_bars
+      where code = any($1)
+        and trade_date >= $2::date - interval '90 day'
+        and trade_date <= $3::date
+      order by code asc, trade_date asc
+    `,
+    [codes, minSignalDate, maxSignalDate],
+  );
+
+  const rowsByCode = new Map();
+  for (const row of rows) {
+    const code = String(row.code || "");
+    const kline = dbBarRowToKline(row);
+    if (!code || !kline.date || !Number.isFinite(kline.close)) continue;
+    if (!rowsByCode.has(code)) rowsByCode.set(code, []);
+    rowsByCode.get(code).push(kline);
+  }
+
+  for (const event of targets) {
+    const metrics = stockPreSignalMetricsFromRows(rowsByCode.get(event.code) || [], event.signalDate);
+    if (event.prev5 === null && metrics.prev5 !== null) event.prev5 = metrics.prev5;
+    if (event.prev10 === null && metrics.prev10 !== null) event.prev10 = metrics.prev10;
+    if (event.amountRatio === null && metrics.amountRatio !== null) event.amountRatio = metrics.amountRatio;
+    if (event.turnover5 === null && metrics.turnover5 !== null) event.turnover5 = metrics.turnover5;
+    if (event.signalClose === null && metrics.signalClose !== null) event.signalClose = metrics.signalClose;
+    event.score = event.strategyKey === "hot" ? scoreHotEvent(event) : scoreEvent(event);
+    event.sortScore = event.modelScore ?? event.score;
+    assignAttribution(event);
+    event.riskFlags = event.strategyKey === "hot" ? hotRiskFlags(event) : riskFlags(event);
+  }
+  return events;
+}
+
 async function loadDbData(sourceKey, strategyKey) {
   const cacheKey = `${sourceKey}:${strategyKey}`;
   if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
@@ -1557,6 +1652,167 @@ async function loadDbData(sourceKey, strategyKey) {
     sourceFile: "neon:strategy_signals",
     available: events.length > 0,
     message: events.length ? "" : "Neon 中暂无当前数据源和策略的信号记录。",
+  });
+  cachedDbData.set(cacheKey, data);
+  return data;
+}
+
+function snapshotRankWindowMaps(rows) {
+  const rankByDate = new Map();
+  for (const row of rows) {
+    const date = normalizeDate(row.snapshot_date);
+    const code = String(row.code || "");
+    if (!date || !code) continue;
+    if (!rankByDate.has(date)) rankByDate.set(date, new Map());
+    rankByDate.get(date).set(code, n(row.rank));
+  }
+  const dates = [...rankByDate.keys()].sort();
+  const dateIndex = new Map(dates.map((date, index) => [date, index]));
+  return {
+    rankAt(date, code, offset) {
+      const index = dateIndex.get(date);
+      if (!Number.isFinite(index) || index < offset) return null;
+      const priorDate = dates[index - offset];
+      return rankByDate.get(priorDate)?.get(code) ?? null;
+    },
+  };
+}
+
+function snapshotRowToHotEvent(row, rankWindows, sourceName = "同花顺热榜快照") {
+  const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
+  const signalDate = normalizeDate(row.snapshot_date);
+  if (!code || !signalDate) return null;
+
+  const concepts = Array.isArray(row.concepts) ? row.concepts : [];
+  const baseName = row.name || row.stock_name || code;
+  const cachedMeta = enrichStockMeta(code, baseName, signalDate);
+  const snapshotConcept = String(row.main_tag || "").trim();
+  const exchange = row.exchange || (String(row.market) === "17" ? "SH" : String(row.market) === "33" ? "SZ" : cachedMeta.exchange);
+  const meta = {
+    ...cachedMeta,
+    name: cachedMeta.name || baseName,
+    exchange,
+    board: row.board || cachedMeta.board,
+    industry: row.industry || cachedMeta.industry,
+    region: row.region || cachedMeta.region,
+    concepts: concepts.length ? concepts : snapshotConcept ? [snapshotConcept] : cachedMeta.concepts || [],
+    listingDate: normalizeDate(row.listing_date) || cachedMeta.listingDate,
+  };
+  const bestBoardName = snapshotConcept || meta.industry || meta.concepts?.[0] || meta.board || "未分类";
+  const event = {
+    source: sourceName,
+    strategyKey: "hot",
+    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
+    code,
+    name: meta.name || baseName,
+    signalDate,
+    entryDate: null,
+    exitDate5: null,
+    exitDate10: null,
+    exitDate20: null,
+    rank: n(row.rank),
+    rank5: rankWindows.rankAt(signalDate, code, 5),
+    rank10: rankWindows.rankAt(signalDate, code, 10),
+    rank20: rankWindows.rankAt(signalDate, code, 20),
+    median5: null,
+    medianPrev5: null,
+    medianPrev10: null,
+    entryOpen: null,
+    signalClose: null,
+    prev5: null,
+    prev10: null,
+    amountRatio: null,
+    turnover5: null,
+    ret5: null,
+    ret10: null,
+    ret20: null,
+    boardCount: null,
+    bestBoardType: snapshotConcept ? "concept" : meta.industry ? "industry" : "concept",
+    bestBoardCode: "",
+    bestBoardName,
+    bestBoardRet5: null,
+    bestBoardRet10: null,
+    bestBoardAmountRatio: null,
+    bestBoardScoreRankPct: null,
+    boardPositiveRatio: null,
+    boardHotRatio: null,
+    boardStrongRatio: null,
+    boardLeaderPct: null,
+    boardLeaderRank: null,
+    boardMemberExcessRet5: null,
+    boardValidMemberCount: null,
+    hasStrongIndustry: Boolean(meta.industry),
+    hasStrongConcept: Boolean(snapshotConcept || meta.concepts?.length),
+    meta,
+  };
+  event.strictBoard = !PSEUDO_BOARD_RE.test(event.bestBoardName || "");
+  event.score = scoreHotEvent(event);
+  event.modelScore = null;
+  event.sortScore = event.score;
+  assignAttribution(event);
+  event.riskFlags = hotRiskFlags(event);
+  return event;
+}
+
+async function loadThsSnapshotHotData({ sourceKey = "ths", afterDate = null, asSupplement = false } = {}) {
+  if (!process.env.DATABASE_URL) {
+    return emptyData(sourceKey, "neon:popularity_snapshots", "同花顺热榜快照需要先连接数据库。");
+  }
+
+  const normalizedAfterDate = normalizeDate(afterDate) || null;
+  const cacheKey = `${sourceKey}:ths-snapshot-hot:${normalizedAfterDate || "all"}:${asSupplement ? "supplement" : "direct"}`;
+  if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
+
+  const { rows } = await getDbPool().query(
+    `
+      with latest as (
+        select snapshot_date, max(snapshot_key) as snapshot_key
+        from popularity_snapshots
+        where source = 'ths'
+          and category = 'stock'
+          and metric = 'hot'
+        group by snapshot_date
+      )
+      select
+        p.*,
+        st.name as stock_name,
+        st.exchange,
+        st.board,
+        st.industry,
+        st.region,
+        st.concepts,
+        st.listing_date
+      from popularity_snapshots p
+      join latest l on l.snapshot_date = p.snapshot_date and l.snapshot_key = p.snapshot_key
+      left join stocks st on st.code = p.code
+      where p.source = 'ths'
+        and p.category = 'stock'
+        and p.metric = 'hot'
+        and p.rank between 1 and 100
+        and ($1::date is null or p.snapshot_date > $1::date)
+      order by p.snapshot_date asc, p.rank asc nulls last
+    `,
+    [normalizedAfterDate],
+  );
+
+  const rankWindows = snapshotRankWindowMaps(rows);
+  const sourceName = asSupplement ? "同花顺热榜快照补齐" : "同花顺热榜快照";
+  const events = rows.map((row) => snapshotRowToHotEvent(row, rankWindows, sourceName)).filter(Boolean);
+  await attachDbPreSignalMetrics(events);
+  await backfillDbEventReturns(events);
+
+  const descriptor = {
+    ...builtinStrategyDescriptor("hot"),
+    note: "基于同花顺每日最终热榜快照生成。近期快照目前覆盖热榜前10左右，20日前排名不足时保留为空。",
+  };
+  const data = finalizeData(events, "neon:popularity_snapshots(ths.stock.hot)", sourceKey, {
+    strategy: descriptor,
+    description: asSupplement
+      ? "东方财富热门确认缺口日期使用同花顺每日最终热榜快照补齐；该补齐口径目前覆盖热榜前10左右。"
+      : "同花顺本地积累，基于每日最终热榜快照动态生成热门确认候选。",
+    sourceFile: "neon:popularity_snapshots(ths.stock.hot)",
+    available: events.length > 0,
+    message: events.length ? "" : "Neon 中暂无同花顺热榜快照。请确认每日采集任务已运行。",
   });
   cachedDbData.set(cacheKey, data);
   return data;
@@ -1857,10 +2113,31 @@ async function loadBuiltinDynamicStrategyData(sourceKey, strategyKey) {
   );
   const materializedData = await loadDbData(sourceKey, strategyKey);
   const events = [...materializedData.events, ...dynamicData.events];
-  const data = finalizeData(events, "neon:strategy_feature_events + neon:strategy_signals", sourceKey, {
+  let sourceFile = "neon:strategy_feature_events + neon:strategy_signals";
+  let description = `${DATA_SOURCES[sourceKey]?.label || sourceKey}，内置策略基于完整特征池动态重算，并用物化信号补齐近期覆盖`;
+
+  if (sourceKey === "em" && strategyKey === "hot") {
+    const maxBaseDate = events
+      .map((event) => event.signalDate)
+      .filter(Boolean)
+      .sort()
+      .at(-1);
+    const snapshotSupplement = await loadThsSnapshotHotData({
+      sourceKey: "em",
+      afterDate: maxBaseDate,
+      asSupplement: true,
+    });
+    events.push(...snapshotSupplement.events);
+    if (snapshotSupplement.events.length) {
+      sourceFile += " + neon:popularity_snapshots(ths.stock.hot)";
+      description += "；东方财富热门确认缺口日期使用同花顺每日最终热榜快照补齐";
+    }
+  }
+
+  const data = finalizeData(events, sourceFile, sourceKey, {
     strategy: descriptor,
-    description: `${DATA_SOURCES[sourceKey]?.label || sourceKey}，内置策略基于完整特征池动态重算，并用物化信号补齐近期覆盖`,
-    sourceFile: "neon:strategy_feature_events + neon:strategy_signals",
+    description,
+    sourceFile,
     available: events.length > 0,
     message: events.length ? "" : "当前策略没有筛出候选；已尝试动态特征池和物化信号兜底。",
   });
@@ -1871,8 +2148,8 @@ async function loadBuiltinDynamicStrategyData(sourceKey, strategyKey) {
 async function loadDataForSource(rawSource, rawStrategy) {
   const sourceKey = normalizeSourceKey(rawSource);
   const strategyKey = normalizeStrategyKey(rawStrategy);
-  if (sourceKey === "ths") return loadThsData();
   if (isCustomStrategyKey(strategyKey)) return loadCustomStrategyData(sourceKey, strategyKey);
+  if (sourceKey === "ths") return loadThsData(strategyKey);
   if (shouldUseDatabase(sourceKey)) return loadBuiltinDynamicStrategyData(sourceKey, strategyKey);
   return strategyKey === "hot" ? loadHotData() : loadData();
 }
@@ -3616,6 +3893,8 @@ async function runThsPopularitySync(options = {}) {
     };
     const status = failedCount ? (savedCount ? "partial" : "failed") : partialCount ? "partial" : "success";
     await finishSyncRun(run.id, status, summary, failedCount && !savedCount ? "all ths categories failed" : null);
+    cachedDbData.clear();
+    cachedThsData.clear();
     return { ...summary, status };
   } catch (error) {
     const summary = {
