@@ -345,7 +345,9 @@ select option { background: #fff; color: var(--text); }
   align-self: start;
   height: calc(100vh - 82px);
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 /* ===========================
@@ -1441,7 +1443,7 @@ tr.focusedRow td {
   display: flex;
   flex: 0 0 auto;
   flex-direction: column;
-  max-height: 360px;
+  max-height: none;
 }
 
 .ruleList {
@@ -1450,9 +1452,9 @@ tr.focusedRow td {
   flex-direction: column;
   gap: 5px;
   padding: 12px;
-  min-height: 160px;
-  max-height: 240px;
-  overflow: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
 }
 
 .ruleList span {
@@ -1705,7 +1707,10 @@ tr.focusedRow td {
   .dashboard { grid-template-columns: 1fr; }
   .sideCol {
     position: static;
+    height: auto;
     max-height: none;
+    overflow: visible;
+    padding-right: 0;
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
