@@ -119,6 +119,19 @@
           </article>
         </div>
 
+        <section class="panel evaluationPanel">
+          <div class="sectionHead">
+            <div>
+              <h2>策略测评</h2>
+              <p id="evaluationSubtitle">按当前数据源、策略和过滤条件统计历史表现</p>
+            </div>
+            <button id="evaluationRefresh" class="ghostButton" type="button">重算</button>
+          </div>
+          <div id="evaluationBody" class="evaluationBody">
+            <div class="emptyState">等待加载测评结果。</div>
+          </div>
+        </section>
+
         <!-- ZONE 2: Daily candidates table (core content) -->
         <section class="panel tablePanel">
           <div class="sectionHead">
@@ -252,6 +265,22 @@
           <p class="note" id="ruleNote">
             这里展示的是策略候选和事后验证，不等同于买卖建议。最近日期的 10 日、20 日结果可能还没有到期。
           </p>
+          <div class="strategyEditor">
+            <div class="strategyEditorHead">
+              <strong>策略参数</strong>
+              <span id="strategyEditMode">保存后生成自定义策略</span>
+            </div>
+            <div class="field">
+              <label for="strategyNameInput">策略名称</label>
+              <input id="strategyNameInput" type="text" placeholder="我的策略" />
+            </div>
+            <div id="strategyParamGrid" class="strategyParamGrid"></div>
+            <div class="strategyEditorActions">
+              <button id="saveStrategyButton" class="primaryButton" type="button">保存并重算</button>
+              <button id="resetStrategyButton" class="ghostButton" type="button">恢复当前策略参数</button>
+            </div>
+            <p id="strategySaveStatus" class="strategySaveStatus"></p>
+          </div>
         </section>
       </aside>
     </main>
