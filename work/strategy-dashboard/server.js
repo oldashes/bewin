@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const ROOT = path.resolve(__dirname, "../..");
 loadEnvFile(path.join(ROOT, ".env"));
-const PUBLIC_DIR = path.join(__dirname, "public");
+const PUBLIC_DIR = path.join(ROOT, "public");
 const EVENTS_FILE = path.join(ROOT, "outputs/em-popularity-sector-filter-sweet-spot-events.csv");
 const HOT_EVENTS_FILE = path.join(ROOT, "outputs/em-popularity-backtest-events.csv");
 const RECENT_CANDIDATES_FILE = path.join(ROOT, "outputs/latest-one-month-strategy-candidates.csv");
