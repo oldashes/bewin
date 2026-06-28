@@ -74,6 +74,10 @@ body {
 button, input, select { font: inherit; }
 h1, h2, p { margin: 0; }
 
+[hidden] {
+  display: none !important;
+}
+
 h1 {
   font-size: 18px;
   font-weight: 700;
@@ -940,6 +944,23 @@ select option { background: #fff; color: var(--text); }
 
 table { width: 100%; border-collapse: separate; border-spacing: 0; }
 
+.stockTable {
+  min-width: 1546px;
+  table-layout: fixed;
+}
+
+.stockTable .col-stock { width: 210px; }
+.stockTable .col-signal { width: 190px; }
+.stockTable .col-tags { width: 170px; }
+.stockTable .col-action { width: 86px; }
+.stockTable .col-rank { width: 90px; }
+.stockTable .col-rank20 { width: 88px; }
+.stockTable .col-volume { width: 84px; }
+.stockTable .col-board { width: 170px; }
+.stockTable .col-board-ret,
+.stockTable .col-ret { width: 96px; }
+.stockTable .col-risk { width: 170px; }
+
 th, td {
   height: 46px;
   padding: 8px 12px;
@@ -1028,7 +1049,7 @@ tr.focusedRow td {
 }
 
 .stockTable td:first-child {
-  background: inherit;
+  background: #fff;
   box-shadow: 1px 0 0 var(--border);
 }
 
@@ -1059,17 +1080,32 @@ tr.focusedRow td {
   font-size: 12px;
 }
 
-.stockName { display: flex; flex-direction: column; gap: 2px; }
+.stockName {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
 
 .stockName a {
+  display: block;
   color: var(--text);
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-decoration: none;
   transition: color var(--fast);
 }
 
 .stockName a:hover { color: var(--blue-hi); }
-.stockName small { color: var(--text-3); font-size: 10px; }
+.stockName small {
+  display: block;
+  color: var(--text-3);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .rankCell { display: flex; align-items: center; gap: 6px; }
 
