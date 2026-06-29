@@ -287,18 +287,44 @@ function ToneText({ value, children }: { value: unknown; children?: ReactNode })
   return <span className={`tone ${valueTone(value)}`}>{children ?? pct(value)}</span>;
 }
 
+function tagColor(item: string) {
+  if (/等待|观察|二次|回踩|不直接追/.test(item)) return "orange";
+  if (/过热|偏热|加速|风险|拥挤|追高|高波动|边缘/.test(item)) return "red";
+  if (/确认|可按|规则|验证|基础候选/.test(item)) return "teal";
+  if (/波段|首次|首板|延续/.test(item)) return "indigo";
+  if (/科创|创业|北交|20%|30%/.test(item)) return "violet";
+  if (/上交|深交|沪市|深市|主板/.test(item)) return "cyan";
+  if (/10%|涨跌幅|正常/.test(item)) return "gray";
+  return "blue";
+}
+
 function Chips({ items, limit = 4 }: { items?: string[]; limit?: number }) {
   const clean = (items || []).filter(Boolean);
-  if (!clean.length) return <Badge variant="light" color="gray">正常</Badge>;
+  if (!clean.length) {
+    return (
+      <Tooltip label="正常" withArrow>
+        <Badge variant="light" color="gray" className="tagBadge">正常</Badge>
+      </Tooltip>
+    );
+  }
   const visible = clean.slice(0, limit);
+  const hidden = clean.slice(limit);
   return (
     <Group gap={6} wrap="wrap">
       {visible.map((item) => (
-        <Badge key={item} variant="light" color={/等待|过热|偏高|风险|拥挤|追高/.test(item) ? "orange" : "blue"}>
-          {item}
-        </Badge>
+        <Tooltip key={item} label={item} withArrow openDelay={250}>
+          <Badge variant="light" color={tagColor(item)} className="tagBadge">
+            {item}
+          </Badge>
+        </Tooltip>
       ))}
-      {clean.length > visible.length ? <Badge variant="light">+{clean.length - visible.length}</Badge> : null}
+      {hidden.length ? (
+        <Tooltip label={hidden.join(" / ")} multiline maw={320} withArrow openDelay={250}>
+          <Badge variant="light" color="gray" className="tagBadge compact">
+            +{hidden.length}
+          </Badge>
+        </Tooltip>
+      ) : null}
     </Group>
   );
 }
@@ -484,7 +510,7 @@ function StockTable({ stocks, onVerify }: { stocks: AnyRecord[]; onVerify: (code
                   </Stack>
                 </Table.Td>
                 <Table.Td><Chips items={stock.meta?.tags || []} limit={3} /></Table.Td>
-                <Table.Td><Button size="xs" variant="light" onClick={() => onVerify(stock.code, stock.signalDate)}>验证</Button></Table.Td>
+                <Table.Td><Button size="xs" variant="filled" color="blue" className="verifyActionButton" onClick={() => onVerify(stock.code, stock.signalDate)}>验证</Button></Table.Td>
                 <Table.Td>
                   <Group gap={6}>
                     <Text fw={800}>{stock.rank ?? "-"}</Text>

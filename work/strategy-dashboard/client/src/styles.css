@@ -248,6 +248,33 @@ a {
   color: var(--blue);
 }
 
+.tagBadge {
+  max-width: 126px;
+  min-width: 0;
+  cursor: help;
+  font-weight: 800;
+}
+
+.tagBadge.compact {
+  max-width: 48px;
+}
+
+.tagBadge .mantine-Badge-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.verifyActionButton {
+  min-width: 58px;
+  box-shadow: 0 6px 14px rgba(36, 104, 216, 0.22);
+}
+
+.verifyActionButton:hover {
+  transform: translateY(-1px);
+}
+
 .tone {
   font-weight: 900;
   white-space: nowrap;
