@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { MantineProvider, createTheme } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Analytics } from "@vercel/analytics/react";
 import "@mantine/core/styles.css";
 import "./styles.css";
 import { App } from "./App";
@@ -42,6 +43,7 @@ createRoot(document.getElementById("root") as HTMLElement).render(
     <QueryClientProvider client={queryClient}>
       <MantineProvider theme={theme}>
         <App />
+        <Analytics />
       </MantineProvider>
     </QueryClientProvider>
   </React.StrictMode>,
