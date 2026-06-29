@@ -23,7 +23,11 @@ const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
 const DEFAULT_SYNC_MAX_STOCKS = 20;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
+const DAILY_SIGNAL_JOB = "daily-signal-generate";
 const DEFAULT_THS_WATCHLIST_MAX = 20;
+const DEFAULT_SIGNAL_MAX_UNIVERSE = 180;
+const DEFAULT_SIGNAL_RANK_MAX = 1600;
+const DEFAULT_SIGNAL_CONCURRENCY = 8;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const MARKET_INDEX = {
   key: "csi300",
@@ -65,6 +69,7 @@ let cachedThsData = new Map();
 let cachedDbData = new Map();
 let cachedNames;
 let cachedStockMeta;
+let cachedBoardCodeByName;
 let cachedTradingCalendar;
 let dbPool;
 
@@ -312,6 +317,45 @@ function readStockNames() {
   }
   cachedNames = names;
   return names;
+}
+
+function readBoardCodeByName() {
+  if (cachedBoardCodeByName) return cachedBoardCodeByName;
+  const counts = new Map();
+  if (fs.existsSync(EVENTS_FILE)) {
+    for (const row of parseCsv(fs.readFileSync(EVENTS_FILE, "utf8"))) {
+      const name = String(row.bestBoardName || row.boardName || "").trim();
+      const code = String(row.bestBoardCode || row.boardCode || "").trim().toUpperCase();
+      if (!name || !/^BK\d{4}$/.test(code)) continue;
+      const key = `${name}\t${code}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+
+  const byName = new Map();
+  for (const [key, count] of counts) {
+    const [name, code] = key.split("\t");
+    const current = byName.get(name);
+    if (!current || count > current.count) byName.set(name, { code, count });
+  }
+  cachedBoardCodeByName = new Map([...byName.entries()].map(([name, value]) => [name, value.code]));
+  return cachedBoardCodeByName;
+}
+
+function normalizeConceptList(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.filter(Boolean);
+    } catch {
+      return value
+        .split(/[,\s，、]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
 }
 
 function inferStockMeta(code, name = "") {
@@ -2025,8 +2069,14 @@ async function loadDynamicStrategyData(sourceKey, strategyKey, config, descripto
         and coalesce(f.rank_delta_20, f.rank_20 - f.rank) >= $5
         and f.amount_ratio between $6 and $7
         and f.prev_5 between $8 and $9
-        and f.best_board_ret_5 between $10 and $11
-        and f.best_board_amount_ratio between $12 and $13
+        and (
+          ($10::numeric <= -1 and $11::numeric >= 3)
+          or f.best_board_ret_5 between $10 and $11
+        )
+        and (
+          ($12::numeric <= 0 and $13::numeric >= 20)
+          or f.best_board_amount_ratio between $12 and $13
+        )
         and (
           $14::boolean = false
           or f.has_strong_board is true
@@ -3117,6 +3167,24 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = KLINE_FETCH_TIMEO
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryFetch(fn, { attempts = 3, delayMs = 600 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      await sleep(delayMs * attempt);
+    }
+  }
+  throw lastError;
+}
+
 async function fetchKline(stock) {
   const url =
     "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
@@ -3144,6 +3212,179 @@ async function fetchKline(stock) {
     await saveKlineToDb(stock, rows);
   }
   return rows;
+}
+
+async function fetchKlineWithRetry(stock) {
+  return retryFetch(() => fetchKline(stock), { attempts: 3, delayMs: 700 });
+}
+
+function emSecurityCode(code) {
+  const clean = String(code || "").match(/\d{6}/)?.[0] || "";
+  if (!clean) return "";
+  return `${clean.startsWith("6") ? "SH" : "SZ"}${clean}`;
+}
+
+function emRankSnapshotTime(date) {
+  const normalized = normalizeDate(date);
+  return normalized ? `${normalized}T15:00:00+08:00` : null;
+}
+
+async function fetchEastmoneyCurrentTopRanks(limit = 100) {
+  const pageSize = Math.min(Math.max(Number(limit) || 100, 1), 100);
+  const response = await fetchWithTimeout(
+    "https://emappdata.eastmoney.com/stockrank/getAllCurrentList",
+    {
+      method: "POST",
+      headers: {
+        "User-Agent": "okhttp/3.12.1",
+        "Content-Type": "application/json;charset=UTF-8",
+        Referer: "https://emappdata.eastmoney.com/",
+      },
+      body: JSON.stringify({
+        appId: "appId01",
+        globalId: "786e4c21-70dc-435a-93bb-38",
+        marketType: "",
+        pageNo: 1,
+        pageSize,
+      }),
+    },
+    KLINE_FETCH_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`东方财富全榜请求失败：${response.status}`);
+  const json = await response.json();
+  if (json.status !== 0 || json.code !== 0 || !Array.isArray(json.data)) {
+    throw new Error(`东方财富全榜返回异常：${json.message || json.code || json.status}`);
+  }
+  return json.data
+    .map((item) => {
+      const code = String(item.sc || "").match(/\d{6}/)?.[0] || "";
+      if (!code) return null;
+      return {
+        code,
+        em: item.sc,
+        rank: n(item.rk),
+        rankChange: n(item.rc),
+        hisRankChange: n(item.hisRc),
+        raw: item,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function fetchEastmoneyRankHistory(code) {
+  const srcSecurityCode = emSecurityCode(code);
+  if (!srcSecurityCode) return [];
+  const response = await fetchWithTimeout(
+    "https://emappdata.eastmoney.com/stockrank/getHisList",
+    {
+      method: "POST",
+      headers: {
+        "User-Agent": "okhttp/3.12.1",
+        "Content-Type": "application/json;charset=UTF-8",
+        Referer: "https://emappdata.eastmoney.com/",
+      },
+      body: JSON.stringify({
+        appId: "appId01",
+        globalId: "786e4c21-70dc-435a-93bb-38",
+        srcSecurityCode,
+      }),
+    },
+    KLINE_FETCH_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`东方财富个股人气历史请求失败：${response.status}`);
+  const json = await response.json();
+  if (json.status !== 0 || json.code !== 0 || !Array.isArray(json.data)) {
+    throw new Error(`东方财富个股人气历史返回异常：${json.message || json.code || json.status}`);
+  }
+  return json.data
+    .map((item) => ({
+      date: normalizeDate(String(item.calcTime || "").slice(0, 10)),
+      rank: n(item.rank),
+      raw: item,
+    }))
+    .filter((item) => item.date && Number.isFinite(item.rank))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function rankAtOffset(history, targetDate, offset) {
+  if (!Array.isArray(history) || !history.length || !targetDate) return null;
+  const uniqueByDate = new Map();
+  for (const item of history) {
+    if (item.date <= targetDate && Number.isFinite(item.rank)) uniqueByDate.set(item.date, item.rank);
+  }
+  const rows = [...uniqueByDate.entries()].map(([date, rank]) => ({ date, rank })).sort((a, b) => a.date.localeCompare(b.date));
+  const index = rows.length - 1;
+  if (index < 0) return null;
+  return rows[Math.max(0, index - offset)]?.rank ?? null;
+}
+
+function eastmoneyRankHistoryToSnapshots({ code, name, history }) {
+  return history.map((item) => {
+    const ymd = item.date.replaceAll("-", "");
+    return {
+      source: "em",
+      category: "stock",
+      metric: "rank",
+      snapshot_date: item.date,
+      snapshot_key: ymd,
+      snapshot_time: emRankSnapshotTime(item.date),
+      code,
+      name: name || code,
+      market: code.startsWith("6") ? "1" : "0",
+      rank: item.rank,
+      rank_change: null,
+      heat_value: null,
+      pct: null,
+      price: null,
+      float_market_value: null,
+      main_tag: "",
+      raw: item.raw || {},
+    };
+  });
+}
+
+function boardKlineStock(boardCode) {
+  const code = String(boardCode || "").trim().toUpperCase();
+  if (!/^BK\d{4}$/.test(code)) return null;
+  return {
+    code,
+    market: "BK",
+    em: code,
+    secid: `90.${code}`,
+    cacheFile: path.join(KLINE_DIR, `90.${code}.json`),
+  };
+}
+
+async function fetchBoardKline(boardCode) {
+  const board = boardKlineStock(boardCode);
+  if (!board) return [];
+  const url =
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
+    `?secid=${board.secid}` +
+    "&fields1=f1,f2,f3,f4,f5,f6" +
+    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
+    "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Referer: "https://quote.eastmoney.com/",
+    },
+  });
+  if (!response.ok) throw new Error(`板块K线请求失败：${response.status}`);
+  const json = await response.json();
+  const rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
+  if (!rows.length) throw new Error(`没有找到 ${boardCode} 的板块K线`);
+  try {
+    fs.mkdirSync(KLINE_DIR, { recursive: true });
+    fs.writeFileSync(board.cacheFile, JSON.stringify(rows));
+  } catch {
+    // Serverless deployments may not have a writable project directory.
+  }
+  return rows;
+}
+
+async function fetchBoardKlineWithRetry(boardCode) {
+  return retryFetch(() => fetchBoardKline(boardCode), { attempts: 3, delayMs: 700 });
 }
 
 function parseKlineLine(line) {
@@ -3177,6 +3418,45 @@ async function loadKline(stock) {
     }
   }
   return fetchKline(stock);
+}
+
+function rowsContainDate(rows, date) {
+  return !date || rows.some((row) => row.date === date);
+}
+
+async function loadKlineForDate(stock, date) {
+  if (shouldUseDatabase("em")) {
+    const rows = await loadKlineFromDb(stock);
+    if (rows.length && rowsContainDate(rows, date)) return rows;
+  }
+
+  if (fs.existsSync(stock.cacheFile)) {
+    try {
+      const rows = JSON.parse(fs.readFileSync(stock.cacheFile, "utf8"));
+      if (Array.isArray(rows) && rows.length && rowsContainDate(rows, date)) {
+        if (shouldUseDatabase("em")) await saveKlineToDb(stock, rows);
+        return rows;
+      }
+    } catch {
+      // Ignore a broken cache and fetch a fresh copy.
+    }
+  }
+
+  return fetchKlineWithRetry(stock);
+}
+
+async function loadBoardKlineForDate(boardCode, date) {
+  const board = boardKlineStock(boardCode);
+  if (!board) return [];
+  if (fs.existsSync(board.cacheFile)) {
+    try {
+      const rows = JSON.parse(fs.readFileSync(board.cacheFile, "utf8"));
+      if (Array.isArray(rows) && rows.length && rowsContainDate(rows, date)) return rows;
+    } catch {
+      // Ignore a broken cache and fetch a fresh copy.
+    }
+  }
+  return fetchBoardKlineWithRetry(boardCode);
 }
 
 function marketIndexCacheFile(index = MARKET_INDEX) {
@@ -3464,6 +3744,430 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
     latestBarDate: normalizeDate(row.latest_bar_date),
     latestBarUpdatedAt: row.latest_bar_updated_at ? new Date(row.latest_bar_updated_at).toISOString() : null,
   }));
+}
+
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      results[current] = await worker(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
+  const { rows } = await getDbPool().query(
+    `
+      with universe as (
+        select
+          f.code,
+          f.name,
+          f.best_board_type,
+          f.best_board_code,
+          f.best_board_name,
+          f.signal_date,
+          st.exchange,
+          st.board,
+          st.industry,
+          st.region,
+          st.concepts,
+          st.listing_date
+        from strategy_feature_events f
+        left join stocks st on st.code = f.code
+        where f.source = $1 and f.feature_set = $2
+        union all
+        select
+          s.code,
+          s.name,
+          s.best_board_type,
+          s.best_board_code,
+          s.best_board_name,
+          s.signal_date,
+          st.exchange,
+          st.board,
+          st.industry,
+          st.region,
+          st.concepts,
+          st.listing_date
+        from strategy_signals s
+        left join stocks st on st.code = s.code
+        where s.source = $1 and s.strategy in ('early', 'hot')
+      ),
+      ranked as (
+        select *,
+          row_number() over (partition by code order by signal_date desc nulls last) as rn
+        from universe
+        where code ~ '^[036][0-9]{5}$'
+      )
+      select *
+      from ranked
+      where rn = 1
+      order by signal_date desc nulls last, code asc
+      limit $3::int
+    `,
+    [sourceKey, FEATURE_SET, maxUniverse],
+  );
+
+  const byCode = new Map();
+  for (const row of rows) {
+    byCode.set(row.code, {
+      code: row.code,
+      name: row.name || row.code,
+      bestBoardType: row.best_board_type || (row.industry ? "industry" : "concept"),
+      bestBoardCode: row.best_board_code || "",
+      bestBoardName: row.best_board_name || row.industry || "",
+      exchange: row.exchange || null,
+      board: row.board || null,
+      industry: row.industry || null,
+      region: row.region || null,
+      concepts: normalizeConceptList(row.concepts),
+      listingDate: normalizeDate(row.listing_date) || null,
+      source: "historical-feature-universe",
+    });
+  }
+
+  for (const item of topRanks || []) {
+    if (byCode.has(item.code)) continue;
+    byCode.set(item.code, {
+      code: item.code,
+      name: item.code,
+      bestBoardType: "",
+      bestBoardCode: "",
+      bestBoardName: "",
+      exchange: item.code.startsWith("6") ? "SH" : "SZ",
+      board: null,
+      industry: null,
+      region: null,
+      concepts: [],
+      listingDate: null,
+      source: "eastmoney-top100",
+    });
+  }
+
+  const codes = [...byCode.keys()];
+  if (codes.length) {
+    const { rows: stockRows } = await getDbPool().query(
+      `
+        select code, name, exchange, board, industry, region, concepts, listing_date
+        from stocks
+        where code = any($1)
+      `,
+      [codes],
+    );
+    for (const row of stockRows) {
+      const item = byCode.get(row.code);
+      if (!item) continue;
+      if ((!item.name || item.name === item.code) && row.name) item.name = row.name;
+      item.exchange = item.exchange || row.exchange || null;
+      item.board = item.board || row.board || null;
+      item.industry = item.industry || row.industry || null;
+      item.region = item.region || row.region || null;
+      const concepts = normalizeConceptList(row.concepts);
+      if (!item.concepts.length && concepts.length) item.concepts = concepts;
+      item.listingDate = item.listingDate || normalizeDate(row.listing_date) || null;
+      if (!item.bestBoardName) {
+        item.bestBoardName = item.industry || item.concepts[0] || item.board || "";
+        item.bestBoardType = item.industry ? "industry" : item.bestBoardName ? "concept" : "";
+      }
+    }
+  }
+
+  const nameFallbackCodes = [...byCode.values()]
+    .filter((item) => !item.name || item.name === item.code)
+    .map((item) => item.code);
+  if (nameFallbackCodes.length) {
+    const { rows: nameRows } = await getDbPool().query(
+      `
+        with candidates as (
+          select code, name, 1 as priority
+          from stocks
+          where code = any($1)
+          union all
+          select code, name, 2 as priority
+          from strategy_signals
+          where code = any($1)
+          union all
+          select code, name, 3 as priority
+          from strategy_feature_events
+          where code = any($1)
+          union all
+          select code, name, 4 as priority
+          from popularity_snapshots
+          where code = any($1)
+        ),
+        ranked as (
+          select *,
+            row_number() over (partition by code order by priority asc) as rn
+          from candidates
+          where nullif(trim(name), '') is not null
+            and trim(name) <> code
+        )
+        select code, name
+        from ranked
+        where rn = 1
+      `,
+      [nameFallbackCodes],
+    );
+    for (const row of nameRows) {
+      const item = byCode.get(row.code);
+      if (item && row.name) item.name = row.name;
+    }
+  }
+
+  const boardCodeByName = readBoardCodeByName();
+  for (const item of byCode.values()) {
+    if (!item.bestBoardCode && item.bestBoardName) {
+      item.bestBoardCode = boardCodeByName.get(item.bestBoardName) || "";
+    }
+  }
+
+  return [...byCode.values()];
+}
+
+function featureRecordFromDailyContext({ sourceKey, targetDate, item, history, stockMetrics, boardMetrics }) {
+  const rank = rankAtOffset(history, targetDate, 0);
+  if (!Number.isFinite(rank)) return null;
+  const rank5 = rankAtOffset(history, targetDate, 5);
+  const rank10 = rankAtOffset(history, targetDate, 10);
+  const rank20 = rankAtOffset(history, targetDate, 20);
+  const bestBoardName = item.bestBoardName || item.industry || item.concepts?.[0] || item.board || "";
+  const bestBoardType = item.bestBoardType || (item.industry ? "industry" : bestBoardName ? "concept" : "");
+  const hasStrongBoard =
+    Number.isFinite(boardMetrics?.prev5) &&
+    boardMetrics.prev5 >= 0.03 &&
+    Number.isFinite(boardMetrics?.amountRatio) &&
+    boardMetrics.amountRatio >= 1.2;
+  const eventForScore = {
+    rank,
+    rank20,
+    prev5: stockMetrics.prev5,
+    amountRatio: stockMetrics.amountRatio,
+    bestBoardRet5: boardMetrics?.prev5 ?? null,
+    bestBoardAmountRatio: boardMetrics?.amountRatio ?? null,
+  };
+
+  return {
+    source: sourceKey,
+    feature_set: FEATURE_SET,
+    signal_date: targetDate,
+    code: item.code,
+    name: item.name || item.code,
+    rank,
+    rank_5: rank5,
+    rank_10: rank10,
+    rank_20: rank20,
+    rank_delta_20: Number.isFinite(rank20) ? rank20 - rank : null,
+    median_5: null,
+    median_prev_5: null,
+    median_prev_10: null,
+    prev_5: stockMetrics.prev5,
+    prev_10: stockMetrics.prev10,
+    amount_ratio: stockMetrics.amountRatio,
+    turnover_5: stockMetrics.turnover5,
+    entry_date: null,
+    entry_open: null,
+    signal_close: stockMetrics.signalClose,
+    ret_5: null,
+    ret_10: null,
+    ret_20: null,
+    board_count: null,
+    has_strong_board: hasStrongBoard,
+    has_strong_industry: hasStrongBoard && bestBoardType === "industry",
+    has_strong_concept: hasStrongBoard && bestBoardType === "concept",
+    best_board_type: bestBoardType || null,
+    best_board_code: item.bestBoardCode || null,
+    best_board_name: bestBoardName || null,
+    best_board_ret_5: boardMetrics?.prev5 ?? null,
+    best_board_ret_10: boardMetrics?.prev10 ?? null,
+    best_board_amount_ratio: boardMetrics?.amountRatio ?? null,
+    best_board_score_rank_pct: null,
+    score: scoreEvent(eventForScore),
+    raw: {
+      generator: DAILY_SIGNAL_JOB,
+      generatedAt: new Date().toISOString(),
+      universeSource: item.source,
+      rankHistoryLength: history.length,
+      boardMetricsAvailable: Boolean(boardMetrics),
+    },
+  };
+}
+
+async function runDailySignalGeneration(options = {}) {
+  requireDatabase();
+  const sourceKey = normalizeSourceKey(options.source || "em");
+  if (sourceKey !== "em") {
+    const error = new Error("当前每日信号生成只支持东方财富数据源");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const requestedYmd = normalizeYmd(options.date);
+  const targetDate = dateFromYmd(requestedYmd);
+  const maxUniverse = boundedInteger(
+    options.maxUniverse ?? process.env.SIGNAL_MAX_UNIVERSE,
+    DEFAULT_SIGNAL_MAX_UNIVERSE,
+    1,
+    2000,
+  );
+  const rankMax = boundedInteger(options.rankMax ?? process.env.SIGNAL_RANK_MAX, DEFAULT_SIGNAL_RANK_MAX, 1, 5000);
+  const concurrency = boundedInteger(
+    options.concurrency ?? process.env.SIGNAL_CONCURRENCY,
+    DEFAULT_SIGNAL_CONCURRENCY,
+    1,
+    16,
+  );
+  const force = options.force === true || options.force === "1" || options.force === "true";
+  const startedAt = new Date().toISOString();
+  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, force };
+  const run = await createSyncRun(DAILY_SIGNAL_JOB, { params, startedAt });
+
+  const results = [];
+  try {
+    const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
+    const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks });
+
+    const histories = await mapLimit(universe, concurrency, async (item) => {
+      const result = { code: item.code, name: item.name, status: "pending" };
+      try {
+        const history = await fetchEastmoneyRankHistory(item.code);
+        const snapshots = eastmoneyRankHistoryToSnapshots({ code: item.code, name: item.name, history });
+        result.status = "rank_synced";
+        result.historyCount = history.length;
+        result.rank = rankAtOffset(history, targetDate, 0);
+        return { item, history, snapshots, result };
+      } catch (error) {
+        result.status = "rank_failed";
+        result.error = error.message;
+        return { item, history: [], snapshots: [], result };
+      }
+    });
+
+    const rankSnapshots = histories.flatMap((entry) => entry.snapshots);
+    const savedRankSnapshots = await upsertPopularitySnapshotsInChunks(rankSnapshots);
+    const rankedCandidates = histories.filter((entry) => {
+      const rank = rankAtOffset(entry.history, targetDate, 0);
+      const rank20 = rankAtOffset(entry.history, targetDate, 20);
+      if (!Number.isFinite(rank) || !Number.isFinite(rank20)) return false;
+      const rankDelta20 = rank20 - rank;
+      const potentialHotConfirm = rank <= 100 && rankDelta20 >= STRATEGY_PARAM_DEFAULTS.hot.rankDelta20Min;
+      const potentialEarlyDiscovery = rank > 100 && rank <= rankMax && rankDelta20 >= 0;
+      return potentialHotConfirm || potentialEarlyDiscovery;
+    });
+
+    const boardMetricCache = new Map();
+    const featureEntries = await mapLimit(rankedCandidates, Math.min(concurrency, 6), async (entry) => {
+      const item = entry.item;
+      const result = entry.result;
+      try {
+        const stockRows = await loadKlineForDate(normalizeStock(item.code), targetDate);
+        const stockMetrics = stockPreSignalMetricsFromRows(stockRows, targetDate);
+        if (
+          !Number.isFinite(stockMetrics.prev5) ||
+          !Number.isFinite(stockMetrics.amountRatio) ||
+          !Number.isFinite(stockMetrics.signalClose)
+        ) {
+          result.status = "feature_skipped";
+          result.reason = "missing_stock_metrics";
+          return null;
+        }
+
+        let boardMetrics = null;
+        if (item.bestBoardCode && /^BK\d{4}$/i.test(item.bestBoardCode)) {
+          if (!boardMetricCache.has(item.bestBoardCode)) {
+            try {
+              const boardRows = await loadBoardKlineForDate(item.bestBoardCode, targetDate);
+              boardMetricCache.set(item.bestBoardCode, stockPreSignalMetricsFromRows(boardRows, targetDate));
+            } catch (error) {
+              boardMetricCache.set(item.bestBoardCode, null);
+            }
+          }
+          boardMetrics = boardMetricCache.get(item.bestBoardCode);
+        }
+
+        const feature = featureRecordFromDailyContext({
+          sourceKey,
+          targetDate,
+          item,
+          history: entry.history,
+          stockMetrics,
+          boardMetrics,
+        });
+        if (!feature) {
+          result.status = "feature_skipped";
+          result.reason = "missing_rank";
+          return null;
+        }
+        result.status = "feature_generated";
+        result.rank = feature.rank;
+        result.rankDelta20 = feature.rank_delta_20;
+        result.amountRatio = feature.amount_ratio;
+        result.bestBoardName = feature.best_board_name;
+        return feature;
+      } catch (error) {
+        result.status = "feature_failed";
+        result.error = error.message;
+        return null;
+      }
+    });
+
+    const featureRecords = featureEntries.filter(Boolean);
+    const savedFeatures = await bulkUpsertStrategyFeatureEvents(featureRecords);
+    results.push(...histories.map((entry) => entry.result));
+
+    const failedCount = results.filter((item) => /failed$/.test(item.status)).length;
+    const summary = {
+      jobName: DAILY_SIGNAL_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: universe.length,
+      successCount: savedFeatures,
+      failedCount,
+      rankSnapshotCount: rankSnapshots.length,
+      savedRankSnapshots,
+      rankedCandidateCount: rankedCandidates.length,
+      featureCount: featureRecords.length,
+      generatedDate: targetDate,
+      results: results.slice(0, 200),
+    };
+    const status = savedFeatures ? (failedCount ? "partial" : "success") : "failed";
+    await finishSyncRun(run.id, status, summary, savedFeatures ? null : "no daily features generated");
+    cachedDbData.clear();
+    cachedThsData.clear();
+    return { ...summary, status };
+  } catch (error) {
+    const summary = {
+      jobName: DAILY_SIGNAL_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: results.length,
+      successCount: 0,
+      failedCount: results.length || 1,
+      results: results.slice(0, 200),
+    };
+    await finishSyncRun(run.id, "failed", summary, error.message);
+    throw error;
+  }
+}
+
+async function dailySignalPayload(query = {}, headers = {}) {
+  assertCronAuthorized(query, headers);
+  return runDailySignalGeneration({
+    source: query.source,
+    date: query.date,
+    maxUniverse: query.maxUniverse,
+    rankMax: query.rankMax,
+    concurrency: query.concurrency,
+    force: query.force,
+  });
 }
 
 async function runDailyKlineSync(options = {}) {
@@ -3769,6 +4473,130 @@ async function upsertPopularitySnapshots(records) {
   }
   await bulkUpsertStocksForSnapshots([...stockRecords.values()]);
   return cleanRecords.length;
+}
+
+async function upsertPopularitySnapshotsInChunks(records, chunkSize = 5000) {
+  let savedCount = 0;
+  for (let index = 0; index < records.length; index += chunkSize) {
+    savedCount += await upsertPopularitySnapshots(records.slice(index, index + chunkSize));
+  }
+  return savedCount;
+}
+
+async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000) {
+  const cleanRecords = records.filter((record) => record.source && record.feature_set && record.signal_date && record.code);
+  if (!cleanRecords.length) return 0;
+
+  let savedCount = 0;
+  for (let index = 0; index < cleanRecords.length; index += chunkSize) {
+    const chunk = cleanRecords.slice(index, index + chunkSize);
+    await getDbPool().query(
+      `
+        with input as (
+          select *
+          from jsonb_to_recordset($1::jsonb) as x(
+            source text,
+            feature_set text,
+            signal_date date,
+            code text,
+            name text,
+            rank integer,
+            rank_5 integer,
+            rank_10 integer,
+            rank_20 integer,
+            rank_delta_20 integer,
+            median_5 numeric,
+            median_prev_5 numeric,
+            median_prev_10 numeric,
+            prev_5 numeric,
+            prev_10 numeric,
+            amount_ratio numeric,
+            turnover_5 numeric,
+            entry_date date,
+            entry_open numeric,
+            signal_close numeric,
+            ret_5 numeric,
+            ret_10 numeric,
+            ret_20 numeric,
+            board_count integer,
+            has_strong_board boolean,
+            has_strong_industry boolean,
+            has_strong_concept boolean,
+            best_board_type text,
+            best_board_code text,
+            best_board_name text,
+            best_board_ret_5 numeric,
+            best_board_ret_10 numeric,
+            best_board_amount_ratio numeric,
+            best_board_score_rank_pct numeric,
+            score numeric,
+            raw jsonb
+          )
+        )
+        insert into strategy_feature_events (
+          source, feature_set, signal_date, code, name,
+          rank, rank_5, rank_10, rank_20, rank_delta_20,
+          median_5, median_prev_5, median_prev_10,
+          prev_5, prev_10, amount_ratio, turnover_5,
+          entry_date, entry_open, signal_close,
+          ret_5, ret_10, ret_20,
+          board_count, has_strong_board, has_strong_industry, has_strong_concept,
+          best_board_type, best_board_code, best_board_name,
+          best_board_ret_5, best_board_ret_10, best_board_amount_ratio, best_board_score_rank_pct,
+          score, raw, updated_at
+        )
+        select
+          source, feature_set, signal_date, code, name,
+          rank, rank_5, rank_10, rank_20, rank_delta_20,
+          median_5, median_prev_5, median_prev_10,
+          prev_5, prev_10, amount_ratio, turnover_5,
+          entry_date, entry_open, signal_close,
+          ret_5, ret_10, ret_20,
+          board_count, has_strong_board, has_strong_industry, has_strong_concept,
+          best_board_type, best_board_code, best_board_name,
+          best_board_ret_5, best_board_ret_10, best_board_amount_ratio, best_board_score_rank_pct,
+          score, coalesce(raw, '{}'::jsonb), now()
+        from input
+        on conflict (source, feature_set, signal_date, code) do update set
+          name = excluded.name,
+          rank = excluded.rank,
+          rank_5 = excluded.rank_5,
+          rank_10 = excluded.rank_10,
+          rank_20 = excluded.rank_20,
+          rank_delta_20 = excluded.rank_delta_20,
+          median_5 = excluded.median_5,
+          median_prev_5 = excluded.median_prev_5,
+          median_prev_10 = excluded.median_prev_10,
+          prev_5 = excluded.prev_5,
+          prev_10 = excluded.prev_10,
+          amount_ratio = excluded.amount_ratio,
+          turnover_5 = excluded.turnover_5,
+          entry_date = excluded.entry_date,
+          entry_open = excluded.entry_open,
+          signal_close = excluded.signal_close,
+          ret_5 = excluded.ret_5,
+          ret_10 = excluded.ret_10,
+          ret_20 = excluded.ret_20,
+          board_count = excluded.board_count,
+          has_strong_board = excluded.has_strong_board,
+          has_strong_industry = excluded.has_strong_industry,
+          has_strong_concept = excluded.has_strong_concept,
+          best_board_type = excluded.best_board_type,
+          best_board_code = excluded.best_board_code,
+          best_board_name = excluded.best_board_name,
+          best_board_ret_5 = excluded.best_board_ret_5,
+          best_board_ret_10 = excluded.best_board_ret_10,
+          best_board_amount_ratio = excluded.best_board_amount_ratio,
+          best_board_score_rank_pct = excluded.best_board_score_rank_pct,
+          score = excluded.score,
+          raw = excluded.raw,
+          updated_at = now()
+      `,
+      [JSON.stringify(chunk.map((record) => ({ ...record, raw: record.raw || {} })))],
+    );
+    savedCount += chunk.length;
+  }
+  return savedCount;
 }
 
 async function bulkUpsertStocksForSnapshots(records) {
@@ -4157,6 +4985,7 @@ async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   if (pathname === "/api/position") return positionPayload(query);
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
   if (pathname === "/api/cron/ths-sync") return thsSyncPayload(query, headers);
+  if (pathname === "/api/cron/daily-signal-sync") return dailySignalPayload(query, headers);
   const error = new Error("Not found");
   error.statusCode = 404;
   throw error;
@@ -4196,5 +5025,7 @@ module.exports = {
   runDailyKlineSync,
   thsSyncPayload,
   runThsPopularitySync,
+  dailySignalPayload,
+  runDailySignalGeneration,
   upsertPopularitySnapshots,
 };

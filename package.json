@@ -16,7 +16,8 @@
     "db:import-ths": "node scripts/import-ths-history.js",
     "lab:strategy": "node scripts/strategy-lab.js",
     "sync:daily": "node scripts/daily-sync.js",
-    "sync:ths": "node scripts/ths-sync.js"
+    "sync:ths": "node scripts/ths-sync.js",
+    "sync:signals": "node scripts/daily-signal-sync.js"
   },
   "dependencies": {
     "@mantine/core": "^9.4.1",
