@@ -225,6 +225,49 @@ a {
 
 .stockTable {
   table-layout: fixed;
+  width: 100%;
+  min-width: 1380px;
+}
+
+.stockTable .stockCol {
+  width: clamp(150px, 12vw, 190px);
+}
+
+.stockTable .signalCol {
+  width: clamp(150px, 13vw, 190px);
+}
+
+.stockTable .tradeCol {
+  width: clamp(118px, 10vw, 150px);
+}
+
+.stockTable .actionCol {
+  width: 76px;
+}
+
+.stockTable .rankCol {
+  width: 96px;
+}
+
+.stockTable .rank20Col {
+  width: 86px;
+}
+
+.stockTable .amountCol {
+  width: 78px;
+}
+
+.stockTable .boardCol {
+  width: clamp(150px, 13vw, 190px);
+}
+
+.stockTable .boardRetCol,
+.stockTable .returnCol {
+  width: 86px;
+}
+
+.stockTable .riskCol {
+  width: clamp(142px, 12vw, 178px);
 }
 
 .stockTable th {
@@ -238,6 +281,16 @@ a {
 .stockTable td {
   border-top-color: var(--line);
   vertical-align: middle;
+}
+
+.stockTable th,
+.stockTable td {
+  overflow: hidden;
+}
+
+.stockTable .mantine-Stack-root,
+.stockTable .mantine-Group-root {
+  min-width: 0;
 }
 
 .linkText {
@@ -489,6 +542,30 @@ a {
     grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
     align-items: start;
   }
+
+  .stockTable {
+    min-width: 1280px;
+  }
+
+  .stockTable .stockCol {
+    width: 160px;
+  }
+
+  .stockTable .signalCol {
+    width: 160px;
+  }
+
+  .stockTable .tradeCol {
+    width: 126px;
+  }
+
+  .stockTable .boardCol {
+    width: 150px;
+  }
+
+  .stockTable .riskCol {
+    width: 136px;
+  }
 }
 
 @media (max-width: 900px) {
@@ -571,5 +648,54 @@ a {
 
   .timelineGrid.row {
     padding: 12px 8px;
+  }
+
+  .stockTable {
+    min-width: 1180px;
+  }
+
+  .stockTable .stockCol {
+    width: 138px;
+  }
+
+  .stockTable .signalCol {
+    width: 130px;
+  }
+
+  .stockTable .tradeCol {
+    width: 112px;
+  }
+
+  .stockTable .actionCol {
+    width: 68px;
+  }
+
+  .stockTable .rankCol {
+    width: 72px;
+  }
+
+  .stockTable .rank20Col {
+    width: 74px;
+  }
+
+  .stockTable .amountCol {
+    width: 66px;
+  }
+
+  .stockTable .boardCol {
+    width: 128px;
+  }
+
+  .stockTable .boardRetCol,
+  .stockTable .returnCol {
+    width: 68px;
+  }
+
+  .stockTable .riskCol {
+    width: 118px;
+  }
+
+  .tagBadge {
+    max-width: 108px;
   }
 }

@@ -468,7 +468,22 @@ function StockTable({ stocks, onVerify }: { stocks: AnyRecord[]; onVerify: (code
   }
   return (
     <ScrollArea type="auto" offsetScrollbars>
-      <Table miw={1180} verticalSpacing="md" className="stockTable">
+      <Table miw={1380} verticalSpacing="md" className="stockTable">
+        <colgroup>
+          <col className="stockCol" />
+          <col className="signalCol" />
+          <col className="tradeCol" />
+          <col className="actionCol" />
+          <col className="rankCol" />
+          <col className="rank20Col" />
+          <col className="amountCol" />
+          <col className="boardCol" />
+          <col className="boardRetCol" />
+          <col className="returnCol" />
+          <col className="returnCol" />
+          <col className="returnCol" />
+          <col className="riskCol" />
+        </colgroup>
         <Table.Thead>
           <Table.Tr>
             <Table.Th>股票</Table.Th>
