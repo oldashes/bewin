@@ -213,39 +213,45 @@ function apiQuery(params: Record<string, string | boolean | undefined>) {
   return search.toString();
 }
 
-function pct(value: unknown, digits = 2) {
+function toFiniteNumber(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
-  if (!Number.isFinite(number)) return "未到期";
+  return Number.isFinite(number) ? number : null;
+}
+
+function pct(value: unknown, digits = 2) {
+  const number = toFiniteNumber(value);
+  if (number === null) return "未到期";
   return `${(number * 100).toFixed(digits)}%`;
 }
 
 function signedPct(value: unknown, digits = 2) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
+  const number = toFiniteNumber(value);
+  if (number === null) return "-";
   return `${number >= 0 ? "+" : ""}${(number * 100).toFixed(digits)}%`;
 }
 
 function signedPp(value: unknown, digits = 1) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
+  const number = toFiniteNumber(value);
+  if (number === null) return "-";
   return `${number >= 0 ? "+" : ""}${(number * 100).toFixed(digits)}pp`;
 }
 
 function number(value: unknown, digits = 2) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return "-";
+  const num = toFiniteNumber(value);
+  if (num === null) return "-";
   return num.toFixed(digits);
 }
 
 function price(value: unknown) {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return "-";
+  const num = toFiniteNumber(value);
+  if (num === null) return "-";
   return num.toFixed(2);
 }
 
 function valueTone(value: unknown) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "muted";
+  const number = toFiniteNumber(value);
+  if (number === null) return "muted";
   if (number > 0) return "up";
   if (number < 0) return "down";
   return "muted";
@@ -665,7 +671,7 @@ function StrategyPanel({
                     max={def.max}
                     step={def.step ?? (def.type === "integer" ? 1 : 0.1)}
                     value={params[def.key] ?? ""}
-                    onChange={(value) => setParams((old) => ({ ...old, [def.key]: Number(value) }))}
+                    onChange={(value) => setParams((old) => ({ ...old, [def.key]: value === "" || value === null ? "" : Number(value) }))}
                   />
                 ),
               )}
