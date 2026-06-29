@@ -46,6 +46,7 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 type AnyRecord = Record<string, any>;
+const TEMPORARY_STRATEGY_KEY = "temporary";
 
 const STRATEGY_PRESETS = [
   {
@@ -205,12 +206,22 @@ async function requestJson<T = AnyRecord>(path: string, options?: RequestInit): 
   return payload;
 }
 
-function apiQuery(params: Record<string, string | boolean | undefined>) {
+function apiQuery(params: Record<string, string | number | boolean | undefined | null>) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== "") search.set(key, String(value));
+    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
   }
   return search.toString();
+}
+
+function temporaryStrategyApiParams(strategy: AnyRecord | null) {
+  if (!strategy) return {};
+  return {
+    tempName: strategy.name,
+    tempDescription: strategy.description || "",
+    tempBaseStrategy: strategy.baseStrategy || "early",
+    tempParams: JSON.stringify(strategy.params || {}),
+  };
 }
 
 function toFiniteNumber(value: unknown) {
@@ -605,6 +616,8 @@ function StrategyPanel({
   strategy,
   setStrategy,
   source,
+  temporaryStrategy,
+  onApplyTemporary,
   openEvaluation,
   openAttribution,
   onSaved,
@@ -624,14 +637,49 @@ function StrategyPanel({
   }, [strategy, overview?.generatedAt]);
 
   const strategyOptions = useMemo(
-    () => (overview?.availableStrategies || []).map((item: AnyRecord) => ({ value: item.key, label: `${item.custom ? "自定义 · " : ""}${item.shortLabel || item.label}` })),
+    () =>
+      (overview?.availableStrategies || []).map((item: AnyRecord) => ({
+        value: item.key,
+        label: `${item.temporary ? "临时 · " : item.custom ? "永久 · " : ""}${item.shortLabel || item.label}`,
+      })),
     [overview],
   );
 
   const paramDefs = overview?.strategyParamDefs || [];
   const visibleDefs = expanded ? paramDefs : [];
+  const currentCustomId = current.custom ? current.id || String(strategy).replace(/^custom:/, "") : "";
+  const trimmedName = name.trim();
+  const duplicateName = Boolean(
+    trimmedName &&
+      (overview?.customStrategies || []).some(
+        (item: AnyRecord) =>
+          String(item.id || "") !== currentCustomId &&
+          String(item.shortLabel || item.label || "").trim().toLowerCase() === trimmedName.toLowerCase(),
+      ),
+  );
+  const baseStrategy =
+    strategy === TEMPORARY_STRATEGY_KEY
+      ? temporaryStrategy?.baseStrategy || "early"
+      : current.custom
+        ? "early"
+        : current.key || strategy || "early";
+
+  function applyTemporary() {
+    const nextName = trimmedName || `${current.shortLabel || current.label || "策略"} 临时版`;
+    onApplyTemporary({
+      name: nextName,
+      description: `临时调整：${nextName}`,
+      baseStrategy,
+      params,
+    });
+    setMessage("已应用临时策略并重算；刷新页面后不会保留。");
+  }
 
   async function save() {
+    if (duplicateName) {
+      setMessage("保存失败：策略名称已存在，请换一个名称，或选择已有永久策略后直接修改。");
+      return;
+    }
     setSaving(true);
     setMessage("保存中...");
     try {
@@ -642,13 +690,13 @@ function StrategyPanel({
         body: JSON.stringify({
           id: customId,
           source,
-          baseStrategy: current.custom ? "early" : current.key || strategy,
-          name,
-          description: current.custom ? current.description || "" : `${current.label || "内置策略"} 的自定义参数版本`,
+          baseStrategy,
+          name: trimmedName || "我的策略",
+          description: current.custom ? current.description || "" : `${current.label || "内置策略"} 的永久自定义参数版本`,
           params,
         }),
       });
-      setMessage("已保存并重算");
+      setMessage("已保存为永久策略并重算");
       onSaved(payload.strategy?.key || `custom:${payload.config.id}`);
     } catch (error) {
       setMessage(error instanceof Error ? `保存失败：${error.message}` : "保存失败");
@@ -671,7 +719,7 @@ function StrategyPanel({
               <Text fw={800}>当前策略</Text>
               <Select mt="xs" value={strategy} onChange={(value) => value && setStrategy(value)} data={strategyOptions} />
             </Box>
-            <Text size="xs" c="dimmed">保存后更新当前自定义策略</Text>
+            <Text size="xs" c="dimmed">临时不入库，永久才保存</Text>
           </Group>
           <SimpleGrid cols={2} mt="md">
             <Button variant="light" color="blue" onClick={openEvaluation}>策略测评</Button>
@@ -689,7 +737,13 @@ function StrategyPanel({
             <Text fw={800}>策略参数</Text>
             <Text size="sm" c="dimmed">需要微调时再展开</Text>
           </Group>
-          <TextInput label="策略名称" mt="sm" value={name} onChange={(event) => setName(event.currentTarget.value)} />
+          <TextInput
+            label="策略名称"
+            mt="sm"
+            value={name}
+            error={duplicateName ? "已有同名永久策略" : undefined}
+            onChange={(event) => setName(event.currentTarget.value)}
+          />
           <Button mt="md" variant="light" fullWidth onClick={() => setExpanded((value) => !value)}>
             {expanded ? "收起高级参数" : "展开高级参数"}
           </Button>
@@ -719,7 +773,8 @@ function StrategyPanel({
               )}
             </SimpleGrid>
           ) : null}
-          <Button mt="md" fullWidth onClick={save} loading={saving}>保存并重算</Button>
+          <Button mt="md" fullWidth variant="light" onClick={applyTemporary}>应用临时并重算</Button>
+          <Button mt="sm" fullWidth onClick={save} loading={saving} disabled={duplicateName}>保存为永久策略</Button>
           <Button mt="sm" fullWidth variant="default" onClick={() => setParams(current.params || {})}>恢复当前策略参数</Button>
           {message ? <Text mt="sm" c="dimmed" size="sm">{message}</Text> : null}
         </Paper>
@@ -734,7 +789,7 @@ function StrategyPanel({
               <UnstyledButton key={preset.key} className="presetCard" onClick={() => {
                 setName(`${preset.title} 调整版`);
                 setParams(preset.params);
-                setMessage(`已套用「${preset.title}」，保存后才会重算候选池。`);
+                setMessage(`已套用「${preset.title}」，点击“应用临时并重算”即可先验证，不会写入永久策略。`);
               }}>
                 <Group justify="space-between" align="flex-start">
                   <Text fw={800}>{preset.title}</Text>
@@ -894,7 +949,7 @@ function normalizeHorizons(horizons: AnyRecord[]) {
   return result;
 }
 
-function StockLookup({ source, strategy, strict, onOpenSignal }: AnyRecord) {
+function StockLookup({ source, strategy, temporaryStrategy, strict, onOpenSignal }: AnyRecord) {
   const [keyword, setKeyword] = useState("");
   const [payload, setPayload] = useState<AnyRecord | null>(null);
   const [loading, setLoading] = useState(false);
@@ -908,7 +963,17 @@ function StockLookup({ source, strategy, strict, onOpenSignal }: AnyRecord) {
     setLoading(true);
     setError("");
     try {
-      setPayload(await requestJson(`/api/stock-signals?${apiQuery({ q: keyword.trim(), strict, source, strategy })}`));
+      setPayload(
+        await requestJson(
+          `/api/stock-signals?${apiQuery({
+            q: keyword.trim(),
+            strict,
+            source,
+            strategy,
+            ...(strategy === TEMPORARY_STRATEGY_KEY ? temporaryStrategyApiParams(temporaryStrategy) : {}),
+          })}`,
+        ),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "查询失败");
     } finally {
@@ -1090,26 +1155,29 @@ export function App() {
   const [strict, setStrict] = useState(initial.strict);
   const [source, setSource] = useState(initial.source);
   const [strategy, setStrategy] = useState(initial.strategy);
+  const [temporaryStrategy, setTemporaryStrategy] = useState<AnyRecord | null>(null);
   const [evaluationOpen, setEvaluationOpen] = useState(false);
   const [attributionOpen, setAttributionOpen] = useState(false);
   const queryClient = useQueryClient();
 
-  const commonKey = [source, strategy, strict] as const;
+  const temporaryKey = useMemo(() => (strategy === TEMPORARY_STRATEGY_KEY && temporaryStrategy ? JSON.stringify(temporaryStrategy) : ""), [strategy, temporaryStrategy]);
+  const strategyRequestParams = strategy === TEMPORARY_STRATEGY_KEY ? temporaryStrategyApiParams(temporaryStrategy) : {};
+  const commonKey = [source, strategy, strict, temporaryKey] as const;
   const overviewQuery = useQuery({
-    queryKey: ["overview", source, strategy],
-    queryFn: () => requestJson(`/api/overview?${apiQuery({ source, strategy })}`),
+    queryKey: ["overview", source, strategy, temporaryKey],
+    queryFn: () => requestJson(`/api/overview?${apiQuery({ source, strategy, ...strategyRequestParams })}`),
   });
   const timelineQuery = useQuery({
     queryKey: ["timeline", ...commonKey],
-    queryFn: () => requestJson<AnyRecord[]>(`/api/timeline?${apiQuery({ strict, source, strategy })}`),
+    queryFn: () => requestJson<AnyRecord[]>(`/api/timeline?${apiQuery({ strict, source, strategy, ...strategyRequestParams })}`),
   });
   const dailyQuery = useQuery({
     queryKey: ["daily", date, ...commonKey],
-    queryFn: () => requestJson(`/api/daily?${apiQuery({ date, strict, source, strategy })}`),
+    queryFn: () => requestJson(`/api/daily?${apiQuery({ date, strict, source, strategy, ...strategyRequestParams })}`),
   });
   const evaluationQuery = useQuery({
     queryKey: ["evaluation", ...commonKey],
-    queryFn: () => requestJson(`/api/evaluation?${apiQuery({ strict, source, strategy })}`),
+    queryFn: () => requestJson(`/api/evaluation?${apiQuery({ strict, source, strategy, ...strategyRequestParams })}`),
   });
 
   const daily = dailyQuery.data;
@@ -1122,20 +1190,32 @@ export function App() {
     url.searchParams.set("date", daily.requestedDate || daily.selectedDate);
     url.searchParams.set("strict", strict ? "1" : "0");
     url.searchParams.set("source", source);
-    url.searchParams.set("strategy", strategy);
+    url.searchParams.set("strategy", strategy === TEMPORARY_STRATEGY_KEY ? temporaryStrategy?.baseStrategy || "early" : strategy);
     window.history.replaceState({}, "", url);
     if (!date) setDate(daily.selectedDate);
-  }, [daily?.selectedDate, daily?.requestedDate, strict, source, strategy]);
+  }, [daily?.selectedDate, daily?.requestedDate, strict, source, strategy, temporaryStrategy?.baseStrategy]);
 
   useEffect(() => {
     if (!overview?.availableStrategies?.length) return;
+    if (strategy === TEMPORARY_STRATEGY_KEY && temporaryStrategy) return;
     if (!overview.availableStrategies.some((item: AnyRecord) => item.key === strategy)) {
       setStrategy(overview.availableStrategies[0].key);
     }
-  }, [overview?.generatedAt, source]);
+  }, [overview?.generatedAt, source, strategy, temporaryStrategy]);
 
   function refreshAll() {
     queryClient.invalidateQueries();
+  }
+
+  function changeSource(nextSource: string) {
+    setTemporaryStrategy(null);
+    if (strategy === TEMPORARY_STRATEGY_KEY) setStrategy("early");
+    setSource(nextSource);
+  }
+
+  function changeStrategy(nextStrategy: string) {
+    if (nextStrategy !== TEMPORARY_STRATEGY_KEY) setTemporaryStrategy(null);
+    setStrategy(nextStrategy);
   }
 
   function moveDate(step: number) {
@@ -1165,7 +1245,7 @@ export function App() {
         strict={strict}
         setStrict={setStrict}
         source={source}
-        setSource={setSource}
+        setSource={changeSource}
         moveDate={moveDate}
         refresh={refreshAll}
         loading={loading}
@@ -1187,6 +1267,7 @@ export function App() {
             <StockLookup
               source={source}
               strategy={strategy}
+              temporaryStrategy={strategy === TEMPORARY_STRATEGY_KEY ? temporaryStrategy : null}
               strict={strict}
               onOpenSignal={(signalDate: string, code: string) => {
                 setDate(signalDate);
@@ -1201,11 +1282,18 @@ export function App() {
           <StrategyPanel
             overview={overview}
             strategy={strategy}
-            setStrategy={setStrategy}
+            setStrategy={changeStrategy}
             source={source}
+            temporaryStrategy={temporaryStrategy}
+            onApplyTemporary={(draft: AnyRecord) => {
+              setTemporaryStrategy(draft);
+              setStrategy(TEMPORARY_STRATEGY_KEY);
+              refreshAll();
+            }}
             openEvaluation={() => setEvaluationOpen(true)}
             openAttribution={() => setAttributionOpen(true)}
             onSaved={(nextStrategy: string) => {
+              setTemporaryStrategy(null);
               setStrategy(nextStrategy);
               refreshAll();
             }}

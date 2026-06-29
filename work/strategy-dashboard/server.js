@@ -107,6 +107,7 @@ const STRATEGIES = {
 
 const FEATURE_SET = "em-sector-filter-v1";
 const CUSTOM_STRATEGY_PREFIX = "custom:";
+const TEMPORARY_STRATEGY_KEY = "temporary";
 
 const STRATEGY_PARAM_DEFS = [
   {
@@ -1202,7 +1203,12 @@ function customStrategyId(raw) {
   return isCustomStrategyKey(raw) ? String(raw).slice(CUSTOM_STRATEGY_PREFIX.length) : "";
 }
 
+function isTemporaryStrategyKey(raw) {
+  return String(raw || "") === TEMPORARY_STRATEGY_KEY;
+}
+
 function normalizeStrategyKey(raw) {
+  if (isTemporaryStrategyKey(raw)) return TEMPORARY_STRATEGY_KEY;
   if (isCustomStrategyKey(raw) && customStrategyId(raw)) return String(raw);
   return STRATEGIES[raw] ? raw : "early";
 }
@@ -1263,6 +1269,13 @@ function createCustomStrategyId() {
   return `custom-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function simpleHash(value) {
+  let hash = 5381;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) hash = (hash * 33) ^ text.charCodeAt(index);
+  return (hash >>> 0).toString(36);
+}
+
 function percentRule(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
@@ -1286,16 +1299,22 @@ function paramsToRuleItems(params) {
 function customStrategyDescriptor(config) {
   const params = normalizeStrategyParams(config.params || {}, "early");
   const label = config.name || "自定义策略";
+  const temporary = Boolean(config.temporary);
   return {
-    key: `${CUSTOM_STRATEGY_PREFIX}${config.id}`,
+    key: temporary ? TEMPORARY_STRATEGY_KEY : `${CUSTOM_STRATEGY_PREFIX}${config.id}`,
     id: config.id,
     label,
     shortLabel: label,
-    description: config.description || "基于完整特征池动态重算的自定义策略",
+    description: config.description || (temporary ? "临时调整策略，刷新页面后丢失" : "基于完整特征池动态重算的自定义策略"),
     rule: paramsToRuleItems(params).slice(0, 6).join(" + "),
     ruleItems: paramsToRuleItems(params),
-    note: config.description || "自定义策略基于特征池重新筛选候选；保存后会按参数重新计算候选池和测评结果。",
-    custom: true,
+    note:
+      config.description ||
+      (temporary
+        ? "临时策略只在当前页面生效，不写入数据库；确认有效后再保存为永久策略。"
+        : "自定义策略基于特征池重新筛选候选；保存后会按参数重新计算候选池和测评结果。"),
+    custom: !temporary,
+    temporary,
     params,
   };
 }
@@ -1326,8 +1345,23 @@ async function listStrategyConfigs(sourceKey = "em") {
   const { rows } = await getDbPool().query(
     `
       select id, source, name, description, params, created_at, updated_at
-      from strategy_configs
-      where source = $1
+      from (
+        select
+          id,
+          source,
+          name,
+          description,
+          params,
+          created_at,
+          updated_at,
+          row_number() over (
+            partition by source, lower(trim(name))
+            order by updated_at desc nulls last, created_at desc nulls last, id desc
+          ) as rn
+        from strategy_configs
+        where source = $1
+      ) ranked
+      where rn = 1
       order by updated_at desc
     `,
     [sourceKey],
@@ -1356,6 +1390,22 @@ async function saveStrategyConfigPayload(body = {}) {
   const name = String(body.name || "").trim().slice(0, 80) || "我的策略";
   const description = String(body.description || "").trim().slice(0, 500);
   const params = normalizeStrategyParams(body.params || {}, body.baseStrategy || "early");
+  const duplicate = await getDbPool().query(
+    `
+      select id
+      from strategy_configs
+      where source = $1
+        and lower(trim(name)) = lower(trim($2))
+        and id <> $3
+      limit 1
+    `,
+    [sourceKey, name, id],
+  );
+  if (duplicate.rows.length) {
+    const error = new Error("策略名称已存在，请换一个名称，或选择已有永久策略后直接修改。");
+    error.statusCode = 409;
+    throw error;
+  }
   const { rows } = await getDbPool().query(
     `
       insert into strategy_configs (id, source, name, description, params, updated_at)
@@ -1370,7 +1420,7 @@ async function saveStrategyConfigPayload(body = {}) {
     `,
     [id, sourceKey, name, description, JSON.stringify(params)],
   );
-  cachedDbData.delete(`${sourceKey}:${CUSTOM_STRATEGY_PREFIX}${id}`);
+  cachedDbData.clear();
   const config = strategyConfigRowToObject(rows[0]);
   return { config, strategy: customStrategyDescriptor(config) };
 }
@@ -2142,6 +2192,48 @@ async function loadCustomStrategyData(sourceKey, strategyKey) {
   );
 }
 
+function temporaryStrategyConfigFromQuery(query = {}) {
+  if (!isTemporaryStrategyKey(query.strategy)) return null;
+  let rawParams = {};
+  try {
+    rawParams = query.tempParams ? JSON.parse(String(query.tempParams)) : {};
+  } catch {
+    rawParams = {};
+  }
+  const baseStrategy = STRATEGIES[query.tempBaseStrategy] ? String(query.tempBaseStrategy) : "early";
+  const params = normalizeStrategyParams(rawParams, baseStrategy);
+  const name = String(query.tempName || "临时策略").trim().slice(0, 80) || "临时策略";
+  const description = String(query.tempDescription || "临时调整，不保存，刷新页面后丢失").trim().slice(0, 500);
+  const signature = simpleHash(JSON.stringify({ baseStrategy, params }));
+  return {
+    id: `temp-${signature}`,
+    key: TEMPORARY_STRATEGY_KEY,
+    name,
+    description,
+    baseStrategy,
+    params,
+    temporary: true,
+    sourceName: `临时 · ${name}`,
+  };
+}
+
+async function loadTemporaryStrategyData(sourceKey, config) {
+  if (!config) return loadBuiltinDynamicStrategyData(sourceKey, "early");
+  const descriptor = customStrategyDescriptor(config);
+  const strategyKey = `${TEMPORARY_STRATEGY_KEY}:${simpleHash(JSON.stringify({ baseStrategy: config.baseStrategy, params: config.params }))}`;
+  return loadDynamicStrategyData(
+    sourceKey,
+    strategyKey,
+    {
+      ...config,
+      key: TEMPORARY_STRATEGY_KEY,
+      sourceName: config.sourceName || descriptor.shortLabel || descriptor.label,
+    },
+    descriptor,
+    config.baseStrategy || "early",
+  );
+}
+
 async function loadBuiltinDynamicStrategyData(sourceKey, strategyKey) {
   const cacheKey = `${sourceKey}:dynamic-merged:${strategyKey}`;
   if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
@@ -2195,9 +2287,10 @@ async function loadBuiltinDynamicStrategyData(sourceKey, strategyKey) {
   return data;
 }
 
-async function loadDataForSource(rawSource, rawStrategy) {
+async function loadDataForSource(rawSource, rawStrategy, options = {}) {
   const sourceKey = normalizeSourceKey(rawSource);
   const strategyKey = normalizeStrategyKey(rawStrategy);
+  if (isTemporaryStrategyKey(strategyKey)) return loadTemporaryStrategyData(sourceKey, options.temporaryStrategy);
   if (isCustomStrategyKey(strategyKey)) return loadCustomStrategyData(sourceKey, strategyKey);
   if (sourceKey === "ths") return loadThsData(strategyKey);
   if (shouldUseDatabase(sourceKey)) return loadBuiltinDynamicStrategyData(sourceKey, strategyKey);
@@ -2912,7 +3005,7 @@ function dateStatus(requestedDate, selectedDate, tradingDates, signalDates) {
 }
 
 async function dailyPayload(query) {
-  const data = await loadDataForSource(query.source, query.strategy);
+  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const map = strict ? data.byDate : data.allByDate;
@@ -2949,7 +3042,7 @@ async function dailyPayload(query) {
 }
 
 async function timelinePayload(query) {
-  const data = await loadDataForSource(query.source, query.strategy);
+  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const dates = displayDateRange(signalDates, query.date);
@@ -2966,8 +3059,11 @@ async function timelinePayload(query) {
 }
 
 async function overviewPayload(query = {}) {
-  const data = await loadDataForSource(query.source, query.strategy);
+  const temporaryStrategy = temporaryStrategyConfigFromQuery(query);
+  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy });
   const strategies = await availableStrategiesForSource(data.sourceKey);
+  const availableStrategies = [...strategies.builtIn, ...strategies.custom];
+  if (temporaryStrategy) availableStrategies.unshift(customStrategyDescriptor(temporaryStrategy));
   const tradingDates = readTradingCalendar().filter(
     (date) => date >= (data.dates[0] || date) && date <= (data.dates[data.dates.length - 1] || date),
   );
@@ -2977,7 +3073,7 @@ async function overviewPayload(query = {}) {
     sourceKey: data.sourceKey,
     dataSource: data.dataSource,
     availableSources: Object.values(DATA_SOURCES),
-    availableStrategies: [...strategies.builtIn, ...strategies.custom],
+    availableStrategies,
     customStrategies: strategies.custom,
     strategyParamDefs: STRATEGY_PARAM_DEFS,
     dataStrategy: data.dataSource.strategy,
@@ -3007,7 +3103,7 @@ async function strategyConfigsPayload(query = {}) {
 }
 
 async function evaluationPayload(query = {}) {
-  const data = await loadDataForSource(query.source, query.strategy);
+  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const baseEvents = strict ? data.strictEvents : data.events;
   const events = dateFilteredEvents(baseEvents, query.from, query.to);
@@ -3076,7 +3172,7 @@ async function evaluationPayload(query = {}) {
 }
 
 async function stockSignalsPayload(query = {}) {
-  const data = await loadDataForSource(query.source, query.strategy);
+  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const rawQuery = String(query.code || query.q || "").trim();
   const code = rawQuery.match(/\d{6}/)?.[0] || "";
@@ -4170,6 +4266,10 @@ async function dailySignalPayload(query = {}, headers = {}) {
   });
 }
 
+async function dailySignalFallbackPayload(query = {}, headers = {}) {
+  return dailySignalPayload({ ...query, force: query.force || "1" }, headers);
+}
+
 async function runDailyKlineSync(options = {}) {
   requireDatabase();
   const sourceKey = normalizeSourceKey(options.source || "em");
@@ -4986,6 +5086,7 @@ async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
   if (pathname === "/api/cron/ths-sync") return thsSyncPayload(query, headers);
   if (pathname === "/api/cron/daily-signal-sync") return dailySignalPayload(query, headers);
+  if (pathname === "/api/cron/daily-signal-fallback") return dailySignalFallbackPayload(query, headers);
   const error = new Error("Not found");
   error.statusCode = 404;
   throw error;
@@ -5026,6 +5127,7 @@ module.exports = {
   thsSyncPayload,
   runThsPopularitySync,
   dailySignalPayload,
+  dailySignalFallbackPayload,
   runDailySignalGeneration,
   upsertPopularitySnapshots,
 };
