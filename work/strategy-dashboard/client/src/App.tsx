@@ -565,7 +565,8 @@ function DailyCandidates({ daily, loading, refresh, onVerify }: AnyRecord) {
 }
 
 function TimelinePanel({ rows, selectedDate, setDate }: { rows: AnyRecord[]; selectedDate?: string; setDate: (date: string) => void }) {
-  const maxCount = Math.max(1, ...rows.map((item) => item.count || 0));
+  const visibleRows = rows.filter((row) => (row.count || 0) > 0 || row.date === selectedDate);
+  const maxCount = Math.max(1, ...visibleRows.map((item) => item.count || 0));
   return (
     <Paper className="sidePanel historyPanel" withBorder>
       <Group justify="space-between" className="panelHead">
@@ -584,7 +585,7 @@ function TimelinePanel({ rows, selectedDate, setDate }: { rows: AnyRecord[]; sel
       </div>
       <ScrollArea.Autosize mah={520} type="auto" offsetScrollbars>
         <Stack gap={4} p="xs">
-          {rows.slice().reverse().map((row) => (
+          {visibleRows.slice().reverse().map((row) => (
             <UnstyledButton key={row.date} className={`timelineGrid row ${row.date === selectedDate ? "active" : ""}`} onClick={() => setDate(row.date)}>
               <strong>{row.date}</strong>
               <span>{row.count}只</span>
