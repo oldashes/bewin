@@ -126,12 +126,11 @@ a {
 
 .dashboardGrid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 460px);
-  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) clamp(380px, 24vw, 560px);
+  gap: clamp(18px, 1.2vw, 28px);
   width: 100%;
-  max-width: 1880px;
-  margin: 0 auto;
-  padding: 20px 24px 36px;
+  margin: 0;
+  padding: 20px clamp(18px, 2vw, 48px) 36px;
 }
 
 .mainColumn,
@@ -302,14 +301,14 @@ a {
 }
 
 .tagBadge {
-  max-width: 126px;
+  max-width: clamp(126px, 8vw, 168px);
   min-width: 0;
   cursor: help;
   font-weight: 800;
 }
 
 .tagBadge.compact {
-  max-width: 48px;
+  max-width: clamp(48px, 4vw, 72px);
 }
 
 .tagBadge .mantine-Badge-label {
@@ -470,6 +469,51 @@ a {
 
 .returnCard.down {
   border-left-color: var(--green);
+}
+
+@media (min-width: 1800px) {
+  .topbar {
+    padding-inline: clamp(28px, 2vw, 72px);
+  }
+
+  .dashboardGrid {
+    grid-template-columns: minmax(0, 1fr) clamp(460px, 21vw, 680px);
+    gap: clamp(24px, 1.4vw, 36px);
+    padding: 24px clamp(28px, 2vw, 72px) 44px;
+  }
+
+  .sectionPanel {
+    padding: 22px;
+  }
+
+  .metricCard {
+    min-height: 136px;
+    padding: 20px;
+  }
+
+  .stockTable {
+    min-width: 1540px;
+  }
+
+  .stockTable .stockCol {
+    width: clamp(190px, 10vw, 260px);
+  }
+
+  .stockTable .signalCol {
+    width: clamp(180px, 10vw, 250px);
+  }
+
+  .stockTable .tradeCol {
+    width: clamp(140px, 7vw, 180px);
+  }
+
+  .stockTable .boardCol {
+    width: clamp(180px, 9vw, 240px);
+  }
+
+  .stockTable .riskCol {
+    width: clamp(170px, 9vw, 240px);
+  }
 }
 
 .returnValue {

@@ -17,7 +17,10 @@
     "lab:strategy": "node scripts/strategy-lab.js",
     "sync:daily": "node scripts/daily-sync.js",
     "sync:ths": "node scripts/ths-sync.js",
-    "sync:signals": "node scripts/daily-signal-sync.js"
+    "sync:ths-features": "node scripts/ths-feature-sync.js",
+    "sync:signals": "node scripts/daily-signal-sync.js",
+    "ifind:backfill-popularity": "node scripts/ifind-backfill-popularity.js",
+    "ifind:generate-features": "node scripts/ifind-generate-features.js"
   },
   "dependencies": {
     "@mantine/core": "^9.4.1",

@@ -299,6 +299,8 @@ function ToneText({ value, children }: { value: unknown; children?: ReactNode })
 }
 
 function tagColor(item: string) {
+  if (/双源共振/.test(item)) return "green";
+  if (/共振/.test(item)) return "teal";
   if (/等待|观察|二次|回踩|不直接追/.test(item)) return "orange";
   if (/过热|偏热|加速|风险|拥挤|追高|高波动|边缘/.test(item)) return "red";
   if (/确认|可按|规则|验证|基础候选/.test(item)) return "teal";
@@ -396,7 +398,7 @@ function AppShellHeader({
           onChange={(value) => setSource(value || "em")}
           data={[
             { value: "em", label: "东方财富历史人气" },
-            { value: "ths", label: "同花顺本地积累" },
+            { value: "ths", label: "同花顺历史人气" },
           ]}
           className="sourceSelect"
         />

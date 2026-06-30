@@ -28,6 +28,7 @@ const DEFAULT_THS_WATCHLIST_MAX = 20;
 const DEFAULT_SIGNAL_MAX_UNIVERSE = 180;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 8;
+const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 20;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const MARKET_INDEX = {
   key: "csi300",
@@ -48,9 +49,9 @@ const DATA_SOURCES = {
   },
   ths: {
     key: "ths",
-    label: "同花顺本地积累",
+    label: "同花顺历史人气",
     shortLabel: "同花顺",
-    description: "同花顺人气榜每日采集后形成的本地历史数据",
+    description: "同花顺 iFind API 回溯 + 每日自动采集形成的历史人气数据",
     sourceFile: THS_CANDIDATES_FILE,
   },
 };
@@ -574,6 +575,7 @@ function hotRiskFlags(event) {
 function signalAttributionTags(event, context = {}) {
   const tags = [];
   const daySignalCount = context.daySignalCount ?? event.daySignalCount;
+  if (event.dualSourceResonance) tags.push("双源共振");
   if (Number.isFinite(daySignalCount) && daySignalCount >= 2) tags.push("多信号日扩散");
   if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.8 && event.boardHotRatio < 0.9) tags.push("板块半拥挤");
   if (Number.isFinite(event.boardHotRatio) && event.boardHotRatio >= 0.9) tags.push("板块高拥挤");
@@ -639,6 +641,12 @@ function applySignalQuality(event, context = {}) {
     band: band.key,
     label: band.label,
   };
+  if (event.dualSourceResonance && event.signalInsight) {
+    event.signalInsight = {
+      ...event.signalInsight,
+      tags: [...new Set(["双源共振", ...(event.signalInsight.tags || [])])],
+    };
+  }
   return event;
 }
 
@@ -1355,14 +1363,19 @@ async function listStrategyConfigs(sourceKey = "em") {
           created_at,
           updated_at,
           row_number() over (
-            partition by source, lower(trim(name))
-            order by updated_at desc nulls last, created_at desc nulls last, id desc
+            partition by lower(trim(name))
+            order by case when source = $1 then 0 when source = 'em' then 1 else 2 end,
+              updated_at desc nulls last,
+              created_at desc nulls last,
+              id desc
           ) as rn
         from strategy_configs
         where source = $1
+          or ($1 <> 'em' and source = 'em')
       ) ranked
       where rn = 1
-      order by updated_at desc
+      order by case when source = $1 then 0 when source = 'em' then 1 else 2 end,
+        updated_at desc
     `,
     [sourceKey],
   );
@@ -1375,7 +1388,14 @@ async function getStrategyConfig(id, sourceKey = "em") {
     `
       select id, source, name, description, params, created_at, updated_at
       from strategy_configs
-      where id = $1 and source = $2
+      where id = $1
+        and (
+          source = $2
+          or $2 <> 'em'
+        )
+      order by case when source = $2 then 0 when source = 'em' then 1 else 2 end,
+        updated_at desc nulls last,
+        created_at desc nulls last
       limit 1
     `,
     [id, sourceKey],
@@ -1449,7 +1469,7 @@ async function loadThsData(strategyKey = "early") {
       const signalDate = normalizeDate(row.signalDate || row.date);
       if (!code || !signalDate) return null;
       const event = {
-        source: "同花顺本地积累",
+        source: "同花顺历史人气",
         em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
         code,
         name: stockMeta.get(code)?.name || row.name || names.get(code) || code,
@@ -1504,7 +1524,7 @@ async function loadThsData(strategyKey = "early") {
 }
 
 function shouldUseDatabase(sourceKey) {
-  return sourceKey === "em" && DATA_MODE !== "csv" && Boolean(process.env.DATABASE_URL);
+  return ["em", "ths"].includes(sourceKey) && DATA_MODE !== "csv" && Boolean(process.env.DATABASE_URL);
 }
 
 function getDbPool() {
@@ -1903,7 +1923,7 @@ async function loadThsSnapshotHotData({ sourceKey = "ths", afterDate = null, asS
     strategy: descriptor,
     description: asSupplement
       ? "东方财富热门确认缺口日期使用同花顺每日最终热榜快照补齐；该补齐口径目前覆盖热榜前10左右。"
-      : "同花顺本地积累，基于每日最终热榜快照动态生成热门确认候选。",
+      : "同花顺历史人气，基于每日最终热榜快照动态生成热门确认候选。",
     sourceFile: "neon:popularity_snapshots(ths.stock.hot)",
     available: events.length > 0,
     message: events.length ? "" : "Neon 中暂无同花顺热榜快照。请确认每日采集任务已运行。",
@@ -2292,6 +2312,8 @@ async function loadDataForSource(rawSource, rawStrategy, options = {}) {
   const strategyKey = normalizeStrategyKey(rawStrategy);
   if (isTemporaryStrategyKey(strategyKey)) return loadTemporaryStrategyData(sourceKey, options.temporaryStrategy);
   if (isCustomStrategyKey(strategyKey)) return loadCustomStrategyData(sourceKey, strategyKey);
+  if (sourceKey === "ths" && strategyKey === "hot") return loadThsData(strategyKey);
+  if (sourceKey === "ths" && shouldUseDatabase(sourceKey)) return loadBuiltinDynamicStrategyData(sourceKey, strategyKey);
   if (sourceKey === "ths") return loadThsData(strategyKey);
   if (shouldUseDatabase(sourceKey)) return loadBuiltinDynamicStrategyData(sourceKey, strategyKey);
   return strategyKey === "hot" ? loadHotData() : loadData();
@@ -2894,12 +2916,15 @@ function dateFilteredEvents(events, from, to) {
 
 function displayDateRange(signalDates, requestedDate = null) {
   const calendar = readTradingCalendar();
-  if (!calendar.length) return signalDates;
   const normalizedRequest = normalizeDate(requestedDate);
-  const start = signalDates[0] || normalizedRequest || calendar[0];
-  const endCandidates = [signalDates[signalDates.length - 1], normalizedRequest, calendar[calendar.length - 1]].filter(Boolean);
+  const dateSet = new Set([...(calendar || []), ...(signalDates || [])]);
+  if (normalizedRequest) dateSet.add(normalizedRequest);
+  const dates = [...dateSet].filter(Boolean).sort();
+  if (!dates.length) return signalDates || [];
+  const start = signalDates[0] || normalizedRequest || dates[0];
+  const endCandidates = [signalDates[signalDates.length - 1], normalizedRequest, dates[dates.length - 1]].filter(Boolean);
   const end = endCandidates.sort().at(-1);
-  return calendar.filter((date) => date >= start && date <= end);
+  return dates.filter((date) => date >= start && date <= end);
 }
 
 async function availableStrategiesForSource(sourceKey) {
@@ -3004,12 +3029,27 @@ function dateStatus(requestedDate, selectedDate, tradingDates, signalDates) {
   };
 }
 
+async function dualSourceCodesForDate({ events, selectedDate, sourceKey, strategyKey, strict, temporaryStrategy }) {
+  if (!events.length || !selectedDate || !["em", "ths"].includes(sourceKey)) return new Set();
+  const otherSource = sourceKey === "em" ? "ths" : "em";
+  try {
+    const otherData = await loadDataForSource(otherSource, strategyKey, { temporaryStrategy });
+    const otherMap = strict ? otherData.byDate : otherData.allByDate;
+    return new Set((otherMap.get(selectedDate) || []).map((event) => event.code));
+  } catch {
+    return new Set();
+  }
+}
+
 async function dailyPayload(query) {
-  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
+  const temporaryStrategy = temporaryStrategyConfigFromQuery(query);
+  const strategyKey = normalizeStrategyKey(query.strategy);
+  const data = await loadDataForSource(query.source, strategyKey, { temporaryStrategy });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const map = strict ? data.byDate : data.allByDate;
-  const requestedDate = normalizeDate(query.date) || signalDates[signalDates.length - 1] || null;
+  const normalizedRequestedDate = normalizeDate(query.date);
+  const requestedDate = normalizedRequestedDate || signalDates[signalDates.length - 1] || null;
   const tradingDates = displayDateRange(signalDates, requestedDate);
   const isTradingDate = !requestedDate || !tradingDates.length || tradingDates.includes(requestedDate);
   const selectedDate = !requestedDate
@@ -3017,19 +3057,35 @@ async function dailyPayload(query) {
     : isTradingDate
       ? requestedDate
       : previousDate(tradingDates, requestedDate) || nextAvailableDate(tradingDates, requestedDate) || requestedDate;
-  const exactDate = !query.date || normalizeDate(query.date) === selectedDate;
+  const exactDate = !normalizedRequestedDate || normalizedRequestedDate === selectedDate;
   const events = selectedDate ? [...(map.get(selectedDate) || [])].sort((a, b) => b.sortScore - a.sortScore) : [];
-  const displayEvents = events.map((event) => applySignalQuality({ ...event }, { daySignalCount: events.length }));
+  const dualSourceCodes = await dualSourceCodesForDate({
+    events,
+    selectedDate,
+    sourceKey: data.sourceKey,
+    strategyKey,
+    strict,
+    temporaryStrategy,
+  });
+  const displayEvents = events.map((event) =>
+    applySignalQuality(
+      {
+        ...event,
+        dualSourceResonance: dualSourceCodes.has(event.code),
+      },
+      { daySignalCount: events.length },
+    ),
+  );
   return {
     selectedDate,
-    requestedDate: query.date || null,
+    requestedDate: normalizedRequestedDate,
     exactDate,
-    nextAvailableDate: exactDate ? null : nextAvailableDate(tradingDates, query.date),
+    nextAvailableDate: exactDate ? null : nextAvailableDate(tradingDates, normalizedRequestedDate),
     strict,
     availableDates: tradingDates,
     signalDates,
     tradingDates,
-    dateStatus: dateStatus(query.date || null, selectedDate, tradingDates, signalDates),
+    dateStatus: dateStatus(normalizedRequestedDate, selectedDate, tradingDates, signalDates),
     source: data.dataSource.description,
     dataSource: data.dataSource,
     dataStrategy: data.dataSource.strategy,
@@ -3747,6 +3803,7 @@ function requireDatabase() {
 }
 
 async function createSyncRun(jobName, details) {
+  await markStaleSyncRuns(jobName);
   const { rows } = await getDbPool().query(
     `
       insert into sync_runs (job_name, status, details)
@@ -3756,6 +3813,22 @@ async function createSyncRun(jobName, details) {
     [jobName, JSON.stringify(details || {})],
   );
   return rows[0];
+}
+
+async function markStaleSyncRuns(jobName, staleMinutes = 20) {
+  await getDbPool().query(
+    `
+      update sync_runs
+      set
+        status = 'timeout',
+        finished_at = now(),
+        error = coalesce(error, 'job exceeded expected runtime or serverless timeout')
+      where job_name = $1
+        and status = 'running'
+        and started_at < now() - ($2::int * interval '1 minute')
+    `,
+    [jobName, staleMinutes],
+  );
 }
 
 async function finishSyncRun(runId, status, summary, errorMessage = null) {
@@ -4022,7 +4095,10 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
     }
   }
 
-  return [...byCode.values()];
+  const topRankCodes = new Set((topRanks || []).map((item) => item.code).filter(Boolean));
+  return [...byCode.values()]
+    .sort((a, b) => Number(topRankCodes.has(b.code)) - Number(topRankCodes.has(a.code)))
+    .slice(0, maxUniverse);
 }
 
 function featureRecordFromDailyContext({ sourceKey, targetDate, item, history, stockMetrics, boardMetrics }) {
@@ -4841,14 +4917,336 @@ async function runThsPopularitySync(options = {}) {
   }
 }
 
+async function runThsFeatureGeneration(options = {}) {
+  requireDatabase();
+  const requestedYmd = normalizeYmd(options.date);
+  const targetDate = dateFromYmd(requestedYmd);
+  const rankMax = boundedInteger(options.rankMax ?? process.env.IFIND_FEATURE_RANK_MAX, 1600, 1, 5000);
+  const minRankDelta20 = Number.isFinite(Number(options.minRankDelta20 ?? process.env.IFIND_FEATURE_MIN_RANK_DELTA_20))
+    ? Number(options.minRankDelta20 ?? process.env.IFIND_FEATURE_MIN_RANK_DELTA_20)
+    : 0;
+  const amountRatioMin = Number.isFinite(Number(options.amountRatioMin ?? process.env.IFIND_FEATURE_AMOUNT_RATIO_MIN))
+    ? Number(options.amountRatioMin ?? process.env.IFIND_FEATURE_AMOUNT_RATIO_MIN)
+    : 0.8;
+  const amountRatioMax = Number.isFinite(Number(options.amountRatioMax ?? process.env.IFIND_FEATURE_AMOUNT_RATIO_MAX))
+    ? Number(options.amountRatioMax ?? process.env.IFIND_FEATURE_AMOUNT_RATIO_MAX)
+    : 3.2;
+  const prev5Min = (Number.isFinite(Number(options.prev5MinPct ?? process.env.IFIND_FEATURE_PREV5_MIN_PCT))
+    ? Number(options.prev5MinPct ?? process.env.IFIND_FEATURE_PREV5_MIN_PCT)
+    : -15) / 100;
+  const prev5Max = (Number.isFinite(Number(options.prev5MaxPct ?? process.env.IFIND_FEATURE_PREV5_MAX_PCT))
+    ? Number(options.prev5MaxPct ?? process.env.IFIND_FEATURE_PREV5_MAX_PCT)
+    : 35) / 100;
+  const boardMode = String(options.boardMode || process.env.IFIND_FEATURE_BOARD_MODE || "cached").toLowerCase();
+  const metric = String(options.metric || process.env.IFIND_FEATURE_METRIC || "attention").toLowerCase();
+  const startedAt = new Date().toISOString();
+
+  const { rows: todaySnapshotRows } = await getDbPool().query(
+    `
+      select
+        p.snapshot_date::text as date,
+        p.snapshot_key,
+        p.metric,
+        p.code,
+        coalesce(nullif(trim(s.name), ''), nullif(trim(p.name), ''), p.code) as name,
+        p.rank::int as rank,
+        s.board,
+        s.industry,
+        s.concepts
+      from popularity_snapshots p
+      left join stocks s on s.code = p.code
+      where p.source = 'ths'
+        and p.category = 'stock'
+        and p.metric = $3
+        and p.snapshot_date = $1::date
+        and p.rank between 1 and $2
+        and p.snapshot_key = (
+          select max(p2.snapshot_key)
+          from popularity_snapshots p2
+          where p2.source = p.source
+            and p2.category = p.category
+            and p2.metric = p.metric
+            and p2.snapshot_date = p.snapshot_date
+        )
+      order by p.rank asc
+    `,
+    [targetDate, rankMax, metric],
+  );
+  const todayRows = todaySnapshotRows
+    .map((row) => ({
+      ...row,
+      code: String(row.code || "").match(/\d{6}/)?.[0] || "",
+      rank: n(row.rank),
+      concepts: normalizeConceptList(row.concepts),
+    }))
+    .filter((row) => row.code && row.date && Number.isFinite(row.rank));
+  const codes = [...new Set(todayRows.map((row) => row.code))];
+  const { rows: historyRows } = codes.length
+    ? await getDbPool().query(
+        `
+          select snapshot_date::text as date, code, rank::int as rank
+          from popularity_snapshots
+          where source = 'ths'
+            and category = 'stock'
+            and metric = $4
+            and code = any($1)
+            and snapshot_date between ($2::date - interval '120 days') and $2::date
+            and rank between 1 and $3
+          order by code asc, snapshot_date asc
+        `,
+        [codes, targetDate, rankMax, metric],
+      )
+    : { rows: [] };
+  const [klineByCode, donorByKey] = await Promise.all([
+    loadStockDailyBarsForFeatures(codes, targetDate),
+    loadEmBoardDonorsForFeatures(codes, targetDate),
+  ]);
+  const historyByCode = new Map();
+  for (const row of historyRows) {
+    const code = String(row.code || "");
+    const rank = n(row.rank);
+    if (!code || !Number.isFinite(rank)) continue;
+    if (!historyByCode.has(code)) historyByCode.set(code, []);
+    historyByCode.get(code).push({ date: normalizeDate(row.date), rank });
+  }
+  const boardCodeByName = readBoardCodeByName();
+  const boardRowsByCode = new Map();
+  const boardMetricsByKey = new Map();
+  const featureRecords = [];
+  const stats = {
+    source: "ths",
+    targetDate,
+    rankMax,
+    minRankDelta20,
+    amountRatioMin,
+    amountRatioMax,
+    prev5Min,
+    prev5Max,
+    boardMode,
+    metric,
+    snapshotCount: todayRows.length,
+    generatedCount: 0,
+    skippedMissingRank20: 0,
+    skippedMissingStockKline: 0,
+    skippedMissingStockMetrics: 0,
+    boardDonorCount: 0,
+    boardComputedCount: 0,
+    boardMissingCount: 0,
+    startedAt,
+  };
+
+  for (const row of todayRows) {
+    const history = historyByCode.get(row.code) || [];
+    const rank20 = rankAtOffset(history, targetDate, 20);
+    if (!Number.isFinite(rank20)) {
+      stats.skippedMissingRank20 += 1;
+      continue;
+    }
+    if (rank20 - row.rank < minRankDelta20) continue;
+    const stockRows = klineByCode.get(row.code);
+    if (!stockRows?.length) {
+      stats.skippedMissingStockKline += 1;
+      continue;
+    }
+    const stockMetrics = stockPreSignalMetricsFromRows(stockRows, targetDate);
+    if (
+      !Number.isFinite(stockMetrics.prev5) ||
+      !Number.isFinite(stockMetrics.amountRatio) ||
+      !Number.isFinite(stockMetrics.signalClose)
+    ) {
+      stats.skippedMissingStockMetrics += 1;
+      continue;
+    }
+    if (
+      stockMetrics.amountRatio < amountRatioMin ||
+      stockMetrics.amountRatio > amountRatioMax ||
+      stockMetrics.prev5 < prev5Min ||
+      stockMetrics.prev5 > prev5Max
+    ) {
+      continue;
+    }
+    const donor = donorByKey.get(row.code) || null;
+    const fallbackBoardName = row.industry || row.concepts?.[0] || row.board || "";
+    const bestBoardName = donor?.best_board_name || fallbackBoardName;
+    const item = {
+      code: row.code,
+      name: row.name || row.code,
+      board: row.board || "",
+      industry: row.industry || "",
+      concepts: row.concepts || [],
+      bestBoardName,
+      bestBoardType: donor?.best_board_type || (row.industry && bestBoardName === row.industry ? "industry" : bestBoardName ? "concept" : ""),
+      bestBoardCode: donor?.best_board_code || boardCodeByName.get(bestBoardName) || "",
+      source: "ifind-daily",
+    };
+    let boardMetrics = boardMetricsFromFeatureDonor(donor);
+    if (boardMetrics) {
+      stats.boardDonorCount += 1;
+    } else if (item.bestBoardCode) {
+      boardMetrics = await loadBoardMetricsForFeature(item.bestBoardCode, targetDate, boardMode, boardRowsByCode, boardMetricsByKey);
+      if (boardMetrics) stats.boardComputedCount += 1;
+      else stats.boardMissingCount += 1;
+    } else {
+      stats.boardMissingCount += 1;
+    }
+    const feature = featureRecordFromDailyContext({
+      sourceKey: "ths",
+      targetDate,
+      item,
+      history,
+      stockMetrics,
+      boardMetrics,
+    });
+    if (!feature) continue;
+    feature.raw = {
+      ...(feature.raw || {}),
+      generator: "ifind-ths-daily-feature-sync",
+      generatedAt: new Date().toISOString(),
+      provider: "ifind",
+      metric,
+      snapshotKey: row.snapshot_key,
+      boardMode,
+      donorBoard: Boolean(donor && boardMetrics),
+      boardMetricsAvailable: Boolean(boardMetrics),
+    };
+    featureRecords.push(feature);
+  }
+
+  const savedCount = await bulkUpsertStrategyFeatureEvents(featureRecords);
+  cachedDbData.clear();
+  cachedThsData.clear();
+  return {
+    ...stats,
+    generatedCount: featureRecords.length,
+    savedCount,
+    finishedAt: new Date().toISOString(),
+    status: savedCount ? "success" : "empty",
+  };
+}
+
+async function loadStockDailyBarsForFeatures(codes, targetDate) {
+  if (!codes.length) return new Map();
+  const { rows } = await getDbPool().query(
+    `
+      select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
+      from stock_daily_bars
+      where code = any($1)
+        and trade_date between ($2::date - interval '140 days') and $2::date
+      order by code asc, trade_date asc
+    `,
+    [codes, targetDate],
+  );
+  const byCode = new Map();
+  for (const row of rows) {
+    const code = String(row.code || "");
+    if (!byCode.has(code)) byCode.set(code, []);
+    byCode.get(code).push(dbBarRowToKline(row));
+  }
+
+  const fetchMissingMax = boundedInteger(
+    process.env.IFIND_FEATURE_FETCH_MISSING_KLINE_MAX,
+    DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
+    0,
+    200,
+  );
+  const missingCodes = codes
+    .filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate))
+    .slice(0, fetchMissingMax);
+  for (const code of missingCodes) {
+    try {
+      const stockRows = await loadKlineForDate(normalizeStock(code), targetDate);
+      if (stockRows?.length) byCode.set(code, stockRows);
+    } catch {
+      // Keep the feature generator best-effort; stocks without K-line data are skipped later.
+    }
+  }
+
+  return byCode;
+}
+
+async function loadEmBoardDonorsForFeatures(codes, targetDate) {
+  if (!codes.length) return new Map();
+  const { rows } = await getDbPool().query(
+    `
+      select code, best_board_type, best_board_code, best_board_name, best_board_ret_5, best_board_ret_10, best_board_amount_ratio
+      from strategy_feature_events
+      where source = 'em'
+        and feature_set = $1
+        and code = any($2)
+        and signal_date = $3::date
+    `,
+    [FEATURE_SET, codes, targetDate],
+  );
+  return new Map(rows.map((row) => [row.code, row]));
+}
+
+function boardMetricsFromFeatureDonor(row) {
+  if (!row) return null;
+  const prev5 = n(row.best_board_ret_5);
+  const amountRatio = n(row.best_board_amount_ratio);
+  if (!Number.isFinite(prev5) || !Number.isFinite(amountRatio)) return null;
+  return { prev5, prev10: n(row.best_board_ret_10), amountRatio };
+}
+
+async function loadBoardMetricsForFeature(boardCode, date, boardMode, rowsByCode, metricsByKey) {
+  const key = `${boardCode}:${date}`;
+  if (metricsByKey.has(key)) return metricsByKey.get(key);
+  if (!rowsByCode.has(boardCode)) {
+    if (boardMode === "none") {
+      rowsByCode.set(boardCode, []);
+    } else if (boardMode === "cached") {
+      const board = boardKlineStock(boardCode);
+      let rows = [];
+      if (board?.cacheFile && fs.existsSync(board.cacheFile)) {
+        try {
+          const cached = JSON.parse(fs.readFileSync(board.cacheFile, "utf8"));
+          rows = Array.isArray(cached) && cached.some((row) => row.date === date) ? cached : [];
+        } catch {
+          rows = [];
+        }
+      }
+      rowsByCode.set(boardCode, rows);
+    } else {
+      rowsByCode.set(boardCode, await loadBoardKlineForDate(boardCode, date).catch(() => []));
+    }
+  }
+  const metrics = stockPreSignalMetricsFromRows(rowsByCode.get(boardCode) || [], date);
+  const value = Number.isFinite(metrics.prev5) && Number.isFinite(metrics.amountRatio) ? metrics : null;
+  metricsByKey.set(key, value);
+  return value;
+}
+
 async function thsSyncPayload(query = {}, headers = {}) {
   assertCronAuthorized(query, headers);
-  return runThsPopularitySync({
+  const summary = await runThsPopularitySync({
     date: query.date,
     categories: query.categories,
     includeAttention: query.includeAttention,
     watchlistMax: query.watchlistMax,
     lookbackDays: query.lookbackDays,
+  });
+  if (query.generateFeatures !== "1" && query.generateFeatures !== "true") return summary;
+  try {
+    const featureDate = normalizeDate(summary.params?.actualYmd) || dateFromYmd(normalizeYmd(query.date));
+    const featureGeneration = await runThsFeatureGeneration({ date: featureDate });
+    return { ...summary, featureGeneration };
+  } catch (error) {
+    return { ...summary, featureGeneration: { status: "failed", error: error.message } };
+  }
+}
+
+async function thsFeaturePayload(query = {}, headers = {}) {
+  assertCronAuthorized(query, headers);
+  return runThsFeatureGeneration({
+    date: query.date,
+    rankMax: query.rankMax,
+    minRankDelta20: query.minRankDelta20,
+    amountRatioMin: query.amountRatioMin,
+    amountRatioMax: query.amountRatioMax,
+    prev5MinPct: query.prev5MinPct,
+    prev5MaxPct: query.prev5MaxPct,
+    metric: query.metric,
+    boardMode: query.boardMode,
   });
 }
 
@@ -5085,6 +5483,7 @@ async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   if (pathname === "/api/position") return positionPayload(query);
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
   if (pathname === "/api/cron/ths-sync") return thsSyncPayload(query, headers);
+  if (pathname === "/api/cron/ths-feature-sync") return thsFeaturePayload(query, headers);
   if (pathname === "/api/cron/daily-signal-sync") return dailySignalPayload(query, headers);
   if (pathname === "/api/cron/daily-signal-fallback") return dailySignalFallbackPayload(query, headers);
   const error = new Error("Not found");
@@ -5125,9 +5524,19 @@ module.exports = {
   dailySyncPayload,
   runDailyKlineSync,
   thsSyncPayload,
+  thsFeaturePayload,
   runThsPopularitySync,
+  runThsFeatureGeneration,
   dailySignalPayload,
   dailySignalFallbackPayload,
   runDailySignalGeneration,
   upsertPopularitySnapshots,
+  bulkUpsertStrategyFeatureEvents,
+  stockPreSignalMetricsFromRows,
+  normalizeStock,
+  fetchKlineWithRetry,
+  loadKlineForDate,
+  loadBoardKlineForDate,
+  featureRecordFromDailyContext,
+  readBoardCodeByName,
 };

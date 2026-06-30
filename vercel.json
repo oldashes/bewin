@@ -19,6 +19,10 @@
       "schedule": "40 8 * * 1-5"
     },
     {
+      "path": "/api/cron/ths-feature-sync",
+      "schedule": "50 8 * * 1-5"
+    },
+    {
       "path": "/api/cron/daily-signal-sync",
       "schedule": "10 9 * * 1-5"
     },
