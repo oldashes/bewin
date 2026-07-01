@@ -30,6 +30,8 @@ const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 8;
 const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 20;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
+const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
+const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
 const MARKET_INDEX = {
   key: "csi300",
   name: "沪深300",
@@ -474,7 +476,7 @@ function normalizeDate(value) {
     const day = String(value.getDate()).padStart(2, "0");
     return `${year}-${month}-${day}`;
   }
-  const text = String(value || "").trim();
+  const text = String(value || "").trim().replaceAll("/", "-");
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
   if (/^\d{8}$/.test(text)) return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
   return "";
@@ -1647,7 +1649,7 @@ async function backfillDbEventReturns(events) {
 
   const { rows } = await getDbPool().query(
     `
-      select code, trade_date, open, close, high, low
+      select code, trade_date::text as trade_date, open, close, high, low
       from stock_daily_bars
       where code = any($1) and trade_date >= $2::date
       order by code asc, trade_date asc
@@ -1698,7 +1700,7 @@ async function attachDbPreSignalMetrics(events) {
 
   const { rows } = await getDbPool().query(
     `
-      select code, trade_date, open, close, high, low, volume, amount, turnover, pct
+      select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
       from stock_daily_bars
       where code = any($1)
         and trade_date >= $2::date - interval '90 day'
@@ -2530,7 +2532,7 @@ async function marketDailyStatsFromBaselineTable(dates) {
   if (!dates.length || !process.env.DATABASE_URL) return new Map();
   const { rows } = await getDbPool().query(
     `
-      select trade_date, horizon, sample_count, avg_return, median_return, win_rate,
+      select trade_date::text as trade_date, horizon, sample_count, avg_return, median_return, win_rate,
              avg_win, avg_loss, payoff_ratio, profit_factor, best_return, worst_return
       from market_daily_baselines
       where source = 'em'
@@ -3370,6 +3372,134 @@ async function fetchKlineWithRetry(stock) {
   return retryFetch(() => fetchKline(stock), { attempts: 3, delayMs: 700 });
 }
 
+let cachedIfindAccessToken = null;
+
+async function ifindPost(pathname, body, accessToken, extraHeaders = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...extraHeaders,
+  };
+  if (accessToken) headers.access_token = accessToken;
+  const response = await fetchWithTimeout(
+    `${IFIND_BASE_URL}${pathname}`,
+    {
+      method: "POST",
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    },
+    KLINE_FETCH_TIMEOUT_MS,
+  );
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`iFind ${pathname} 返回非 JSON：${text.slice(0, 120)}`);
+  }
+  if (!response.ok) {
+    throw new Error(`iFind ${pathname} 请求失败：${response.status} ${payload.errmsg || ""}`.trim());
+  }
+  return payload;
+}
+
+async function getIfindAccessToken() {
+  if (cachedIfindAccessToken) return cachedIfindAccessToken;
+  const refreshToken = process.env.IFIND_REFRESH_TOKEN || "";
+  if (!refreshToken) throw new Error("缺少 IFIND_REFRESH_TOKEN，无法使用同花顺 iFind 兜底行情");
+  const payload = await ifindPost("/get_access_token", null, null, { refresh_token: refreshToken });
+  const token = payload?.data?.access_token;
+  if (payload.errorcode !== 0 || !token) {
+    throw new Error(`iFind access token 获取失败：${payload.errmsg || payload.errorcode || "unknown"}`);
+  }
+  cachedIfindAccessToken = token;
+  return token;
+}
+
+function ifindStockCode(stock) {
+  const market = stock.market === "SH" ? "SH" : stock.market === "BJ" ? "BJ" : "SZ";
+  return `${stock.code}.${market}`;
+}
+
+function firstTableValue(table, matcher) {
+  const key = Object.keys(table || {}).find(matcher);
+  const values = key ? table[key] : null;
+  return Array.isArray(values) ? values[0] : null;
+}
+
+function ifindKlineValue(table, label, ymd) {
+  return firstTableValue(table, (key) => key.includes(label) && key.includes(`[${ymd}]`));
+}
+
+function parseIfindKlineRow(payload, stock, date) {
+  if (payload.errorcode !== 0) throw new Error(payload.errmsg || `iFind error ${payload.errorcode}`);
+  const table = payload?.tables?.[0]?.table || {};
+  const ymd = date.replaceAll("-", "");
+  const row = {
+    date,
+    open: n(ifindKlineValue(table, "开盘价", ymd)),
+    close: n(ifindKlineValue(table, "收盘价", ymd)),
+    high: n(ifindKlineValue(table, "最高价", ymd)),
+    low: n(ifindKlineValue(table, "最低价", ymd)),
+    volume: n(ifindKlineValue(table, "成交量", ymd)),
+    amount: n(ifindKlineValue(table, "成交额", ymd)),
+    amplitude: null,
+    pct: n(ifindKlineValue(table, "涨跌幅", ymd)),
+    change: null,
+    turnover: n(ifindKlineValue(table, "换手率", ymd)),
+  };
+  if (!Number.isFinite(row.open) || !Number.isFinite(row.close)) {
+    throw new Error(`iFind 没有返回 ${stock.code} ${date} 的完整日 K`);
+  }
+  return row;
+}
+
+function weekdayDatesBetween(fromDate, toDate, maxDays = IFIND_KLINE_FALLBACK_MAX_DAYS) {
+  const dates = [];
+  const current = new Date(`${fromDate}T00:00:00Z`);
+  const end = new Date(`${toDate}T00:00:00Z`);
+  while (Number.isFinite(current.getTime()) && current <= end && dates.length < maxDays) {
+    const day = current.getUTCDay();
+    if (day >= 1 && day <= 5) dates.push(current.toISOString().slice(0, 10));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+async function fetchIfindKlineRow(stock, date) {
+  const token = await getIfindAccessToken();
+  const ymd = date.replaceAll("-", "");
+  const searchstring = `${ifindStockCode(stock)} ${ymd} 日K线 开盘价 收盘价 最高价 最低价 涨跌幅 成交量 成交额 换手率`;
+  const payload = await ifindPost("/smart_stock_picking", { searchstring, searchtype: "stock" }, token);
+  return parseIfindKlineRow(payload, stock, date);
+}
+
+async function fetchIfindKlineRange(stock, fromDate, toDate) {
+  if (!process.env.IFIND_REFRESH_TOKEN) return [];
+  const dates = weekdayDatesBetween(fromDate, toDate);
+  const rows = [];
+  for (const date of dates) {
+    try {
+      rows.push(await fetchIfindKlineRow(stock, date));
+    } catch {
+      // Non-trading days or incomplete iFind responses are skipped.
+    }
+    await sleep(80);
+  }
+  if (rows.length && shouldUseDatabase("em")) await saveKlineToDb(stock, rows, "ifind");
+  return rows;
+}
+
+function mergeKlineRows(baseRows, freshRows) {
+  const byDate = new Map();
+  for (const row of baseRows || []) {
+    if (row?.date) byDate.set(row.date, row);
+  }
+  for (const row of freshRows || []) {
+    if (row?.date) byDate.set(row.date, row);
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 function emSecurityCode(code) {
   const clean = String(code || "").match(/\d{6}/)?.[0] || "";
   if (!clean) return "";
@@ -3597,6 +3727,35 @@ async function loadKlineForDate(stock, date) {
   return fetchKlineWithRetry(stock);
 }
 
+function rowsHavePostDate(rows, date) {
+  return Boolean(date) && Array.isArray(rows) && rows.some((row) => row.date > date);
+}
+
+function rowsHaveEntryDate(rows, date, entryMode) {
+  if (!date || !Array.isArray(rows)) return false;
+  if (entryMode === "nextOpen") return rowsHavePostDate(rows, date);
+  return rows.some((row) => row.date === date || row.date > date);
+}
+
+async function loadKlineForPosition(stock, date, entryMode) {
+  const normalizedDate = normalizeDate(date);
+  let rows = await loadKline(stock);
+  if (!normalizedDate) return rows;
+
+  const hasEntryDate = rowsHaveEntryDate(rows, normalizedDate, entryMode);
+  const hasPostDate = rowsHavePostDate(rows, normalizedDate);
+  if (hasEntryDate && hasPostDate) return rows;
+
+  try {
+    const freshRows = await fetchKlineWithRetry(stock);
+    if (Array.isArray(freshRows) && freshRows.length) return freshRows;
+  } catch {
+    const fallbackRows = await fetchIfindKlineRange(stock, normalizedDate, dateFromYmd(chinaDateYmd())).catch(() => []);
+    if (fallbackRows.length) return mergeKlineRows(rows, fallbackRows);
+  }
+  return rows;
+}
+
 async function loadBoardKlineForDate(boardCode, date) {
   const board = boardKlineStock(boardCode);
   if (!board) return [];
@@ -3657,7 +3816,7 @@ async function loadMarketIndexKline(index = MARKET_INDEX) {
 async function loadKlineFromDb(stock) {
   const { rows } = await getDbPool().query(
     `
-      select trade_date, open, close, high, low, volume, amount, amplitude, pct, change, turnover
+      select trade_date::text as trade_date, open, close, high, low, volume, amount, amplitude, pct, change, turnover
       from stock_daily_bars
       where code = $1
       order by trade_date asc
@@ -3681,13 +3840,14 @@ async function loadKlineFromDb(stock) {
     .filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close));
 }
 
-async function saveKlineToDb(stock, rows) {
+async function saveKlineToDb(stock, rows, source = "eastmoney") {
   const cleanRows = rows
     .filter((row) => row.date >= KLINE_DB_START_DATE && Number.isFinite(row.open) && Number.isFinite(row.close))
     .map((row) => ({
       code: stock.code,
       trade_date: row.date,
       market: stock.market,
+      source,
       open: row.open,
       close: row.close,
       high: row.high,
@@ -3717,6 +3877,7 @@ async function saveKlineToDb(stock, rows) {
             code text,
             trade_date date,
             market text,
+            source text,
             open numeric,
             close numeric,
             high numeric,
@@ -3735,7 +3896,7 @@ async function saveKlineToDb(stock, rows) {
         )
         select
           code, trade_date, market, open, close, high, low, volume, amount,
-          amplitude, pct, change, turnover, 'eastmoney', now()
+          amplitude, pct, change, turnover, coalesce(source, 'eastmoney'), now()
         from input
         on conflict (code, trade_date) do update set
           market = excluded.market,
@@ -5379,18 +5540,20 @@ function attachBenchmarkToPositionHorizons(horizons, benchmarkRows, entryDate, e
 async function positionPayload(query) {
   const stock = normalizeStock(query.code);
   if (!query.date) throw new Error("请输入买入日期");
+  const requestedDate = normalizeDate(query.date);
+  if (!requestedDate) throw new Error("买入日期格式不正确");
   const entryMode = query.entry || "nextOpen";
-  const rows = await loadKline(stock);
+  const rows = await loadKlineForPosition(stock, requestedDate, entryMode);
   const benchmarkRows = await loadMarketIndexKline().catch(() => []);
   const names = readStockNames();
   const storedMeta = readStockMeta().get(stock.code);
   const displayName = await resolveStockDisplayName(stock.code, storedMeta?.name || names.get(stock.code));
   const useNextTradingDay = entryMode === "nextOpen";
-  const entryIndex = findTradingIndex(rows, query.date, useNextTradingDay);
-  if (entryIndex < 0 || entryIndex >= rows.length) throw new Error(`找不到 ${query.date} 之后的交易日`);
+  const entryIndex = findTradingIndex(rows, requestedDate, useNextTradingDay);
+  if (entryIndex < 0 || entryIndex >= rows.length) throw new Error(`找不到 ${requestedDate} 之后的交易日`);
   const entryRow = rows[entryIndex];
   const entryPrice = entryMode === "close" ? entryRow.close : entryRow.open;
-  const meta = enrichStockMeta(stock.code, displayName || stock.code, query.date);
+  const meta = enrichStockMeta(stock.code, displayName || stock.code, requestedDate);
   const horizonDefs = [
     { days: 1, label: "1天" },
     { days: 2, label: "2天" },
@@ -5411,7 +5574,7 @@ async function positionPayload(query) {
     em: stock.em,
     name: meta.name || displayName || stock.code,
     meta,
-    requestedDate: query.date,
+    requestedDate,
     entryMode,
     entryModeLabel: entryMode === "close" ? "当日收盘" : entryMode === "open" ? "当日开盘" : "信号次日开盘",
     entryDate: entryRow.date,
