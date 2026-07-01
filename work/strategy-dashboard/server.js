@@ -3,7 +3,9 @@
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
-const { Pool } = require("pg");
+const { Pool, types } = require("pg");
+
+types.setTypeParser(1082, (value) => value);
 
 const ROOT = path.resolve(__dirname, "../..");
 loadEnvFile(path.join(ROOT, ".env"));
@@ -2591,7 +2593,7 @@ async function marketDailyStatsFromDb(dates) {
         where b.entry_open is not null
       )
       select
-        signal_date,
+        signal_date::text as signal_date,
         count(ret5)::int as ret5_count,
         avg(ret5) as ret5_avg,
         percentile_cont(0.5) within group (order by ret5) filter (where ret5 is not null) as ret5_median,
@@ -3500,6 +3502,23 @@ function mergeKlineRows(baseRows, freshRows) {
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
+async function fetchKlineWithIfindFallback(stock, fromDate, toDate = dateFromYmd(chinaDateYmd())) {
+  const normalizedFromDate = normalizeDate(fromDate) || toDate;
+  const normalizedToDate = normalizeDate(toDate) || normalizedFromDate;
+  try {
+    const primaryRows = await fetchKlineWithRetry(stock);
+    const latestDate = latestKlineDate(primaryRows);
+    const needsSupplement = normalizedFromDate && normalizedToDate && (!rowsContainDate(primaryRows, normalizedFromDate) || (latestDate && latestDate < normalizedToDate));
+    if (!needsSupplement) return primaryRows;
+    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch(() => []);
+    return fallbackRows.length ? mergeKlineRows(primaryRows, fallbackRows) : primaryRows;
+  } catch (error) {
+    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch(() => []);
+    if (fallbackRows.length) return fallbackRows;
+    throw error;
+  }
+}
+
 function emSecurityCode(code) {
   const clean = String(code || "").match(/\d{6}/)?.[0] || "";
   if (!clean) return "";
@@ -3707,24 +3726,33 @@ function rowsContainDate(rows, date) {
 }
 
 async function loadKlineForDate(stock, date) {
+  let localRows = [];
   if (shouldUseDatabase("em")) {
     const rows = await loadKlineFromDb(stock);
+    if (rows.length) localRows = rows;
     if (rows.length && rowsContainDate(rows, date)) return rows;
   }
 
   if (fs.existsSync(stock.cacheFile)) {
     try {
       const rows = JSON.parse(fs.readFileSync(stock.cacheFile, "utf8"));
+      if (Array.isArray(rows) && rows.length) localRows = mergeKlineRows(localRows, rows);
       if (Array.isArray(rows) && rows.length && rowsContainDate(rows, date)) {
         if (shouldUseDatabase("em")) await saveKlineToDb(stock, rows);
-        return rows;
+        return mergeKlineRows(localRows, rows);
       }
     } catch {
       // Ignore a broken cache and fetch a fresh copy.
     }
   }
 
-  return fetchKlineWithRetry(stock);
+  try {
+    const freshRows = await fetchKlineWithIfindFallback(stock, date);
+    return mergeKlineRows(localRows, freshRows);
+  } catch (error) {
+    if (localRows.length) return localRows;
+    throw error;
+  }
 }
 
 function rowsHavePostDate(rows, date) {
@@ -3737,21 +3765,29 @@ function rowsHaveEntryDate(rows, date, entryMode) {
   return rows.some((row) => row.date === date || row.date > date);
 }
 
+function latestKlineDate(rows) {
+  return (rows || []).map((row) => row.date).filter(Boolean).sort().at(-1) || null;
+}
+
+function positionRowsNeedRefresh(rows, date, entryMode) {
+  if (!rowsHaveEntryDate(rows, date, entryMode)) return true;
+  const today = dateFromYmd(chinaDateYmd());
+  const latestDate = latestKlineDate(rows);
+  return Boolean(today && latestDate && date < today && latestDate < today);
+}
+
 async function loadKlineForPosition(stock, date, entryMode) {
   const normalizedDate = normalizeDate(date);
   let rows = await loadKline(stock);
   if (!normalizedDate) return rows;
 
-  const hasEntryDate = rowsHaveEntryDate(rows, normalizedDate, entryMode);
-  const hasPostDate = rowsHavePostDate(rows, normalizedDate);
-  if (hasEntryDate && hasPostDate) return rows;
+  if (!positionRowsNeedRefresh(rows, normalizedDate, entryMode)) return rows;
 
   try {
-    const freshRows = await fetchKlineWithRetry(stock);
-    if (Array.isArray(freshRows) && freshRows.length) return freshRows;
+    const freshRows = await fetchKlineWithIfindFallback(stock, normalizedDate);
+    if (Array.isArray(freshRows) && freshRows.length) return mergeKlineRows(rows, freshRows);
   } catch {
-    const fallbackRows = await fetchIfindKlineRange(stock, normalizedDate, dateFromYmd(chinaDateYmd())).catch(() => []);
-    if (fallbackRows.length) return mergeKlineRows(rows, fallbackRows);
+    // Keep the best local data we have. The caller will mark missing horizons as not matured.
   }
   return rows;
 }
@@ -3802,15 +3838,24 @@ async function fetchMarketIndexKline(index = MARKET_INDEX) {
 
 async function loadMarketIndexKline(index = MARKET_INDEX) {
   const file = marketIndexCacheFile(index);
+  let cachedRows = [];
   if (fs.existsSync(file)) {
     try {
       const rows = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (Array.isArray(rows) && rows.length) return rows.filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close));
+      cachedRows = Array.isArray(rows) ? rows.filter((row) => row.date && Number.isFinite(row.open) && Number.isFinite(row.close)) : [];
+      const latestDate = latestKlineDate(cachedRows);
+      const today = dateFromYmd(chinaDateYmd());
+      if (cachedRows.length && latestDate && today && latestDate >= today) return cachedRows;
     } catch {
       // Ignore a broken local cache and fetch a fresh copy.
     }
   }
-  return fetchMarketIndexKline(index);
+  try {
+    return await fetchMarketIndexKline(index);
+  } catch (error) {
+    if (cachedRows.length) return cachedRows;
+    throw error;
+  }
 }
 
 async function loadKlineFromDb(stock) {
@@ -4031,7 +4076,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
         select
           s.code,
           max(s.name) as name,
-          max(s.signal_date) as latest_signal_date,
+          max(s.signal_date)::text as latest_signal_date,
           count(*)::int as signal_count
         from strategy_signals s
         cross join bounds b
@@ -4043,7 +4088,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
       latest_bars as (
         select
           code,
-          max(trade_date) as latest_bar_date,
+          max(trade_date)::text as latest_bar_date,
           max(updated_at) as latest_bar_updated_at
         from stock_daily_bars
         group by code
@@ -4542,6 +4587,7 @@ async function runDailyKlineSync(options = {}) {
 
     for (const candidate of candidates) {
       const stock = normalizeStock(candidate.code);
+      const fallbackFromDate = candidate.latestBarDate || candidate.latestSignalDate || KLINE_DB_START_DATE;
       const item = {
         code: candidate.code,
         name: candidate.name,
@@ -4550,9 +4596,9 @@ async function runDailyKlineSync(options = {}) {
         status: "pending",
       };
       try {
-        const rows = await fetchKline(stock);
+        const rows = await fetchKlineWithIfindFallback(stock, fallbackFromDate);
         const latestRow = rows[rows.length - 1] || null;
-        item.status = "synced";
+        item.status = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS ? "synced_fallback" : "synced";
         item.rowCount = rows.length;
         item.latestBarDate = latestRow?.date || null;
         successCount += 1;
@@ -4722,7 +4768,7 @@ async function selectThsAttentionWatchlist(maxStocks, lookbackDays) {
         select coalesce(max(signal_date), current_date) as max_signal_date
         from strategy_signals
       )
-      select s.code, max(s.signal_date) as latest_signal_date
+      select s.code, max(s.signal_date)::text as latest_signal_date
       from strategy_signals s
       cross join bounds b
       where s.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
