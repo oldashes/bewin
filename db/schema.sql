@@ -193,9 +193,7 @@ create index if not exists idx_strategy_feature_events_code_date on strategy_fea
 create index if not exists idx_strategy_configs_source_updated on strategy_configs(source, updated_at desc);
 create index if not exists idx_stocks_name on stocks(name);
 create index if not exists idx_stock_daily_bars_date on stock_daily_bars(trade_date desc);
-create index if not exists idx_stock_daily_bars_updated on stock_daily_bars(updated_at);
 create index if not exists idx_market_daily_baselines_date on market_daily_baselines(source, universe, trade_date desc);
 create index if not exists idx_popularity_snapshots_source_date on popularity_snapshots(source, category, metric, snapshot_date desc);
 create index if not exists idx_popularity_snapshots_code_date on popularity_snapshots(source, code, snapshot_date desc);
-create index if not exists idx_popularity_snapshots_time on popularity_snapshots(snapshot_time desc);
 create index if not exists idx_sync_runs_job_started on sync_runs(job_name, started_at desc);

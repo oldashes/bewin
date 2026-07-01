@@ -8,6 +8,7 @@ runDailySignalGeneration({
   maxUniverse: process.env.SIGNAL_MAX_UNIVERSE,
   rankMax: process.env.SIGNAL_RANK_MAX,
   concurrency: process.env.SIGNAL_CONCURRENCY,
+  boardMode: process.env.SIGNAL_BOARD_MODE,
   force: process.env.SIGNAL_FORCE,
 })
   .then((summary) => {

@@ -20,7 +20,7 @@ const STOCK_META_FILE = path.join(ROOT, "work/cache/strategy-dashboard/stock-met
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
-const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2024-01-01";
+const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2025-08-01";
 const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
 const DEFAULT_SYNC_MAX_STOCKS = 20;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
@@ -75,6 +75,7 @@ let cachedDbData = new Map();
 let cachedNames;
 let cachedStockMeta;
 let cachedBoardCodeByName;
+let cachedBoardMembersByCode = new Map();
 let cachedTradingCalendar;
 let dbPool;
 
@@ -323,6 +324,34 @@ function readStockNames() {
   }
   cachedNames = names;
   return names;
+}
+
+function readBoardMembers(boardCode) {
+  const code = String(boardCode || "").trim().toUpperCase();
+  if (!/^BK\d{4}$/.test(code)) return [];
+  if (cachedBoardMembersByCode.has(code)) return cachedBoardMembersByCode.get(code);
+
+  const file = path.join(BOARD_MEMBER_DIR, `${code}.json`);
+  let members = [];
+  if (fs.existsSync(file)) {
+    try {
+      const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+      members = Array.isArray(rows)
+        ? rows
+            .map((row) => {
+              const memberCode = String(row.code || row.stockCode || row.SECURITY_CODE || "").match(/\d{6}/)?.[0] || "";
+              return memberCode;
+            })
+            .filter(Boolean)
+        : [];
+    } catch {
+      members = [];
+    }
+  }
+
+  const uniqueMembers = [...new Set(members)];
+  cachedBoardMembersByCode.set(code, uniqueMembers);
+  return uniqueMembers;
 }
 
 function readBoardCodeByName() {
@@ -4399,9 +4428,10 @@ async function runDailySignalGeneration(options = {}) {
     1,
     16,
   );
+  const boardMode = String(options.boardMode || process.env.SIGNAL_BOARD_MODE || "fetch").toLowerCase();
   const force = options.force === true || options.force === "1" || options.force === "true";
   const startedAt = new Date().toISOString();
-  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, force };
+  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, boardMode, force };
   const run = await createSyncRun(DAILY_SIGNAL_JOB, { params, startedAt });
 
   const results = [];
@@ -4437,7 +4467,8 @@ async function runDailySignalGeneration(options = {}) {
       return potentialHotConfirm || potentialEarlyDiscovery;
     });
 
-    const boardMetricCache = new Map();
+    const boardRowsByCode = new Map();
+    const boardMetricsByKey = new Map();
     const featureEntries = await mapLimit(rankedCandidates, Math.min(concurrency, 6), async (entry) => {
       const item = entry.item;
       const result = entry.result;
@@ -4456,15 +4487,13 @@ async function runDailySignalGeneration(options = {}) {
 
         let boardMetrics = null;
         if (item.bestBoardCode && /^BK\d{4}$/i.test(item.bestBoardCode)) {
-          if (!boardMetricCache.has(item.bestBoardCode)) {
-            try {
-              const boardRows = await loadBoardKlineForDate(item.bestBoardCode, targetDate);
-              boardMetricCache.set(item.bestBoardCode, stockPreSignalMetricsFromRows(boardRows, targetDate));
-            } catch (error) {
-              boardMetricCache.set(item.bestBoardCode, null);
-            }
-          }
-          boardMetrics = boardMetricCache.get(item.bestBoardCode);
+          boardMetrics = await loadBoardMetricsForFeature(
+            item.bestBoardCode,
+            targetDate,
+            boardMode,
+            boardRowsByCode,
+            boardMetricsByKey,
+          );
         }
 
         const feature = featureRecordFromDailyContext({
@@ -4544,6 +4573,7 @@ async function dailySignalPayload(query = {}, headers = {}) {
     maxUniverse: query.maxUniverse,
     rankMax: query.rankMax,
     concurrency: query.concurrency,
+    boardMode: query.boardMode,
     force: query.force,
   });
 }
@@ -4855,6 +4885,7 @@ async function upsertPopularitySnapshots(records) {
     });
   }
   await bulkUpsertStocksForSnapshots([...stockRecords.values()]);
+  await deleteSupersededPopularitySnapshots(cleanRecords);
   return cleanRecords.length;
 }
 
@@ -4864,6 +4895,49 @@ async function upsertPopularitySnapshotsInChunks(records, chunkSize = 5000) {
     savedCount += await upsertPopularitySnapshots(records.slice(index, index + chunkSize));
   }
   return savedCount;
+}
+
+async function deleteSupersededPopularitySnapshots(records) {
+  const groups = new Map();
+  for (const record of records) {
+    const key = `${record.source}:${record.category}:${record.metric}:${record.snapshot_date}`;
+    const existing = groups.get(key);
+    if (!existing || String(record.snapshot_key) > String(existing.snapshot_key)) {
+      groups.set(key, {
+        source: record.source,
+        category: record.category,
+        metric: record.metric,
+        snapshot_date: record.snapshot_date,
+        snapshot_key: record.snapshot_key,
+      });
+    }
+  }
+  const cleanGroups = [...groups.values()].filter((group) => group.source === "ths");
+  if (!cleanGroups.length) return 0;
+
+  const { rowCount } = await getDbPool().query(
+    `
+      with groups as (
+        select *
+        from jsonb_to_recordset($1::jsonb) as x(
+          source text,
+          category text,
+          metric text,
+          snapshot_date date,
+          snapshot_key text
+        )
+      )
+      delete from popularity_snapshots p
+      using groups g
+      where p.source = g.source
+        and p.category = g.category
+        and p.metric = g.metric
+        and p.snapshot_date = g.snapshot_date
+        and p.snapshot_key <> g.snapshot_key
+    `,
+    [JSON.stringify(cleanGroups)],
+  );
+  return rowCount;
 }
 
 async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000) {
@@ -5085,7 +5159,11 @@ async function runThsPopularitySync(options = {}) {
 
     const uniqueRecords = new Map();
     for (const record of allRecords) {
-      uniqueRecords.set(`${record.source}:${record.category}:${record.metric}:${record.snapshot_key}:${record.code}`, record);
+      const key = `${record.source}:${record.category}:${record.metric}:${record.snapshot_date}:${record.code}`;
+      const existing = uniqueRecords.get(key);
+      if (!existing || String(record.snapshot_key) > String(existing.snapshot_key)) {
+        uniqueRecords.set(key, record);
+      }
     }
     const savedCount = await upsertPopularitySnapshots([...uniqueRecords.values()]);
     const failedCount = results.filter((item) => item.status === "failed").length;
@@ -5395,6 +5473,48 @@ function boardMetricsFromFeatureDonor(row) {
   return { prev5, prev10: n(row.best_board_ret_10), amountRatio };
 }
 
+async function loadBoardMemberAggregateMetrics(boardCode, date) {
+  const memberCodes = readBoardMembers(boardCode);
+  if (!memberCodes.length || !process.env.DATABASE_URL) return null;
+
+  const { rows } = await getDbPool().query(
+    `
+      select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
+      from stock_daily_bars
+      where code = any($1)
+        and trade_date between ($2::date - interval '140 days') and $2::date
+      order by code asc, trade_date asc
+    `,
+    [memberCodes, date],
+  );
+
+  const rowsByMember = new Map();
+  for (const row of rows) {
+    const code = String(row.code || "");
+    if (!rowsByMember.has(code)) rowsByMember.set(code, []);
+    rowsByMember.get(code).push(dbBarRowToKline(row));
+  }
+
+  const memberMetrics = [...rowsByMember.values()]
+    .map((memberRows) => stockPreSignalMetricsFromRows(memberRows, date))
+    .filter(
+      (metrics) =>
+        Number.isFinite(metrics.prev5) &&
+        Number.isFinite(metrics.amountRatio) &&
+        Number.isFinite(metrics.signalClose),
+    );
+
+  if (memberMetrics.length < 5) return null;
+
+  return {
+    prev5: median(memberMetrics.map((metrics) => metrics.prev5)),
+    prev10: median(memberMetrics.map((metrics) => metrics.prev10)),
+    amountRatio: median(memberMetrics.map((metrics) => metrics.amountRatio)),
+    memberSampleCount: memberMetrics.length,
+    source: "member-aggregate",
+  };
+}
+
 async function loadBoardMetricsForFeature(boardCode, date, boardMode, rowsByCode, metricsByKey) {
   const key = `${boardCode}:${date}`;
   if (metricsByKey.has(key)) return metricsByKey.get(key);
@@ -5418,7 +5538,10 @@ async function loadBoardMetricsForFeature(boardCode, date, boardMode, rowsByCode
     }
   }
   const metrics = stockPreSignalMetricsFromRows(rowsByCode.get(boardCode) || [], date);
-  const value = Number.isFinite(metrics.prev5) && Number.isFinite(metrics.amountRatio) ? metrics : null;
+  let value = Number.isFinite(metrics.prev5) && Number.isFinite(metrics.amountRatio) ? metrics : null;
+  if (!value && boardMode !== "none") {
+    value = await loadBoardMemberAggregateMetrics(boardCode, date);
+  }
   metricsByKey.set(key, value);
   return value;
 }
