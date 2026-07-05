@@ -3064,6 +3064,113 @@ function dateStatus(requestedDate, selectedDate, tradingDates, signalDates) {
   };
 }
 
+function isoTimestamp(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function maxIsoTimestamp(...values) {
+  const timestamps = values
+    .flat()
+    .map(isoTimestamp)
+    .filter(Boolean)
+    .map((value) => new Date(value).getTime())
+    .filter(Number.isFinite);
+  if (!timestamps.length) return null;
+  return new Date(Math.max(...timestamps)).toISOString();
+}
+
+async function dailyFreshness({ sourceKey, selectedDate }) {
+  if (!process.env.DATABASE_URL || !selectedDate) return null;
+  const jobs = sourceKey === "ths" ? [THS_SYNC_JOB, THS_FEATURE_JOB, DAILY_SYNC_JOB] : [DAILY_SIGNAL_JOB, DAILY_SYNC_JOB];
+  try {
+    const [features, snapshots, klines, syncRuns] = await Promise.all([
+      getDbPool().query(
+        `
+          select count(*)::int as count, max(updated_at) as updated_at
+          from strategy_feature_events
+          where source = $1
+            and feature_set = $2
+            and signal_date = $3::date
+        `,
+        [sourceKey, FEATURE_SET, selectedDate],
+      ),
+      getDbPool().query(
+        `
+          select count(*)::int as count, max(updated_at) as updated_at, max(snapshot_time) as snapshot_time
+          from popularity_snapshots
+          where source = $1
+            and snapshot_date = $2::date
+        `,
+        [sourceKey, selectedDate],
+      ),
+      getDbPool().query(
+        `
+          select count(*)::int as count, max(updated_at) as updated_at
+          from stock_daily_bars
+          where trade_date = $1::date
+        `,
+        [selectedDate],
+      ),
+      getDbPool().query(
+        `
+          select job_name, status, started_at, finished_at, selected_count, success_count, failed_count, error
+          from sync_runs
+          where job_name = any($1)
+          order by started_at desc
+          limit 6
+        `,
+        [jobs],
+      ),
+    ]);
+    const featureRow = features.rows[0] || {};
+    const snapshotRow = snapshots.rows[0] || {};
+    const klineRow = klines.rows[0] || {};
+    const lastSynces = syncRuns.rows.map((row) => ({
+      jobName: row.job_name,
+      status: row.status,
+      startedAt: isoTimestamp(row.started_at),
+      finishedAt: isoTimestamp(row.finished_at),
+      selectedCount: Number(row.selected_count) || 0,
+      successCount: Number(row.success_count) || 0,
+      failedCount: Number(row.failed_count) || 0,
+      error: row.error || null,
+    }));
+    const featureUpdatedAt = isoTimestamp(featureRow.updated_at);
+    const snapshotUpdatedAt = isoTimestamp(snapshotRow.updated_at);
+    const snapshotTime = isoTimestamp(snapshotRow.snapshot_time);
+    const klineUpdatedAt = isoTimestamp(klineRow.updated_at);
+    const latestSyncFinishedAt = maxIsoTimestamp(lastSynces.map((row) => row.finishedAt || row.startedAt));
+    const featureCount = Number(featureRow.count) || 0;
+    const snapshotCount = Number(snapshotRow.count) || 0;
+    const klineCount = Number(klineRow.count) || 0;
+    return {
+      sourceKey,
+      selectedDate,
+      computed: featureCount > 0 || snapshotCount > 0,
+      updatedAt: maxIsoTimestamp(featureUpdatedAt, snapshotUpdatedAt, snapshotTime, klineUpdatedAt),
+      featureUpdatedAt,
+      featureCount,
+      snapshotUpdatedAt,
+      snapshotTime,
+      snapshotCount,
+      klineUpdatedAt,
+      klineCount,
+      latestSyncFinishedAt,
+      lastSynces,
+    };
+  } catch (error) {
+    return {
+      sourceKey,
+      selectedDate,
+      computed: false,
+      updatedAt: null,
+      error: error.message,
+    };
+  }
+}
+
 async function dualSourceCodesForDate({ events, selectedDate, sourceKey, strategyKey, strict, temporaryStrategy }) {
   if (!events.length || !selectedDate || !["em", "ths"].includes(sourceKey)) return new Set();
   const otherSource = sourceKey === "em" ? "ths" : "em";
@@ -3111,6 +3218,7 @@ async function dailyPayload(query) {
       { daySignalCount: events.length },
     ),
   );
+  const freshness = await dailyFreshness({ sourceKey: data.sourceKey, selectedDate });
   return {
     selectedDate,
     requestedDate: normalizedRequestedDate,
@@ -3125,6 +3233,7 @@ async function dailyPayload(query) {
     dataSource: data.dataSource,
     dataStrategy: data.dataSource.strategy,
     rule: data.dataSource.strategy?.rule || STRATEGIES.early.rule,
+    freshness,
     stats: summarize(displayEvents),
     signalStats: summarizeSignals(displayEvents),
     boards: aggregateBoards(displayEvents),

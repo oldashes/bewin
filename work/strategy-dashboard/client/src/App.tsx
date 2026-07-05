@@ -260,6 +260,21 @@ function price(value: unknown) {
   return num.toFixed(2);
 }
 
+function formatDateTime(value: unknown, withSeconds = false) {
+  if (!value) return "-";
+  const date = new Date(String(value));
+  if (!Number.isFinite(date.getTime())) return "-";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: withSeconds ? "2-digit" : undefined,
+    hour12: false,
+  }).format(date);
+}
+
 function valueTone(value: unknown) {
   const number = toFiniteNumber(value);
   if (number === null) return "muted";
@@ -342,6 +357,52 @@ function Chips({ items, limit = 4 }: { items?: string[]; limit?: number }) {
   );
 }
 
+function syncJobLabel(jobName: string) {
+  if (jobName === "daily-signal-generate") return "东财特征";
+  if (jobName === "daily-kline-refresh") return "K线";
+  if (jobName === "ths-popularity-refresh") return "同花顺人气";
+  if (jobName === "ths-feature-generate") return "同花顺特征";
+  return jobName || "同步任务";
+}
+
+function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
+  const freshness = daily?.freshness || {};
+  const hitCount = daily?.stats?.count ?? 0;
+  const computed = Boolean(freshness.computed);
+  const computedLabel = daily?.selectedDate ? `${computed ? "已计算" : "未计算"} · ${hitCount} 命中` : "等待日期";
+  const updatedLabel = freshness.updatedAt ? `更新时间 ${formatDateTime(freshness.updatedAt)}` : "更新时间 -";
+  const tooltip = (
+    <Stack gap={4}>
+      <Text size="xs" fw={800}>当前信号日：{daily?.selectedDate || "-"}</Text>
+      <Text size="xs">策略命中：{hitCount} 只；{computed ? "数据已计算" : "未发现对应特征或快照"}</Text>
+      <Text size="xs">特征记录：{freshness.featureCount ?? 0} 条 · {formatDateTime(freshness.featureUpdatedAt, true)}</Text>
+      <Text size="xs">榜单快照：{freshness.snapshotCount ?? 0} 条 · {formatDateTime(freshness.snapshotUpdatedAt || freshness.snapshotTime, true)}</Text>
+      <Text size="xs">K线记录：{freshness.klineCount ?? 0} 条 · {formatDateTime(freshness.klineUpdatedAt, true)}</Text>
+      {(freshness.lastSynces || []).slice(0, 3).map((item: AnyRecord) => (
+        <Text key={`${item.jobName}-${item.startedAt}`} size="xs">
+          {syncJobLabel(item.jobName)}：{item.status} · {formatDateTime(item.finishedAt || item.startedAt, true)}
+        </Text>
+      ))}
+      {freshness.error ? <Text size="xs" c="red">更新时间读取失败：{freshness.error}</Text> : null}
+    </Stack>
+  );
+
+  return (
+    <>
+      <Tooltip label={tooltip} multiline maw={360} withArrow>
+        <Badge size="lg" variant="light" color={computed ? "green" : "yellow"}>
+          {computedLabel}
+        </Badge>
+      </Tooltip>
+      <Tooltip label={tooltip} multiline maw={360} withArrow>
+        <Badge size="lg" variant="default">
+          {updatedLabel}
+        </Badge>
+      </Tooltip>
+    </>
+  );
+}
+
 function AppShellHeader({
   date,
   setDate,
@@ -417,6 +478,7 @@ function AppShellHeader({
         <Badge size="lg" variant="light" color="blue">
           {overview?.dataSource?.shortLabel || "数据源"} · {overview?.dataStrategy?.shortLabel || "策略"} · {overview?.strictCount ?? "-"} 条样本
         </Badge>
+        <FreshnessBadges daily={daily} />
         <Badge size="lg" variant="default">
           {overview?.minDate && overview?.maxDate ? `${overview.minDate} 至 ${overview.maxDate}` : "待积累"}
         </Badge>
