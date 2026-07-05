@@ -25,13 +25,15 @@ const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
 const DEFAULT_SYNC_MAX_STOCKS = 20;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
+const THS_FEATURE_JOB = "ths-feature-generate";
 const DAILY_SIGNAL_JOB = "daily-signal-generate";
 const DEFAULT_THS_WATCHLIST_MAX = 20;
 const DEFAULT_SIGNAL_MAX_UNIVERSE = 180;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 8;
-const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 20;
+const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 0;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
+const DEFAULT_CRON_TIME_BUDGET_MS = 52000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
 const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
 const MARKET_INDEX = {
@@ -4604,9 +4606,16 @@ async function runDailyKlineSync(options = {}) {
     1,
     200,
   );
+  const timeBudgetMs = boundedInteger(
+    options.timeBudgetMs ?? process.env.DAILY_KLINE_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
+    DEFAULT_CRON_TIME_BUDGET_MS,
+    5000,
+    300000,
+  );
   const force = options.force === true || options.force === "1" || options.force === "true";
-  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force };
+  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force, timeBudgetMs };
   const startedAt = new Date().toISOString();
+  const startedAtMs = Date.now();
   const run = await createSyncRun(DAILY_SYNC_JOB, { params, startedAt });
   const results = [];
 
@@ -4614,8 +4623,13 @@ async function runDailyKlineSync(options = {}) {
     const candidates = await selectDailySyncStocks(params);
     let successCount = 0;
     let failedCount = 0;
+    let stoppedByTimeBudget = false;
 
     for (const candidate of candidates) {
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
       const stock = normalizeStock(candidate.code);
       const fallbackFromDate = candidate.latestBarDate || candidate.latestSignalDate || KLINE_DB_START_DATE;
       const item = {
@@ -4650,9 +4664,16 @@ async function runDailyKlineSync(options = {}) {
       successCount,
       failedCount,
       results,
+      stoppedByTimeBudget,
+      remainingCount: Math.max(0, candidates.length - results.length),
     };
-    const status = failedCount ? (successCount ? "partial" : "failed") : "success";
-    await finishSyncRun(run.id, status, summary, failedCount && !successCount ? "all selected stocks failed" : null);
+    const status = stoppedByTimeBudget || failedCount ? (successCount ? "partial" : "failed") : "success";
+    const errorMessage = stoppedByTimeBudget
+      ? "time budget reached before all selected stocks were synced"
+      : failedCount && !successCount
+        ? "all selected stocks failed"
+        : null;
+    await finishSyncRun(run.id, status, summary, errorMessage);
     cachedDbData.clear();
     return { ...summary, status };
   } catch (error) {
@@ -4679,6 +4700,7 @@ async function dailySyncPayload(query = {}, headers = {}) {
     strategy: query.strategy,
     lookbackDays: query.lookbackDays,
     maxStocks: query.maxStocks,
+    timeBudgetMs: query.timeBudgetMs,
     force: query.force,
   });
 }
@@ -5224,8 +5246,37 @@ async function runThsFeatureGeneration(options = {}) {
     : 35) / 100;
   const boardMode = String(options.boardMode || process.env.IFIND_FEATURE_BOARD_MODE || "cached").toLowerCase();
   const metric = String(options.metric || process.env.IFIND_FEATURE_METRIC || "attention").toLowerCase();
+  const timeBudgetMs = boundedInteger(
+    options.timeBudgetMs ?? process.env.THS_FEATURE_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
+    DEFAULT_CRON_TIME_BUDGET_MS,
+    5000,
+    300000,
+  );
+  const fetchMissingKlineMax = boundedInteger(
+    options.fetchMissingKlineMax ?? process.env.IFIND_FEATURE_FETCH_MISSING_KLINE_MAX,
+    DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
+    0,
+    200,
+  );
   const startedAt = new Date().toISOString();
+  const startedAtMs = Date.now();
+  const params = {
+    requestedYmd,
+    targetDate,
+    rankMax,
+    minRankDelta20,
+    amountRatioMin,
+    amountRatioMax,
+    prev5Min,
+    prev5Max,
+    boardMode,
+    metric,
+    timeBudgetMs,
+    fetchMissingKlineMax,
+  };
+  const run = await createSyncRun(THS_FEATURE_JOB, { params, startedAt });
 
+  try {
   const { rows: todaySnapshotRows } = await getDbPool().query(
     `
       select
@@ -5283,7 +5334,7 @@ async function runThsFeatureGeneration(options = {}) {
       )
     : { rows: [] };
   const [klineByCode, donorByKey] = await Promise.all([
-    loadStockDailyBarsForFeatures(codes, targetDate),
+    loadStockDailyBarsForFeatures(codes, targetDate, { fetchMissingMax: fetchMissingKlineMax }),
     loadEmBoardDonorsForFeatures(codes, targetDate),
   ]);
   const historyByCode = new Map();
@@ -5317,10 +5368,15 @@ async function runThsFeatureGeneration(options = {}) {
     boardDonorCount: 0,
     boardComputedCount: 0,
     boardMissingCount: 0,
+    stoppedByTimeBudget: false,
     startedAt,
   };
 
   for (const row of todayRows) {
+    if (Date.now() - startedAtMs > timeBudgetMs) {
+      stats.stoppedByTimeBudget = true;
+      break;
+    }
     const history = historyByCode.get(row.code) || [];
     const rank20 = rankAtOffset(history, targetDate, 20);
     if (!Number.isFinite(rank20)) {
@@ -5400,16 +5456,46 @@ async function runThsFeatureGeneration(options = {}) {
   const savedCount = await bulkUpsertStrategyFeatureEvents(featureRecords);
   cachedDbData.clear();
   cachedThsData.clear();
-  return {
+  const resultStatus = stats.stoppedByTimeBudget ? (savedCount ? "partial" : "timeout") : savedCount ? "success" : "empty";
+  const summary = {
+    jobName: THS_FEATURE_JOB,
+    runId: run.id,
+    params,
     ...stats,
     generatedCount: featureRecords.length,
     savedCount,
     finishedAt: new Date().toISOString(),
-    status: savedCount ? "success" : "empty",
+    status: resultStatus,
   };
+  await finishSyncRun(
+    run.id,
+    resultStatus === "timeout" ? "failed" : resultStatus === "partial" ? "partial" : "success",
+    {
+      ...summary,
+      selectedCount: todayRows.length,
+      successCount: savedCount,
+      failedCount: 0,
+    },
+    stats.stoppedByTimeBudget ? "time budget reached before all ths features were generated" : null,
+  );
+  return summary;
+  } catch (error) {
+    const summary = {
+      jobName: THS_FEATURE_JOB,
+      runId: run.id,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      params,
+      selectedCount: 0,
+      successCount: 0,
+      failedCount: 1,
+    };
+    await finishSyncRun(run.id, "failed", summary, error.message);
+    throw error;
+  }
 }
 
-async function loadStockDailyBarsForFeatures(codes, targetDate) {
+async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   if (!codes.length) return new Map();
   const { rows } = await getDbPool().query(
     `
@@ -5428,12 +5514,7 @@ async function loadStockDailyBarsForFeatures(codes, targetDate) {
     byCode.get(code).push(dbBarRowToKline(row));
   }
 
-  const fetchMissingMax = boundedInteger(
-    process.env.IFIND_FEATURE_FETCH_MISSING_KLINE_MAX,
-    DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
-    0,
-    200,
-  );
+  const fetchMissingMax = boundedInteger(options.fetchMissingMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX, 0, 200);
   const missingCodes = codes
     .filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate))
     .slice(0, fetchMissingMax);
@@ -5577,6 +5658,8 @@ async function thsFeaturePayload(query = {}, headers = {}) {
     prev5MaxPct: query.prev5MaxPct,
     metric: query.metric,
     boardMode: query.boardMode,
+    timeBudgetMs: query.timeBudgetMs,
+    fetchMissingKlineMax: query.fetchMissingKlineMax,
   });
 }
 
