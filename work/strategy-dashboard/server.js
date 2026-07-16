@@ -1399,7 +1399,7 @@ function customStrategyDescriptor(config) {
     note:
       config.description ||
       (temporary
-        ? "临时策略只在当前页面生效，不写入数据库；确认有效后再保存为永久策略。"
+        ? "本地临时策略只在当前浏览器生效，不写入数据库。"
         : "自定义策略基于特征池重新筛选候选；保存后会按参数重新计算候选池和测评结果。"),
     custom: !temporary,
     temporary,
@@ -1450,8 +1450,8 @@ async function listStrategyConfigs(sourceKey = "em") {
               id desc
           ) as rn
         from strategy_configs
-        where source = $1
-          or ($1 <> 'em' and source = 'em')
+        where (source = $1 or ($1 <> 'em' and source = 'em'))
+          and name not like '%调整版%'
       ) ranked
       where rn = 1
       order by case when source = $1 then 0 when source = 'em' then 1 else 2 end,
@@ -1469,6 +1469,7 @@ async function getStrategyConfig(id, sourceKey = "em") {
       select id, source, name, description, params, created_at, updated_at
       from strategy_configs
       where id = $1
+        and name not like '%调整版%'
         and (
           source = $2
           or $2 <> 'em'
@@ -1484,45 +1485,9 @@ async function getStrategyConfig(id, sourceKey = "em") {
 }
 
 async function saveStrategyConfigPayload(body = {}) {
-  requireDatabase();
-  const sourceKey = normalizeSourceKey(body.source || "em");
-  const id = String(body.id || "").match(/^[a-zA-Z0-9:_-]{3,80}$/) ? String(body.id) : createCustomStrategyId();
-  const name = String(body.name || "").trim().slice(0, 80) || "我的策略";
-  const description = String(body.description || "").trim().slice(0, 500);
-  const params = normalizeStrategyParams(body.params || {}, body.baseStrategy || "early");
-  const duplicate = await getDbPool().query(
-    `
-      select id
-      from strategy_configs
-      where source = $1
-        and lower(trim(name)) = lower(trim($2))
-        and id <> $3
-      limit 1
-    `,
-    [sourceKey, name, id],
-  );
-  if (duplicate.rows.length) {
-    const error = new Error("策略名称已存在，请换一个名称，或选择已有永久策略后直接修改。");
-    error.statusCode = 409;
-    throw error;
-  }
-  const { rows } = await getDbPool().query(
-    `
-      insert into strategy_configs (id, source, name, description, params, updated_at)
-      values ($1, $2, $3, $4, $5::jsonb, now())
-      on conflict (id) do update set
-        source = excluded.source,
-        name = excluded.name,
-        description = excluded.description,
-        params = excluded.params,
-        updated_at = now()
-      returning id, source, name, description, params, created_at, updated_at
-    `,
-    [id, sourceKey, name, description, JSON.stringify(params)],
-  );
-  cachedDbData.clear();
-  const config = strategyConfigRowToObject(rows[0]);
-  return { config, strategy: customStrategyDescriptor(config) };
+  const error = new Error("策略微调已改为本地临时策略，不再写入数据库。");
+  error.statusCode = 410;
+  throw error;
 }
 
 async function loadThsData(strategyKey = "early") {

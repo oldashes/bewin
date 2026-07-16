@@ -47,6 +47,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 type AnyRecord = Record<string, any>;
 const TEMPORARY_STRATEGY_KEY = "temporary";
+const LOCAL_TEMPORARY_STRATEGY_KEY = "bewin:temporaryStrategy";
 
 const STRATEGY_PRESETS = [
   {
@@ -189,13 +190,42 @@ const STRATEGY_PRESETS = [
   },
 ];
 
+function normalizeLocalTemporaryStrategy(value: AnyRecord | null) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    name: String(value.name || "本地临时策略").slice(0, 80),
+    description: String(value.description || "本地浏览器临时调整").slice(0, 500),
+    baseStrategy: String(value.baseStrategy || "early"),
+    params: value.params && typeof value.params === "object" ? value.params : {},
+  };
+}
+
+function readLocalTemporaryStrategy() {
+  try {
+    return normalizeLocalTemporaryStrategy(JSON.parse(window.localStorage.getItem(LOCAL_TEMPORARY_STRATEGY_KEY) || "null"));
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalTemporaryStrategy(strategy: AnyRecord) {
+  try {
+    window.localStorage.setItem(LOCAL_TEMPORARY_STRATEGY_KEY, JSON.stringify(strategy));
+  } catch {
+    // Local storage can be unavailable in private modes; the in-memory strategy still works.
+  }
+}
+
 function readInitialState() {
   const params = new URLSearchParams(window.location.search);
+  const temporaryStrategy = readLocalTemporaryStrategy();
+  const requestedStrategy = params.get("strategy") || "early";
   return {
     date: params.get("date") || "",
     strict: params.get("strict") !== "0",
     source: params.get("source") === "ths" ? "ths" : "em",
-    strategy: params.get("strategy") || "early",
+    strategy: requestedStrategy === TEMPORARY_STRATEGY_KEY && temporaryStrategy ? TEMPORARY_STRATEGY_KEY : requestedStrategy,
+    temporaryStrategy,
   };
 }
 
@@ -414,6 +444,7 @@ function AppShellHeader({
   setSource,
   strategy,
   setStrategy,
+  temporaryStrategy,
   moveDate,
   refresh,
   loading,
@@ -422,8 +453,14 @@ function AppShellHeader({
   const coverageEnd = overview?.computedMaxDate || overview?.tradingMaxDate || overview?.maxDate;
   const strategyOptions = (overview?.availableStrategies || []).map((item: AnyRecord) => ({
     value: item.key,
-    label: `${item.temporary ? "临时 · " : item.custom ? "永久 · " : ""}${item.shortLabel || item.label}`,
+    label: `${item.temporary ? "本地 · " : item.custom ? "策略库 · " : ""}${item.shortLabel || item.label}`,
   }));
+  if (temporaryStrategy && !strategyOptions.some((item: AnyRecord) => item.value === TEMPORARY_STRATEGY_KEY)) {
+    strategyOptions.unshift({
+      value: TEMPORARY_STRATEGY_KEY,
+      label: `本地 · ${temporaryStrategy.name || "临时策略"}`,
+    });
+  }
   if (strategy && !strategyOptions.some((item: AnyRecord) => item.value === strategy)) {
     strategyOptions.unshift({
       value: strategy,
@@ -705,48 +742,44 @@ function StrategyPanel({
   overview,
   strategy,
   setStrategy,
-  source,
   temporaryStrategy,
   onApplyTemporary,
   openEvaluation,
   openAttribution,
-  onSaved,
 }: AnyRecord) {
   const current = overview?.availableStrategies?.find((item: AnyRecord) => item.key === strategy) || overview?.dataStrategy || {};
   const [name, setName] = useState("");
   const [params, setParams] = useState<AnyRecord>({});
   const [expanded, setExpanded] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    setName(current.custom ? current.label || "我的策略" : `${current.shortLabel || current.label || "策略"} 调整版`);
+    setName(current.custom ? current.label || "我的策略" : `${current.shortLabel || current.label || "策略"} 临时版`);
     setParams(current.params || {});
     setExpanded(false);
     setMessage("");
   }, [strategy, overview?.generatedAt]);
 
   const strategyOptions = useMemo(
-    () =>
-      (overview?.availableStrategies || []).map((item: AnyRecord) => ({
+    () => {
+      const options = (overview?.availableStrategies || []).map((item: AnyRecord) => ({
         value: item.key,
-        label: `${item.temporary ? "临时 · " : item.custom ? "永久 · " : ""}${item.shortLabel || item.label}`,
-      })),
-    [overview],
+        label: `${item.temporary ? "本地 · " : item.custom ? "策略库 · " : ""}${item.shortLabel || item.label}`,
+      }));
+      if (temporaryStrategy && !options.some((item: AnyRecord) => item.value === TEMPORARY_STRATEGY_KEY)) {
+        options.unshift({
+          value: TEMPORARY_STRATEGY_KEY,
+          label: `本地 · ${temporaryStrategy.name || "临时策略"}`,
+        });
+      }
+      return options;
+    },
+    [overview, temporaryStrategy],
   );
 
   const paramDefs = overview?.strategyParamDefs || [];
   const visibleDefs = expanded ? paramDefs : [];
-  const currentCustomId = current.custom ? current.id || String(strategy).replace(/^custom:/, "") : "";
   const trimmedName = name.trim();
-  const duplicateName = Boolean(
-    trimmedName &&
-      (overview?.customStrategies || []).some(
-        (item: AnyRecord) =>
-          String(item.id || "") !== currentCustomId &&
-          String(item.shortLabel || item.label || "").trim().toLowerCase() === trimmedName.toLowerCase(),
-      ),
-  );
   const baseStrategy =
     strategy === TEMPORARY_STRATEGY_KEY
       ? temporaryStrategy?.baseStrategy || "early"
@@ -756,43 +789,15 @@ function StrategyPanel({
 
   function applyTemporary() {
     const nextName = trimmedName || `${current.shortLabel || current.label || "策略"} 临时版`;
-    onApplyTemporary({
+    const draft = {
       name: nextName,
-      description: `临时调整：${nextName}`,
+      description: `本地临时调整：${nextName}`,
       baseStrategy,
       params,
-    });
-    setMessage("已应用临时策略并重算；刷新页面后不会保留。");
-  }
-
-  async function save() {
-    if (duplicateName) {
-      setMessage("保存失败：策略名称已存在，请换一个名称，或选择已有永久策略后直接修改。");
-      return;
-    }
-    setSaving(true);
-    setMessage("保存中...");
-    try {
-      const customId = current.custom ? current.id || String(strategy).replace(/^custom:/, "") : undefined;
-      const payload = await requestJson(`/api/strategy-configs?source=${encodeURIComponent(source)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: customId,
-          source,
-          baseStrategy,
-          name: trimmedName || "我的策略",
-          description: current.custom ? current.description || "" : `${current.label || "内置策略"} 的永久自定义参数版本`,
-          params,
-        }),
-      });
-      setMessage("已保存为永久策略并重算");
-      onSaved(payload.strategy?.key || `custom:${payload.config.id}`);
-    } catch (error) {
-      setMessage(error instanceof Error ? `保存失败：${error.message}` : "保存失败");
-    } finally {
-      setSaving(false);
-    }
+    };
+    writeLocalTemporaryStrategy(draft);
+    onApplyTemporary(draft);
+    setMessage("已应用本地临时策略并重算；只保存在当前浏览器，不写入数据库。");
   }
 
   return (
@@ -809,7 +814,7 @@ function StrategyPanel({
               <Text fw={800}>当前策略</Text>
               <Select mt="xs" value={strategy} onChange={(value) => value && setStrategy(value)} data={strategyOptions} />
             </Box>
-            <Text size="xs" c="dimmed">临时不入库，永久才保存</Text>
+            <Text size="xs" c="dimmed">微调只保存在当前浏览器</Text>
           </Group>
           <SimpleGrid cols={2} mt="md">
             <Button variant="light" color="blue" onClick={openEvaluation}>策略测评</Button>
@@ -831,7 +836,6 @@ function StrategyPanel({
             label="策略名称"
             mt="sm"
             value={name}
-            error={duplicateName ? "已有同名永久策略" : undefined}
             onChange={(event) => setName(event.currentTarget.value)}
           />
           <Button mt="md" variant="light" fullWidth onClick={() => setExpanded((value) => !value)}>
@@ -863,8 +867,7 @@ function StrategyPanel({
               )}
             </SimpleGrid>
           ) : null}
-          <Button mt="md" fullWidth variant="light" onClick={applyTemporary}>应用临时并重算</Button>
-          <Button mt="sm" fullWidth onClick={save} loading={saving} disabled={duplicateName}>保存为永久策略</Button>
+          <Button mt="md" fullWidth onClick={applyTemporary}>应用本地临时并重算</Button>
           <Button mt="sm" fullWidth variant="default" onClick={() => setParams(current.params || {})}>恢复当前策略参数</Button>
           {message ? <Text mt="sm" c="dimmed" size="sm">{message}</Text> : null}
         </Paper>
@@ -877,9 +880,9 @@ function StrategyPanel({
           <SimpleGrid cols={{ base: 1, xs: 2 }} mt="md">
             {STRATEGY_PRESETS.map((preset) => (
               <UnstyledButton key={preset.key} className="presetCard" onClick={() => {
-                setName(`${preset.title} 调整版`);
+                setName(`${preset.title} 临时版`);
                 setParams(preset.params);
-                setMessage(`已套用「${preset.title}」，点击“应用临时并重算”即可先验证，不会写入永久策略。`);
+                setMessage(`已套用「${preset.title}」，点击“应用本地临时并重算”即可验证；只保存在当前浏览器，不写入数据库。`);
               }}>
                 <Group justify="space-between" align="flex-start">
                   <Text fw={800}>{preset.title}</Text>
@@ -1245,7 +1248,7 @@ export function App() {
   const [strict, setStrict] = useState(initial.strict);
   const [source, setSource] = useState(initial.source);
   const [strategy, setStrategy] = useState(initial.strategy);
-  const [temporaryStrategy, setTemporaryStrategy] = useState<AnyRecord | null>(null);
+  const [temporaryStrategy, setTemporaryStrategy] = useState<AnyRecord | null>(initial.temporaryStrategy);
   const [evaluationOpen, setEvaluationOpen] = useState(false);
   const [attributionOpen, setAttributionOpen] = useState(false);
   const queryClient = useQueryClient();
@@ -1281,10 +1284,10 @@ export function App() {
     url.searchParams.set("date", daily.requestedDate || daily.selectedDate);
     url.searchParams.set("strict", strict ? "1" : "0");
     url.searchParams.set("source", source);
-    url.searchParams.set("strategy", strategy === TEMPORARY_STRATEGY_KEY ? temporaryStrategy?.baseStrategy || "early" : strategy);
+    url.searchParams.set("strategy", strategy === TEMPORARY_STRATEGY_KEY ? TEMPORARY_STRATEGY_KEY : strategy);
     window.history.replaceState({}, "", url);
     if (!date) setDate(daily.selectedDate);
-  }, [daily?.selectedDate, daily?.requestedDate, strict, source, strategy, temporaryStrategy?.baseStrategy]);
+  }, [daily?.selectedDate, daily?.requestedDate, strict, source, strategy]);
 
   useEffect(() => {
     if (!overview?.availableStrategies?.length) return;
@@ -1299,13 +1302,10 @@ export function App() {
   }
 
   function changeSource(nextSource: string) {
-    setTemporaryStrategy(null);
-    if (strategy === TEMPORARY_STRATEGY_KEY) setStrategy("early");
     setSource(nextSource);
   }
 
   function changeStrategy(nextStrategy: string) {
-    if (nextStrategy !== TEMPORARY_STRATEGY_KEY) setTemporaryStrategy(null);
     setStrategy(nextStrategy);
   }
 
@@ -1339,6 +1339,7 @@ export function App() {
         setSource={changeSource}
         strategy={strategy}
         setStrategy={changeStrategy}
+        temporaryStrategy={temporaryStrategy}
         moveDate={moveDate}
         refresh={refreshAll}
         loading={loading}
@@ -1376,7 +1377,6 @@ export function App() {
             overview={overview}
             strategy={strategy}
             setStrategy={changeStrategy}
-            source={source}
             temporaryStrategy={temporaryStrategy}
             onApplyTemporary={(draft: AnyRecord) => {
               setTemporaryStrategy(draft);
@@ -1385,11 +1385,6 @@ export function App() {
             }}
             openEvaluation={() => setEvaluationOpen(true)}
             openAttribution={() => setAttributionOpen(true)}
-            onSaved={(nextStrategy: string) => {
-              setTemporaryStrategy(null);
-              setStrategy(nextStrategy);
-              refreshAll();
-            }}
           />
         </aside>
       </main>
