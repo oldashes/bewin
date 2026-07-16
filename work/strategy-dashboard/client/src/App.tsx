@@ -1245,6 +1245,7 @@ export function App() {
   const evaluationQuery = useQuery({
     queryKey: ["evaluation", ...commonKey],
     queryFn: () => requestJson(`/api/evaluation?${apiQuery({ strict, source, strategy, ...strategyRequestParams })}`),
+    enabled: evaluationOpen || attributionOpen,
   });
 
   const daily = dailyQuery.data;

@@ -2012,6 +2012,215 @@ async function loadThsSnapshotHotData({ sourceKey = "ths", afterDate = null, asS
   return data;
 }
 
+function thsHotDescriptor() {
+  return {
+    ...builtinStrategyDescriptor("hot"),
+    note: "基于同花顺每日最终热榜快照生成。近期快照目前覆盖热榜前10左右，20日前排名不足时保留为空。",
+  };
+}
+
+async function thsHotSnapshotStats() {
+  if (!process.env.DATABASE_URL) {
+    return { total: 0, dates: [], countByDate: new Map(), minDate: null, maxDate: null };
+  }
+  const { rows } = await getDbPool().query(
+    `
+      with latest as (
+        select snapshot_date, max(snapshot_key) as snapshot_key
+        from popularity_snapshots
+        where source = 'ths'
+          and category = 'stock'
+          and metric = 'hot'
+        group by snapshot_date
+      )
+      select p.snapshot_date::text as date, count(*)::int as count
+      from popularity_snapshots p
+      join latest l on l.snapshot_date = p.snapshot_date and l.snapshot_key = p.snapshot_key
+      where p.source = 'ths'
+        and p.category = 'stock'
+        and p.metric = 'hot'
+        and p.rank between 1 and 100
+      group by p.snapshot_date
+      order by p.snapshot_date asc
+    `,
+  );
+  const countByDate = new Map();
+  for (const row of rows) countByDate.set(normalizeDate(row.date), Number(row.count) || 0);
+  const dates = [...countByDate.keys()].filter(Boolean).sort();
+  return {
+    total: [...countByDate.values()].reduce((total, count) => total + count, 0),
+    dates,
+    countByDate,
+    minDate: dates[0] || null,
+    maxDate: dates[dates.length - 1] || null,
+  };
+}
+
+async function thsHotSnapshotEventsForDate(selectedDate) {
+  const normalizedDate = normalizeDate(selectedDate);
+  if (!process.env.DATABASE_URL || !normalizedDate) return [];
+
+  const { rows } = await getDbPool().query(
+    `
+      with latest as (
+        select snapshot_date, max(snapshot_key) as snapshot_key
+        from popularity_snapshots
+        where source = 'ths'
+          and category = 'stock'
+          and metric = 'hot'
+        group by snapshot_date
+      ),
+      window_dates as (
+        select snapshot_date
+        from latest
+        where snapshot_date <= $1::date
+        order by snapshot_date desc
+        limit 25
+      )
+      select
+        p.*,
+        st.name as stock_name,
+        st.exchange,
+        st.board,
+        st.industry,
+        st.region,
+        st.concepts,
+        st.listing_date
+      from popularity_snapshots p
+      join latest l on l.snapshot_date = p.snapshot_date and l.snapshot_key = p.snapshot_key
+      join window_dates wd on wd.snapshot_date = p.snapshot_date
+      left join stocks st on st.code = p.code
+      where p.source = 'ths'
+        and p.category = 'stock'
+        and p.metric = 'hot'
+        and p.rank between 1 and 100
+      order by p.snapshot_date asc, p.rank asc nulls last
+    `,
+    [normalizedDate],
+  );
+
+  const rankWindows = snapshotRankWindowMaps(rows);
+  const events = rows
+    .filter((row) => normalizeDate(row.snapshot_date) === normalizedDate)
+    .map((row) => snapshotRowToHotEvent(row, rankWindows))
+    .filter(Boolean);
+  await attachDbPreSignalMetrics(events);
+  await backfillDbEventReturns(events);
+  return events;
+}
+
+async function thsHotOverviewPayload(query = {}) {
+  const descriptor = thsHotDescriptor();
+  const strategies = await availableStrategiesForSource("ths");
+  const stats = await thsHotSnapshotStats();
+  const coverageDates = await computedDataCoverageDates("ths");
+  const displayDates = stats.dates.length ? stats.dates : coverageDates;
+  const tradingDates = displayDateRange(displayDates);
+  const overall = { ...summarize([]), count: stats.total };
+  return {
+    generatedAt: new Date().toISOString(),
+    sourceFile: "neon:popularity_snapshots(ths.stock.hot)",
+    sourceKey: "ths",
+    dataSource: {
+      ...DATA_SOURCES.ths,
+      strategy: descriptor,
+      sourceFile: "neon:popularity_snapshots(ths.stock.hot)",
+      available: stats.total > 0,
+      description: "同花顺历史人气，基于每日最终热榜快照动态生成热门确认候选。",
+    },
+    availableSources: Object.values(DATA_SOURCES),
+    availableStrategies: [...strategies.builtIn, ...strategies.custom],
+    customStrategies: strategies.custom,
+    strategyParamDefs: STRATEGY_PARAM_DEFS,
+    dataStrategy: descriptor,
+    strictCount: stats.total,
+    rawCount: stats.total,
+    dateCount: stats.dates.length,
+    hitMinDate: stats.minDate,
+    hitMaxDate: stats.maxDate,
+    computedDateCount: coverageDates.length,
+    computedMinDate: coverageDates[0] || null,
+    computedMaxDate: coverageDates[coverageDates.length - 1] || null,
+    minDate: stats.minDate || coverageDates[0] || null,
+    maxDate: stats.maxDate || coverageDates[coverageDates.length - 1] || null,
+    tradingDateCount: tradingDates.length,
+    tradingMinDate: tradingDates[0] || null,
+    tradingMaxDate: tradingDates[tradingDates.length - 1] || null,
+    overall,
+  };
+}
+
+async function thsHotTimelinePayload(query = {}) {
+  const stats = await thsHotSnapshotStats();
+  const coverageDates = await computedDataCoverageDates("ths");
+  const dates = displayDateRange(stats.dates.length ? stats.dates : coverageDates, query.date);
+  const emptySummary = summarize([]);
+  return dates.map((date) => ({
+    date,
+    ...emptySummary,
+    count: stats.countByDate.get(date) || 0,
+    boardCount: 0,
+    topBoards: [],
+  }));
+}
+
+async function thsHotDailyPayload(query = {}) {
+  const descriptor = thsHotDescriptor();
+  const stats = await thsHotSnapshotStats();
+  const normalizedRequestedDate = normalizeDate(query.date);
+  const requestedDate = normalizedRequestedDate || stats.maxDate || null;
+  const tradingDates = displayDateRange(stats.dates, requestedDate);
+  const isTradingDate = !requestedDate || !tradingDates.length || tradingDates.includes(requestedDate);
+  const selectedDate = !requestedDate
+    ? tradingDates[tradingDates.length - 1] || stats.maxDate || null
+    : isTradingDate
+      ? requestedDate
+      : previousDate(tradingDates, requestedDate) || nextAvailableDate(tradingDates, requestedDate) || requestedDate;
+  const exactDate = !normalizedRequestedDate || normalizedRequestedDate === selectedDate;
+  const events = selectedDate ? await thsHotSnapshotEventsForDate(selectedDate) : [];
+  const strict = query.strict !== "false";
+  const baseEvents = strict ? events.filter((event) => event.strictBoard) : events;
+  const displayEvents = baseEvents.map((event) =>
+    applySignalQuality(
+      {
+        ...event,
+        dualSourceResonance: false,
+      },
+      { daySignalCount: baseEvents.length },
+    ),
+  );
+  const coverageDates = await computedDataCoverageDates("ths");
+  const freshness = await dailyFreshness({ sourceKey: "ths", selectedDate });
+  const dataSource = {
+    ...DATA_SOURCES.ths,
+    strategy: descriptor,
+    sourceFile: "neon:popularity_snapshots(ths.stock.hot)",
+    available: stats.total > 0,
+    description: "同花顺历史人气，基于每日最终热榜快照动态生成热门确认候选。",
+  };
+  return {
+    selectedDate,
+    requestedDate: normalizedRequestedDate,
+    exactDate,
+    nextAvailableDate: exactDate ? null : nextAvailableDate(tradingDates, normalizedRequestedDate),
+    strict,
+    availableDates: tradingDates,
+    signalDates: stats.dates,
+    computedDates: coverageDates,
+    tradingDates,
+    dateStatus: dateStatus(normalizedRequestedDate, selectedDate, tradingDates, stats.dates),
+    source: dataSource.description,
+    dataSource,
+    dataStrategy: descriptor,
+    rule: descriptor.rule || STRATEGIES.hot.rule,
+    freshness,
+    stats: summarize(displayEvents),
+    signalStats: summarizeSignals(displayEvents),
+    boards: aggregateBoards(displayEvents),
+    stocks: displayEvents.sort((a, b) => b.sortScore - a.sortScore),
+  };
+}
+
 function dbRowToEvent(row, strategyKey) {
   const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
   const signalDate = normalizeDate(row.signal_date);
@@ -3299,6 +3508,9 @@ async function dualSourceCodesForDate({ events, selectedDate, sourceKey, strateg
 async function dailyPayload(query) {
   const temporaryStrategy = temporaryStrategyConfigFromQuery(query);
   const strategyKey = normalizeStrategyKey(query.strategy);
+  if (!temporaryStrategy && normalizeSourceKey(query.source) === "ths" && strategyKey === "hot") {
+    return thsHotDailyPayload(query);
+  }
   const data = await loadDataForSource(query.source, strategyKey, { temporaryStrategy });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
@@ -3358,6 +3570,9 @@ async function dailyPayload(query) {
 }
 
 async function timelinePayload(query) {
+  if (!temporaryStrategyConfigFromQuery(query) && normalizeSourceKey(query.source) === "ths" && normalizeStrategyKey(query.strategy) === "hot") {
+    return thsHotTimelinePayload(query);
+  }
   const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
@@ -3377,6 +3592,9 @@ async function timelinePayload(query) {
 
 async function overviewPayload(query = {}) {
   const temporaryStrategy = temporaryStrategyConfigFromQuery(query);
+  if (!temporaryStrategy && normalizeSourceKey(query.source) === "ths" && normalizeStrategyKey(query.strategy) === "hot") {
+    return thsHotOverviewPayload(query);
+  }
   const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy });
   const strategies = await availableStrategiesForSource(data.sourceKey);
   const availableStrategies = [...strategies.builtIn, ...strategies.custom];
