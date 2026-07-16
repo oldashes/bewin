@@ -2021,6 +2021,115 @@ async function thsHotSnapshotStats() {
   };
 }
 
+function thsHotTimelineSummaryFromRow(row) {
+  return {
+    count: Number(row.count) || 0,
+    avgScore: null,
+    avgRet5: n(row.avg_ret_5),
+    avgRet10: n(row.avg_ret_10),
+    avgRet20: n(row.avg_ret_20),
+    medianRet5: n(row.median_ret_5),
+    medianRet10: n(row.median_ret_10),
+    medianRet20: n(row.median_ret_20),
+    win5: n(row.win_5),
+    win10: n(row.win_10),
+    win20: n(row.win_20),
+    matured5: Number(row.matured_5) || 0,
+    matured10: Number(row.matured_10) || 0,
+    matured20: Number(row.matured_20) || 0,
+  };
+}
+
+async function thsHotTimelineSummaryMap() {
+  const cacheKey = "ths:hot:timeline-summary";
+  if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
+  if (!process.env.DATABASE_URL) return new Map();
+
+  const { rows } = await getDbPool().query(
+    `
+      with latest as (
+        select snapshot_date, max(snapshot_key) as snapshot_key
+        from popularity_snapshots
+        where source = 'ths'
+          and category = 'stock'
+          and metric = 'hot'
+        group by snapshot_date
+      ),
+      signals as (
+        select p.snapshot_date::date as signal_date, p.code::text as code
+        from popularity_snapshots p
+        join latest l on l.snapshot_date = p.snapshot_date and l.snapshot_key = p.snapshot_key
+        where p.source = 'ths'
+          and p.category = 'stock'
+          and p.metric = 'hot'
+          and p.rank between 1 and 100
+      ),
+      signal_codes as (
+        select distinct code from signals
+      ),
+      bars as (
+        select
+          code::text as code,
+          trade_date::date as trade_date,
+          open::double precision as open,
+          close::double precision as close,
+          row_number() over (partition by code order by trade_date asc) as rn
+        from stock_daily_bars
+        where code in (select code from signal_codes)
+      ),
+      entry_rn as (
+        select s.signal_date, s.code, min(b.rn) as entry_rn
+        from signals s
+        left join bars b on b.code = s.code and b.trade_date > s.signal_date
+        group by s.signal_date, s.code
+      ),
+      entries as (
+        select er.signal_date, er.code, er.entry_rn, be.open as entry_open
+        from entry_rn er
+        left join bars be on be.code = er.code and be.rn = er.entry_rn
+      ),
+      returns as (
+        select
+          e.signal_date,
+          e.code,
+          case when e.entry_open > 0 and b5.close is not null then (b5.close - e.entry_open) / e.entry_open end as ret_5,
+          case when e.entry_open > 0 and b10.close is not null then (b10.close - e.entry_open) / e.entry_open end as ret_10,
+          case when e.entry_open > 0 and b20.close is not null then (b20.close - e.entry_open) / e.entry_open end as ret_20
+        from entries e
+        left join bars b5 on b5.code = e.code and b5.rn = e.entry_rn + 5
+        left join bars b10 on b10.code = e.code and b10.rn = e.entry_rn + 10
+        left join bars b20 on b20.code = e.code and b20.rn = e.entry_rn + 20
+      )
+      select
+        signal_date::text as date,
+        count(*)::int as count,
+        avg(ret_5) as avg_ret_5,
+        avg(ret_10) as avg_ret_10,
+        avg(ret_20) as avg_ret_20,
+        percentile_cont(0.5) within group (order by ret_5) filter (where ret_5 is not null) as median_ret_5,
+        percentile_cont(0.5) within group (order by ret_10) filter (where ret_10 is not null) as median_ret_10,
+        percentile_cont(0.5) within group (order by ret_20) filter (where ret_20 is not null) as median_ret_20,
+        avg(case when ret_5 > 0 then 1.0 else 0.0 end) filter (where ret_5 is not null) as win_5,
+        avg(case when ret_10 > 0 then 1.0 else 0.0 end) filter (where ret_10 is not null) as win_10,
+        avg(case when ret_20 > 0 then 1.0 else 0.0 end) filter (where ret_20 is not null) as win_20,
+        count(ret_5)::int as matured_5,
+        count(ret_10)::int as matured_10,
+        count(ret_20)::int as matured_20
+      from returns
+      group by signal_date
+      order by signal_date asc
+    `,
+  );
+
+  const summaries = new Map();
+  for (const row of rows) {
+    const date = normalizeDate(row.date);
+    if (date) summaries.set(date, thsHotTimelineSummaryFromRow(row));
+  }
+  cachedDbData.set(cacheKey, summaries);
+  return summaries;
+}
+
 async function thsHotSnapshotEventsForDate(selectedDate) {
   const normalizedDate = normalizeDate(selectedDate);
   if (!process.env.DATABASE_URL || !normalizedDate) return [];
@@ -2119,11 +2228,11 @@ async function thsHotTimelinePayload(query = {}) {
   const stats = await thsHotSnapshotStats();
   const coverageDates = await computedDataCoverageDates("ths");
   const dates = displayDateRange(stats.dates.length ? stats.dates : coverageDates, query.date);
+  const summaries = await thsHotTimelineSummaryMap();
   const emptySummary = summarize([]);
   return dates.map((date) => ({
     date,
-    ...emptySummary,
-    count: stats.countByDate.get(date) || 0,
+    ...(summaries.get(date) || { ...emptySummary, count: stats.countByDate.get(date) || 0 }),
     boardCount: 0,
     topBoards: [],
   }));
