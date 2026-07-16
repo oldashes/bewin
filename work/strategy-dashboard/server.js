@@ -29,12 +29,12 @@ const THS_SYNC_JOB = "ths-popularity-refresh";
 const THS_FEATURE_JOB = "ths-feature-generate";
 const DAILY_SIGNAL_JOB = "daily-signal-generate";
 const DEFAULT_THS_WATCHLIST_MAX = 20;
-const DEFAULT_SIGNAL_MAX_UNIVERSE = 180;
+const DEFAULT_SIGNAL_MAX_UNIVERSE = 80;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
-const DEFAULT_SIGNAL_CONCURRENCY = 8;
+const DEFAULT_SIGNAL_CONCURRENCY = 6;
 const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
-const DEFAULT_CRON_TIME_BUDGET_MS = 52000;
+const DEFAULT_CRON_TIME_BUDGET_MS = 45000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
 const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
 const MARKET_INDEX = {
@@ -78,6 +78,7 @@ let cachedDbData = new Map();
 let cachedNames;
 let cachedStockMeta;
 let cachedBoardCodeByName;
+let cachedDbBoardCodeByName;
 let cachedBoardMembersByCode = new Map();
 let cachedTradingCalendar;
 let dbPool;
@@ -378,6 +379,49 @@ function readBoardCodeByName() {
   }
   cachedBoardCodeByName = new Map([...byName.entries()].map(([name, value]) => [name, value.code]));
   return cachedBoardCodeByName;
+}
+
+async function loadBoardCodeByName() {
+  if (cachedDbBoardCodeByName) return cachedDbBoardCodeByName;
+  const byName = new Map(readBoardCodeByName());
+  if (!process.env.DATABASE_URL) {
+    cachedDbBoardCodeByName = byName;
+    return byName;
+  }
+
+  try {
+    const { rows } = await getDbPool().query(
+      `
+        with ranked as (
+          select
+            best_board_name,
+            best_board_code,
+            count(*)::int as cnt,
+            row_number() over (
+              partition by best_board_name
+              order by count(*) desc, max(signal_date) desc
+            ) as rn
+          from strategy_feature_events
+          where nullif(trim(best_board_name), '') is not null
+            and best_board_code ~ '^BK[0-9]{4}$'
+          group by best_board_name, best_board_code
+        )
+        select best_board_name, best_board_code
+        from ranked
+        where rn = 1
+      `,
+    );
+    for (const row of rows) {
+      const name = String(row.best_board_name || "").trim();
+      const code = String(row.best_board_code || "").trim().toUpperCase();
+      if (name && /^BK\d{4}$/.test(code) && !byName.has(name)) byName.set(name, code);
+    }
+  } catch {
+    // Keep the local CSV mapping when the database lookup is unavailable.
+  }
+
+  cachedDbBoardCodeByName = byName;
+  return byName;
 }
 
 function normalizeConceptList(value) {
@@ -4595,7 +4639,7 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
     }
   }
 
-  const boardCodeByName = readBoardCodeByName();
+  const boardCodeByName = await loadBoardCodeByName();
   for (const item of byCode.values()) {
     if (!item.bestBoardCode && item.bestBoardName) {
       item.bestBoardCode = boardCodeByName.get(item.bestBoardName) || "";
@@ -5437,6 +5481,7 @@ async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000) {
     );
     savedCount += chunk.length;
   }
+  cachedDbBoardCodeByName = null;
   return savedCount;
 }
 
@@ -5707,7 +5752,7 @@ async function runThsFeatureGeneration(options = {}) {
     if (!historyByCode.has(code)) historyByCode.set(code, []);
     historyByCode.get(code).push({ date: normalizeDate(row.date), rank });
   }
-  const boardCodeByName = readBoardCodeByName();
+  const boardCodeByName = await loadBoardCodeByName();
   const boardRowsByCode = new Map();
   const boardMetricsByKey = new Map();
   const featureRecords = [];
