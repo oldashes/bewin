@@ -22,7 +22,8 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
 const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2025-08-01";
 const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
-const DEFAULT_SYNC_MAX_STOCKS = 20;
+const DEFAULT_SYNC_MAX_STOCKS = 60;
+const DEFAULT_SYNC_CONCURRENCY = 4;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
 const THS_FEATURE_JOB = "ths-feature-generate";
@@ -31,7 +32,7 @@ const DEFAULT_THS_WATCHLIST_MAX = 20;
 const DEFAULT_SIGNAL_MAX_UNIVERSE = 180;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 8;
-const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 0;
+const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const DEFAULT_CRON_TIME_BUDGET_MS = 52000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
@@ -3116,6 +3117,7 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       getDbPool().query(
         `
           select job_name, status, started_at, finished_at, selected_count, success_count, failed_count, error
+          , details
           from sync_runs
           where job_name = any($1)
           order by started_at desc
@@ -3136,6 +3138,7 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       successCount: Number(row.success_count) || 0,
       failedCount: Number(row.failed_count) || 0,
       error: row.error || null,
+      details: row.details && typeof row.details === "object" ? row.details : null,
     }));
     const featureUpdatedAt = isoTimestamp(featureRow.updated_at);
     const snapshotUpdatedAt = isoTimestamp(snapshotRow.updated_at);
@@ -3145,10 +3148,22 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
     const featureCount = Number(featureRow.count) || 0;
     const snapshotCount = Number(snapshotRow.count) || 0;
     const klineCount = Number(klineRow.count) || 0;
+    const featureJobName = sourceKey === "ths" ? THS_FEATURE_JOB : DAILY_SIGNAL_JOB;
+    const featureRunForDate = lastSynces.find((row) => {
+      if (row.jobName !== featureJobName) return false;
+      const details = row.details || {};
+      const params = details.params || {};
+      const runDate =
+        normalizeDate(details.generatedDate) ||
+        normalizeDate(details.targetDate) ||
+        normalizeDate(params.targetDate) ||
+        dateFromYmd(params.requestedYmd);
+      return runDate === selectedDate && row.finishedAt && !["running", "failed", "timeout"].includes(row.status);
+    });
     return {
       sourceKey,
       selectedDate,
-      computed: featureCount > 0 || snapshotCount > 0,
+      computed: featureCount > 0 || Boolean(featureRunForDate),
       updatedAt: maxIsoTimestamp(featureUpdatedAt, snapshotUpdatedAt, snapshotTime, klineUpdatedAt),
       featureUpdatedAt,
       featureCount,
@@ -3158,7 +3173,7 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       klineUpdatedAt,
       klineCount,
       latestSyncFinishedAt,
-      lastSynces,
+      lastSynces: lastSynces.map(({ details, ...row }) => row),
     };
   } catch (error) {
     return {
@@ -4206,49 +4221,126 @@ async function finishSyncRun(runId, status, summary, errorMessage = null) {
 async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, maxStocks, force }) {
   const { rows } = await getDbPool().query(
     `
-      with bounds as (
+      with source_scope as (
+        select unnest(case when $3::text in ('em', 'ths') then array['em', 'ths']::text[] else array['em', 'ths']::text[] end) as source
+      ),
+      feature_bounds as (
+        select coalesce(max(signal_date), current_date) as max_signal_date
+        from strategy_feature_events
+        where source in (select source from source_scope)
+          and feature_set = $6
+      ),
+      signal_bounds as (
         select coalesce(max(signal_date), current_date) as max_signal_date
         from strategy_signals
-        where source = $3
+        where source in (select source from source_scope)
           and ($4::text is null or strategy = $4)
+      ),
+      snapshot_bounds as (
+        select coalesce(max(snapshot_date), current_date) as max_snapshot_date
+        from popularity_snapshots
+        where source in (select source from source_scope)
+          and category = 'stock'
+      ),
+      recent_features as (
+        select
+          f.code,
+          max(f.name) as name,
+          max(f.signal_date) as latest_signal_date,
+          count(*)::int as signal_count,
+          min(f.rank)::int as best_rank,
+          2 as priority
+        from strategy_feature_events f
+        cross join feature_bounds b
+        where f.source in (select source from source_scope)
+          and f.feature_set = $6
+          and f.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
+        group by f.code
       ),
       recent_signals as (
         select
           s.code,
           max(s.name) as name,
-          max(s.signal_date)::text as latest_signal_date,
-          count(*)::int as signal_count
+          max(s.signal_date) as latest_signal_date,
+          count(*)::int as signal_count,
+          min(s.rank)::int as best_rank,
+          3 as priority
         from strategy_signals s
-        cross join bounds b
-        where s.source = $3
+        cross join signal_bounds b
+        where s.source in (select source from source_scope)
           and ($4::text is null or s.strategy = $4)
           and s.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
         group by s.code
       ),
+      recent_snapshots as (
+        select
+          p.code,
+          max(p.name) as name,
+          max(p.snapshot_date) as latest_signal_date,
+          count(*)::int as signal_count,
+          min(p.rank)::int as best_rank,
+          1 as priority
+        from popularity_snapshots p
+        cross join snapshot_bounds b
+        where p.source in (select source from source_scope)
+          and p.category = 'stock'
+          and p.snapshot_date >= b.max_snapshot_date - interval '5 day'
+          and p.rank between 1 and 1600
+        group by p.code
+      ),
+      candidates as (
+        select * from recent_snapshots
+        union all
+        select * from recent_features
+        union all
+        select * from recent_signals
+      ),
+      deduped as (
+        select
+          code,
+          (array_agg(name order by priority asc, latest_signal_date desc))[1] as name,
+          max(latest_signal_date) as latest_signal_date,
+          sum(signal_count)::int as signal_count,
+          min(best_rank)::int as best_rank,
+          min(priority)::int as priority
+        from candidates
+        where code ~ '^[036][0-9]{5}$'
+        group by code
+      ),
       latest_bars as (
         select
           code,
-          max(trade_date)::text as latest_bar_date,
+          max(trade_date) as latest_bar_date,
           max(updated_at) as latest_bar_updated_at
         from stock_daily_bars
         group by code
       )
       select
-        rs.code,
-        rs.name,
-        rs.latest_signal_date,
-        rs.signal_count,
-        lb.latest_bar_date,
+        d.code,
+        d.name,
+        d.latest_signal_date::text as latest_signal_date,
+        d.signal_count,
+        d.best_rank,
+        d.priority,
+        lb.latest_bar_date::text as latest_bar_date,
         lb.latest_bar_updated_at
-      from recent_signals rs
-      left join latest_bars lb on lb.code = rs.code
+      from deduped d
+      left join latest_bars lb on lb.code = d.code
       where $5::boolean
          or lb.latest_bar_updated_at is null
+         or lb.latest_bar_date is null
+         or lb.latest_bar_date < d.latest_signal_date
          or lb.latest_bar_updated_at < now() - interval '18 hours'
-      order by lb.latest_bar_updated_at asc nulls first, rs.latest_signal_date desc, rs.signal_count desc
+      order by
+        d.priority asc,
+        (lb.latest_bar_date is null or lb.latest_bar_date < d.latest_signal_date) desc,
+        lb.latest_bar_updated_at asc nulls first,
+        d.latest_signal_date desc,
+        d.best_rank asc nulls last,
+        d.signal_count desc
       limit $2::int
     `,
-    [lookbackDays, maxStocks, sourceKey, strategyKey || null, Boolean(force)],
+    [lookbackDays, maxStocks, sourceKey, strategyKey || null, Boolean(force), FEATURE_SET],
   );
 
   return rows.map((row) => ({
@@ -4256,6 +4348,8 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
     name: row.name || row.code,
     latestSignalDate: normalizeDate(row.latest_signal_date),
     signalCount: n(row.signal_count) || 0,
+    bestRank: n(row.best_rank),
+    priority: n(row.priority),
     latestBarDate: normalizeDate(row.latest_bar_date),
     latestBarUpdatedAt: row.latest_bar_updated_at ? new Date(row.latest_bar_updated_at).toISOString() : null,
   }));
@@ -4539,18 +4633,30 @@ async function runDailySignalGeneration(options = {}) {
     1,
     16,
   );
+  const timeBudgetMs = boundedInteger(
+    options.timeBudgetMs ?? process.env.SIGNAL_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
+    DEFAULT_CRON_TIME_BUDGET_MS,
+    5000,
+    300000,
+  );
   const boardMode = String(options.boardMode || process.env.SIGNAL_BOARD_MODE || "fetch").toLowerCase();
   const force = options.force === true || options.force === "1" || options.force === "true";
   const startedAt = new Date().toISOString();
-  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, boardMode, force };
+  const startedAtMs = Date.now();
+  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, boardMode, force, timeBudgetMs };
   const run = await createSyncRun(DAILY_SIGNAL_JOB, { params, startedAt });
 
   const results = [];
   try {
     const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
     const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks });
+    const histories = [];
+    let rankSnapshotCount = 0;
+    let savedRankSnapshots = 0;
+    let stoppedByTimeBudget = false;
+    const historyChunkSize = Math.max(concurrency * 2, 8);
 
-    const histories = await mapLimit(universe, concurrency, async (item) => {
+    const fetchHistoryEntry = async (item) => {
       const result = { code: item.code, name: item.name, status: "pending" };
       try {
         const history = await fetchEastmoneyRankHistory(item.code);
@@ -4564,10 +4670,25 @@ async function runDailySignalGeneration(options = {}) {
         result.error = error.message;
         return { item, history: [], snapshots: [], result };
       }
-    });
+    };
 
-    const rankSnapshots = histories.flatMap((entry) => entry.snapshots);
-    const savedRankSnapshots = await upsertPopularitySnapshotsInChunks(rankSnapshots);
+    for (let index = 0; index < universe.length; index += historyChunkSize) {
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
+      const chunk = universe.slice(index, index + historyChunkSize);
+      const chunkHistories = await mapLimit(chunk, concurrency, fetchHistoryEntry);
+      histories.push(...chunkHistories);
+      const chunkSnapshots = chunkHistories.flatMap((entry) => entry.snapshots);
+      rankSnapshotCount += chunkSnapshots.length;
+      savedRankSnapshots += await upsertPopularitySnapshotsInChunks(chunkSnapshots);
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
+    }
+
     const rankedCandidates = histories.filter((entry) => {
       const rank = rankAtOffset(entry.history, targetDate, 0);
       const rank20 = rankAtOffset(entry.history, targetDate, 20);
@@ -4580,7 +4701,11 @@ async function runDailySignalGeneration(options = {}) {
 
     const boardRowsByCode = new Map();
     const boardMetricsByKey = new Map();
-    const featureEntries = await mapLimit(rankedCandidates, Math.min(concurrency, 6), async (entry) => {
+    const featureRecords = [];
+    let savedFeatures = 0;
+    const featureConcurrency = Math.min(concurrency, 6);
+    const featureChunkSize = Math.max(featureConcurrency * 2, 6);
+    const buildFeatureEntry = async (entry) => {
       const item = entry.item;
       const result = entry.result;
       try {
@@ -4631,10 +4756,23 @@ async function runDailySignalGeneration(options = {}) {
         result.error = error.message;
         return null;
       }
-    });
+    };
 
-    const featureRecords = featureEntries.filter(Boolean);
-    const savedFeatures = await bulkUpsertStrategyFeatureEvents(featureRecords);
+    for (let index = 0; index < rankedCandidates.length; index += featureChunkSize) {
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
+      const chunk = rankedCandidates.slice(index, index + featureChunkSize);
+      const featureEntries = await mapLimit(chunk, featureConcurrency, buildFeatureEntry);
+      const chunkFeatures = featureEntries.filter(Boolean);
+      featureRecords.push(...chunkFeatures);
+      savedFeatures += await bulkUpsertStrategyFeatureEvents(chunkFeatures);
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
+    }
     results.push(...histories.map((entry) => entry.result));
 
     const failedCount = results.filter((item) => /failed$/.test(item.status)).length;
@@ -4647,15 +4785,31 @@ async function runDailySignalGeneration(options = {}) {
       selectedCount: universe.length,
       successCount: savedFeatures,
       failedCount,
-      rankSnapshotCount: rankSnapshots.length,
+      rankSnapshotCount,
       savedRankSnapshots,
       rankedCandidateCount: rankedCandidates.length,
       featureCount: featureRecords.length,
       generatedDate: targetDate,
+      processedUniverseCount: histories.length,
+      remainingUniverseCount: Math.max(0, universe.length - histories.length),
+      stoppedByTimeBudget,
       results: results.slice(0, 200),
     };
-    const status = savedFeatures ? (failedCount ? "partial" : "success") : "failed";
-    await finishSyncRun(run.id, status, summary, savedFeatures ? null : "no daily features generated");
+    const status = stoppedByTimeBudget
+      ? savedFeatures || savedRankSnapshots
+        ? "partial"
+        : "failed"
+      : savedFeatures
+        ? failedCount
+          ? "partial"
+          : "success"
+        : "empty";
+    await finishSyncRun(
+      run.id,
+      status === "empty" ? "success" : status,
+      summary,
+      status === "failed" ? "no daily features generated before time budget" : null,
+    );
     cachedDbData.clear();
     cachedThsData.clear();
     return { ...summary, status };
@@ -4684,6 +4838,7 @@ async function dailySignalPayload(query = {}, headers = {}) {
     maxUniverse: query.maxUniverse,
     rankMax: query.rankMax,
     concurrency: query.concurrency,
+    timeBudgetMs: query.timeBudgetMs,
     boardMode: query.boardMode,
     force: query.force,
   });
@@ -4713,7 +4868,13 @@ async function runDailyKlineSync(options = {}) {
     options.maxStocks ?? process.env.SYNC_MAX_STOCKS,
     DEFAULT_SYNC_MAX_STOCKS,
     1,
-    200,
+    500,
+  );
+  const concurrency = boundedInteger(
+    options.concurrency ?? process.env.SYNC_CONCURRENCY,
+    DEFAULT_SYNC_CONCURRENCY,
+    1,
+    12,
   );
   const timeBudgetMs = boundedInteger(
     options.timeBudgetMs ?? process.env.DAILY_KLINE_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
@@ -4722,7 +4883,8 @@ async function runDailyKlineSync(options = {}) {
     300000,
   );
   const force = options.force === true || options.force === "1" || options.force === "true";
-  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force, timeBudgetMs };
+  const targetDate = dateFromYmd(normalizeYmd(options.date));
+  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force, timeBudgetMs, concurrency, targetDate };
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
   const run = await createSyncRun(DAILY_SYNC_JOB, { params, startedAt });
@@ -4734,10 +4896,9 @@ async function runDailyKlineSync(options = {}) {
     let failedCount = 0;
     let stoppedByTimeBudget = false;
 
-    for (const candidate of candidates) {
+    const syncCandidate = async (candidate) => {
       if (Date.now() - startedAtMs > timeBudgetMs) {
-        stoppedByTimeBudget = true;
-        break;
+        return { stoppedByTimeBudget: true };
       }
       const stock = normalizeStock(candidate.code);
       const fallbackFromDate = candidate.latestBarDate || candidate.latestSignalDate || KLINE_DB_START_DATE;
@@ -4745,22 +4906,45 @@ async function runDailyKlineSync(options = {}) {
         code: candidate.code,
         name: candidate.name,
         latestSignalDate: candidate.latestSignalDate,
+        bestRank: candidate.bestRank,
+        priority: candidate.priority,
         previousLatestBarDate: candidate.latestBarDate,
         status: "pending",
       };
       try {
-        const rows = await fetchKlineWithIfindFallback(stock, fallbackFromDate);
+        const rows = await fetchKlineWithIfindFallback(stock, fallbackFromDate, targetDate);
         const latestRow = rows[rows.length - 1] || null;
-        item.status = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS ? "synced_fallback" : "synced";
+        const hasTargetDate = rowsContainDate(rows, targetDate);
+        const usedFallbackOnly = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS;
+        item.status = hasTargetDate ? (usedFallbackOnly ? "synced_fallback" : "synced") : "stale";
         item.rowCount = rows.length;
         item.latestBarDate = latestRow?.date || null;
-        successCount += 1;
+        item.targetDate = targetDate;
+        item.hasTargetDate = hasTargetDate;
       } catch (error) {
         item.status = "failed";
         item.error = error.message;
-        failedCount += 1;
       }
-      results.push(item);
+      return item;
+    };
+
+    for (let index = 0; index < candidates.length; index += concurrency) {
+      if (Date.now() - startedAtMs > timeBudgetMs) {
+        stoppedByTimeBudget = true;
+        break;
+      }
+      const chunk = candidates.slice(index, index + concurrency);
+      const chunkResults = await Promise.all(chunk.map(syncCandidate));
+      for (const item of chunkResults) {
+        if (item?.stoppedByTimeBudget) {
+          stoppedByTimeBudget = true;
+          continue;
+        }
+        results.push(item);
+        if (item.status === "synced" || item.status === "synced_fallback") successCount += 1;
+        if (item.status === "failed" || item.status === "stale") failedCount += 1;
+      }
+      if (stoppedByTimeBudget) break;
     }
 
     const summary = {
@@ -4807,8 +4991,10 @@ async function dailySyncPayload(query = {}, headers = {}) {
   return runDailyKlineSync({
     source: query.source,
     strategy: query.strategy,
+    date: query.date,
     lookbackDays: query.lookbackDays,
     maxStocks: query.maxStocks,
+    concurrency: query.concurrency,
     timeBudgetMs: query.timeBudgetMs,
     force: query.force,
   });
@@ -5578,7 +5764,7 @@ async function runThsFeatureGeneration(options = {}) {
   };
   await finishSyncRun(
     run.id,
-    resultStatus === "timeout" ? "failed" : resultStatus === "partial" ? "partial" : "success",
+    resultStatus === "timeout" ? "failed" : resultStatus,
     {
       ...summary,
       selectedCount: todayRows.length,

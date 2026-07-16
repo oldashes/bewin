@@ -11,16 +11,16 @@
   },
   "crons": [
     {
-      "path": "/api/cron/daily-sync",
-      "schedule": "30 8 * * 1-5"
+      "path": "/api/cron/ths-sync",
+      "schedule": "35 8 * * 1-5"
     },
     {
-      "path": "/api/cron/ths-sync",
-      "schedule": "40 8 * * 1-5"
+      "path": "/api/cron/daily-sync",
+      "schedule": "45 8 * * 1-5"
     },
     {
       "path": "/api/cron/ths-feature-sync",
-      "schedule": "50 8 * * 1-5"
+      "schedule": "55 8 * * 1-5"
     },
     {
       "path": "/api/cron/daily-signal-sync",
