@@ -412,12 +412,24 @@ function AppShellHeader({
   setStrict,
   source,
   setSource,
+  strategy,
+  setStrategy,
   moveDate,
   refresh,
   loading,
 }: AnyRecord) {
   const coverageStart = overview?.computedMinDate || overview?.tradingMinDate || overview?.minDate;
   const coverageEnd = overview?.computedMaxDate || overview?.tradingMaxDate || overview?.maxDate;
+  const strategyOptions = (overview?.availableStrategies || []).map((item: AnyRecord) => ({
+    value: item.key,
+    label: `${item.temporary ? "临时 · " : item.custom ? "永久 · " : ""}${item.shortLabel || item.label}`,
+  }));
+  if (strategy && !strategyOptions.some((item: AnyRecord) => item.value === strategy)) {
+    strategyOptions.unshift({
+      value: strategy,
+      label: overview?.dataStrategy?.shortLabel || overview?.dataStrategy?.label || "当前策略",
+    });
+  }
 
   return (
     <header className="topbar">
@@ -464,6 +476,13 @@ function AppShellHeader({
             { value: "em", label: "东方财富历史人气" },
             { value: "ths", label: "同花顺历史人气" },
           ]}
+          className="sourceSelect"
+        />
+        <Select
+          label="策略"
+          value={strategy}
+          onChange={(value) => value && setStrategy(value)}
+          data={strategyOptions}
           className="sourceSelect"
         />
         <Checkbox
@@ -536,7 +555,11 @@ function DateBanner({ daily }: { daily?: AnyRecord }) {
   }
   const status = daily.dateStatus || {};
   if (!daily.requestedDate || (status.isTradingDate !== false && status.hasSignal !== false)) return null;
-  const text = daily.rule || "当前日期没有符合策略的候选。";
+  const strategyLabel = daily.dataStrategy?.shortLabel || daily.dataStrategy?.label || "当前策略";
+  const text =
+    status.isTradingDate === false
+      ? "当前日期不是交易日，已按交易日历切换到可用日期。"
+      : `${strategyLabel} 在 ${daily.selectedDate || daily.requestedDate} 没有命中候选；这不代表其他策略没有信号，可以在顶部“策略”下拉切换热门确认、早期发现等策略查看。当前规则：${daily.rule || "当前日期没有符合策略的候选。"}`;
   return <Alert color={status.isTradingDate === false ? "blue" : "yellow"} icon={<IconAlertTriangle size={18} />}>{text}</Alert>;
 }
 
@@ -1314,6 +1337,8 @@ export function App() {
         setStrict={setStrict}
         source={source}
         setSource={changeSource}
+        strategy={strategy}
+        setStrategy={changeStrategy}
         moveDate={moveDate}
         refresh={refreshAll}
         loading={loading}
