@@ -416,6 +416,9 @@ function AppShellHeader({
   refresh,
   loading,
 }: AnyRecord) {
+  const coverageStart = overview?.computedMinDate || overview?.tradingMinDate || overview?.minDate;
+  const coverageEnd = overview?.computedMaxDate || overview?.tradingMaxDate || overview?.maxDate;
+
   return (
     <header className="topbar">
       <Group gap="md" className="brandGroup">
@@ -433,8 +436,8 @@ function AppShellHeader({
           label="信号日期"
           type="date"
           value={date}
-          min={overview?.tradingMinDate || overview?.minDate || undefined}
-          max={overview?.tradingMaxDate || overview?.maxDate || undefined}
+          min={coverageStart || undefined}
+          max={coverageEnd || undefined}
           onChange={(event) => setDate(event.currentTarget.value)}
           className="dateInput"
         />
@@ -444,7 +447,7 @@ function AppShellHeader({
               <IconArrowLeft size={16} />
             </Button>
           </Tooltip>
-          <Button variant="default" onClick={() => setDate((daily?.availableDates || []).at(-1) || overview?.maxDate || date)} disabled={loading}>
+          <Button variant="default" onClick={() => setDate(coverageEnd || (daily?.availableDates || []).at(-1) || date)} disabled={loading}>
             最新
           </Button>
           <Tooltip label="下一交易日">
@@ -480,7 +483,7 @@ function AppShellHeader({
         </Badge>
         <FreshnessBadges daily={daily} />
         <Badge size="lg" variant="default">
-          {overview?.minDate && overview?.maxDate ? `${overview.minDate} 至 ${overview.maxDate}` : "待积累"}
+          {coverageStart && coverageEnd ? `${coverageStart} 至 ${coverageEnd}` : "待积累"}
         </Badge>
       </Group>
     </header>

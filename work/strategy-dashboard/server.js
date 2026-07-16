@@ -3082,6 +3082,60 @@ function maxIsoTimestamp(...values) {
   return new Date(Math.max(...timestamps)).toISOString();
 }
 
+function syncRunCoverageDate(row) {
+  const details = row?.details && typeof row.details === "object" ? row.details : {};
+  const params = details.params && typeof details.params === "object" ? details.params : {};
+  return (
+    normalizeDate(details.generatedDate) ||
+    normalizeDate(details.targetDate) ||
+    normalizeDate(details.date) ||
+    normalizeDate(params.targetDate) ||
+    normalizeDate(params.actualDate) ||
+    dateFromYmd(params.requestedYmd) ||
+    dateFromYmd(params.actualYmd)
+  );
+}
+
+async function computedDataCoverageDates(sourceKey) {
+  if (!shouldUseDatabase(sourceKey)) return [];
+  const featureJobName = sourceKey === "ths" ? THS_FEATURE_JOB : DAILY_SIGNAL_JOB;
+  try {
+    const [featureRows, runRows] = await Promise.all([
+      getDbPool().query(
+        `
+          select distinct signal_date::text as date
+          from strategy_feature_events
+          where source = $1
+            and feature_set = $2
+          order by date asc
+        `,
+        [sourceKey, FEATURE_SET],
+      ),
+      getDbPool().query(
+        `
+          select status, details
+          from sync_runs
+          where job_name = $1
+            and finished_at is not null
+            and status in ('success', 'partial', 'empty')
+          order by finished_at asc
+        `,
+        [featureJobName],
+      ),
+    ]);
+    return [
+      ...new Set(
+        [
+          ...featureRows.rows.map((row) => normalizeDate(row.date)),
+          ...runRows.rows.map(syncRunCoverageDate),
+        ].filter(Boolean),
+      ),
+    ].sort();
+  } catch {
+    return [];
+  }
+}
+
 async function dailyFreshness({ sourceKey, selectedDate }) {
   if (!process.env.DATABASE_URL || !selectedDate) return null;
   const jobs = sourceKey === "ths" ? [THS_SYNC_JOB, THS_FEATURE_JOB, DAILY_SYNC_JOB] : [DAILY_SIGNAL_JOB, DAILY_SYNC_JOB];
@@ -3204,10 +3258,12 @@ async function dailyPayload(query) {
   const data = await loadDataForSource(query.source, strategyKey, { temporaryStrategy });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
+  const coverageDates = await computedDataCoverageDates(data.sourceKey);
+  const navigationDates = coverageDates.length ? coverageDates : signalDates;
   const map = strict ? data.byDate : data.allByDate;
   const normalizedRequestedDate = normalizeDate(query.date);
-  const requestedDate = normalizedRequestedDate || signalDates[signalDates.length - 1] || null;
-  const tradingDates = displayDateRange(signalDates, requestedDate);
+  const requestedDate = normalizedRequestedDate || navigationDates[navigationDates.length - 1] || signalDates[signalDates.length - 1] || null;
+  const tradingDates = displayDateRange(navigationDates, requestedDate);
   const isTradingDate = !requestedDate || !tradingDates.length || tradingDates.includes(requestedDate);
   const selectedDate = !requestedDate
     ? tradingDates[tradingDates.length - 1] || signalDates[signalDates.length - 1] || null
@@ -3242,6 +3298,7 @@ async function dailyPayload(query) {
     strict,
     availableDates: tradingDates,
     signalDates,
+    computedDates: coverageDates,
     tradingDates,
     dateStatus: dateStatus(normalizedRequestedDate, selectedDate, tradingDates, signalDates),
     source: data.dataSource.description,
@@ -3260,7 +3317,8 @@ async function timelinePayload(query) {
   const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
-  const dates = displayDateRange(signalDates, query.date);
+  const coverageDates = await computedDataCoverageDates(data.sourceKey);
+  const dates = displayDateRange(coverageDates.length ? coverageDates : signalDates, query.date);
   const map = strict ? data.byDate : data.allByDate;
   return dates.map((date) => {
     const events = map.get(date) || [];
@@ -3279,9 +3337,13 @@ async function overviewPayload(query = {}) {
   const strategies = await availableStrategiesForSource(data.sourceKey);
   const availableStrategies = [...strategies.builtIn, ...strategies.custom];
   if (temporaryStrategy) availableStrategies.unshift(customStrategyDescriptor(temporaryStrategy));
-  const tradingDates = readTradingCalendar().filter(
-    (date) => date >= (data.dates[0] || date) && date <= (data.dates[data.dates.length - 1] || date),
-  );
+  const coverageDates = await computedDataCoverageDates(data.sourceKey);
+  const displayDates = coverageDates.length ? coverageDates : data.dates;
+  const tradingDates = displayDateRange(displayDates);
+  const hitMinDate = data.dates[0] || null;
+  const hitMaxDate = data.dates[data.dates.length - 1] || null;
+  const computedMinDate = coverageDates[0] || null;
+  const computedMaxDate = coverageDates[coverageDates.length - 1] || null;
   return {
     generatedAt: data.generatedAt,
     sourceFile: data.sourceFile,
@@ -3295,8 +3357,13 @@ async function overviewPayload(query = {}) {
     strictCount: data.strictEvents.length,
     rawCount: data.events.length,
     dateCount: data.dates.length,
-    minDate: data.dates[0] || null,
-    maxDate: data.dates[data.dates.length - 1] || null,
+    hitMinDate,
+    hitMaxDate,
+    computedDateCount: coverageDates.length,
+    computedMinDate,
+    computedMaxDate,
+    minDate: computedMinDate || hitMinDate,
+    maxDate: computedMaxDate || hitMaxDate,
     tradingDateCount: tradingDates.length,
     tradingMinDate: tradingDates[0] || null,
     tradingMaxDate: tradingDates[tradingDates.length - 1] || null,
