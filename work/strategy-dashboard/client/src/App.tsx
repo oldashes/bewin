@@ -490,7 +490,7 @@ function AppShellHeader({
           onChange={(event) => setDate(event.currentTarget.value)}
           className="dateInput"
         />
-        <Button.Group>
+        <Button.Group className="navControls">
           <Tooltip label="上一交易日">
             <Button variant="default" px="sm" onClick={() => moveDate(-1)} disabled={loading}>
               <IconArrowLeft size={16} />
@@ -520,7 +520,7 @@ function AppShellHeader({
           value={strategy}
           onChange={(value) => value && setStrategy(value)}
           data={strategyOptions}
-          className="sourceSelect"
+          className="sourceSelect strategySelect"
         />
         <Checkbox
           checked={strict}
@@ -528,7 +528,7 @@ function AppShellHeader({
           label="过滤伪板块"
           className="strictToggle"
         />
-        <ActionIcon size={38} variant="light" onClick={refresh} loading={loading} aria-label="刷新">
+        <ActionIcon size={38} variant="light" onClick={refresh} loading={loading} aria-label="刷新" className="refreshControl">
           <IconRefresh size={18} />
         </ActionIcon>
       </Group>
@@ -566,7 +566,7 @@ function Metrics({ daily }: { daily?: AnyRecord }) {
   const stats = daily?.stats || {};
   const signal = daily?.signalStats || {};
   return (
-    <SimpleGrid cols={{ base: 1, xs: 2, md: 4 }} spacing="md">
+    <SimpleGrid cols={{ base: 2, md: 4 }} spacing="md">
       <MetricCard
         title="候选股票"
         help="当前信号日下，满足策略并通过伪板块过滤的股票数量。"
@@ -600,12 +600,62 @@ function DateBanner({ daily }: { daily?: AnyRecord }) {
   return <Alert color={status.isTradingDate === false ? "blue" : "yellow"} icon={<IconAlertTriangle size={18} />}>{text}</Alert>;
 }
 
+function StockMobileCard({ stock, onVerify }: { stock: AnyRecord; onVerify: (code: string, date: string) => void }) {
+  const strength = stock.signalStrength;
+  const risks = [...(stock.riskTags || []), ...(stock.riskFlags || [])];
+  return (
+    <Paper className="mobileStockCard" p="md" radius="md" withBorder>
+      <Group justify="space-between" align="flex-start" wrap="nowrap">
+        <Box miw={0}>
+          <Group gap={6} wrap="nowrap">
+            <Text component="a" href={quoteUrl(stock)} target="_blank" rel="noreferrer" fw={900} className="linkText" truncate>
+              {stock.name}
+            </Text>
+            <IconExternalLink size={14} />
+          </Group>
+          <Text size="xs" c="dimmed">{stock.code} · {stock.source} · 强度 {strength?.score ?? Math.round(stock.modelScore ?? stock.score ?? 0)}</Text>
+        </Box>
+        <Button size="xs" variant="filled" color="blue" className="verifyActionButton" onClick={() => onVerify(stock.code, stock.signalDate)}>
+          验证
+        </Button>
+      </Group>
+
+      <Stack gap={8} mt="sm">
+        <Chips items={stock.signalInsight?.tags || []} limit={4} />
+        <Chips items={stock.meta?.tags || []} limit={4} />
+      </Stack>
+
+      <SimpleGrid cols={2} spacing="xs" mt="md" className="mobileMetricGrid">
+        <Box><Text c="dimmed" size="xs">人气 / 20日前</Text><Text fw={900}>{stock.rank ?? "-"} / {stock.rank20 ?? "-"}</Text></Box>
+        <Box><Text c="dimmed" size="xs">量能</Text><Text fw={900}>{number(stock.amountRatio)}x</Text></Box>
+        <Box><Text c="dimmed" size="xs">板块</Text><Text fw={800}>{stock.bestBoardName || "-"}</Text></Box>
+        <Box><Text c="dimmed" size="xs">板块5日</Text><ToneText value={stock.bestBoardRet5} /></Box>
+        <Box><Text c="dimmed" size="xs">5日</Text><ToneText value={stock.ret5} /></Box>
+        <Box><Text c="dimmed" size="xs">20日</Text><ToneText value={stock.ret20} /></Box>
+      </SimpleGrid>
+
+      {risks.length ? (
+        <Box mt="sm">
+          <Text c="dimmed" size="xs" mb={4}>风险提示</Text>
+          <Chips items={risks} limit={4} />
+        </Box>
+      ) : null}
+    </Paper>
+  );
+}
+
 function StockTable({ stocks, onVerify }: { stocks: AnyRecord[]; onVerify: (code: string, date: string) => void }) {
   if (!stocks.length) {
     return <EmptyState text="这一天没有符合当前过滤条件的候选。" />;
   }
   return (
-    <ScrollArea type="auto" offsetScrollbars>
+    <>
+      <Stack className="mobileStockCards" gap="sm">
+        {stocks.map((stock) => (
+          <StockMobileCard key={`${stock.signalDate}-${stock.code}-${stock.bestBoardName}-mobile`} stock={stock} onVerify={onVerify} />
+        ))}
+      </Stack>
+      <ScrollArea type="auto" offsetScrollbars className="desktopStockTable">
       <Table miw={1380} verticalSpacing="md" className="stockTable">
         <colgroup>
           <col className="stockCol" />
@@ -683,7 +733,8 @@ function StockTable({ stocks, onVerify }: { stocks: AnyRecord[]; onVerify: (code
           })}
         </Table.Tbody>
       </Table>
-    </ScrollArea>
+      </ScrollArea>
+    </>
   );
 }
 
