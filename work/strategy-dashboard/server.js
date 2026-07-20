@@ -22,19 +22,19 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
 const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2025-08-01";
 const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
-const DEFAULT_SYNC_MAX_STOCKS = 60;
+const DEFAULT_SYNC_MAX_STOCKS = 160;
 const DEFAULT_SYNC_CONCURRENCY = 4;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
 const THS_FEATURE_JOB = "ths-feature-generate";
 const DAILY_SIGNAL_JOB = "daily-signal-generate";
-const DEFAULT_THS_WATCHLIST_MAX = 20;
-const DEFAULT_SIGNAL_MAX_UNIVERSE = 80;
+const DEFAULT_THS_WATCHLIST_MAX = 80;
+const DEFAULT_SIGNAL_MAX_UNIVERSE = 240;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 6;
 const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
-const DEFAULT_CRON_TIME_BUDGET_MS = 45000;
+const DEFAULT_CRON_TIME_BUDGET_MS = 55000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
 const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
 const MARKET_INDEX = {
@@ -581,6 +581,68 @@ function chinaDateYmd(date = new Date()) {
   })
     .format(date)
     .replaceAll("-", "");
+}
+
+function shiftYmd(ymd, days) {
+  const date = dateFromYmd(ymd);
+  if (!date) return ymd;
+  const value = new Date(`${date}T00:00:00+08:00`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return chinaDateYmd(value);
+}
+
+function chinaClockParts(date = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Shanghai",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    })
+      .formatToParts(date)
+      .map((part) => [part.type, part.value]),
+  );
+  const hour = Number(parts.hour);
+  return {
+    hour: hour === 24 ? 0 : hour,
+    minute: Number(parts.minute) || 0,
+  };
+}
+
+function defaultCompletedMarketYmd(date = new Date()) {
+  const ymd = chinaDateYmd(date);
+  const { hour } = chinaClockParts(date);
+  return hour < 16 ? shiftYmd(ymd, -1) : ymd;
+}
+
+async function resolveMarketTargetDate(rawDate, sourceKey = null) {
+  const explicitDate = normalizeDate(rawDate);
+  if (explicitDate) return explicitDate;
+  const candidateDate = dateFromYmd(defaultCompletedMarketYmd());
+  if (!process.env.DATABASE_URL) return candidateDate;
+
+  try {
+    const { rows } = await getDbPool().query(
+      `
+        select max(day)::text as date
+        from (
+          select trade_date as day
+          from stock_daily_bars
+          where trade_date <= $1::date
+          union all
+          select snapshot_date as day
+          from popularity_snapshots
+          where snapshot_date <= $1::date
+            and category = 'stock'
+            and ($2::text is null or source = $2)
+        ) d
+      `,
+      [candidateDate, sourceKey || null],
+    );
+    return normalizeDate(rows[0]?.date) || candidateDate;
+  } catch {
+    return candidateDate;
+  }
 }
 
 function chinaMinuteKey(date = new Date()) {
@@ -3517,6 +3579,7 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       finishedAt: isoTimestamp(row.finished_at),
       selectedCount: Number(row.selected_count) || 0,
       successCount: Number(row.success_count) || 0,
+      staleCount: Number(row.details?.staleCount) || 0,
       failedCount: Number(row.failed_count) || 0,
       error: row.error || null,
       details: row.details && typeof row.details === "object" ? row.details : null,
@@ -3564,6 +3627,103 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       updatedAt: null,
       error: error.message,
     };
+  }
+}
+
+async function strategyParamsForDiagnostics(sourceKey, strategyKey, temporaryStrategy) {
+  if (temporaryStrategy) return normalizeStrategyParams(temporaryStrategy.params || {}, temporaryStrategy.baseStrategy || "early");
+  if (isCustomStrategyKey(strategyKey)) {
+    const config = await getStrategyConfig(customStrategyId(strategyKey), sourceKey);
+    if (config) return normalizeStrategyParams(config.params || {}, "early");
+  }
+  const baseKey = STRATEGIES[strategyKey] ? strategyKey : "early";
+  return normalizeStrategyParams(STRATEGY_PARAM_DEFAULTS[baseKey] || STRATEGY_PARAM_DEFAULTS.early, baseKey);
+}
+
+function featureRowsFilterDiagnostics(rows, params, strategyKey) {
+  const steps = [];
+  let current = rows;
+  const addStep = (key, label, predicate) => {
+    current = current.filter(predicate);
+    steps.push({ key, label, count: current.length });
+  };
+
+  steps.push({ key: "features", label: "特征池", count: current.length });
+  addStep("rank", `人气 ${params.rankMin}-${params.rankMax}`, (row) => {
+    const rank = n(row.rank);
+    return Number.isFinite(rank) && rank >= params.rankMin && rank <= params.rankMax;
+  });
+  addStep("rankDelta20", `20日前上移 ≥${params.rankDelta20Min}`, (row) => {
+    const delta = n(row.rank_delta_20) ?? (Number.isFinite(n(row.rank_20)) && Number.isFinite(n(row.rank)) ? n(row.rank_20) - n(row.rank) : null);
+    return Number.isFinite(delta) && delta >= params.rankDelta20Min;
+  });
+  addStep("amountRatio", `个股量能 ${params.amountRatioMin}-${params.amountRatioMax}`, (row) => {
+    const value = n(row.amount_ratio);
+    return Number.isFinite(value) && value >= params.amountRatioMin && value <= params.amountRatioMax;
+  });
+  addStep("stockPrev5", `个股5日 ${percentRule(params.stockPrev5MinPct)}-${percentRule(params.stockPrev5MaxPct)}`, (row) => {
+    const value = n(row.prev_5);
+    return Number.isFinite(value) && value >= params.stockPrev5MinPct / 100 && value <= params.stockPrev5MaxPct / 100;
+  });
+  addStep("boardRet5", `板块5日 ${percentRule(params.boardRet5MinPct)}-${percentRule(params.boardRet5MaxPct)}`, (row) => {
+    if (params.boardRet5MinPct <= -100 && params.boardRet5MaxPct >= 300) return true;
+    const value = n(row.best_board_ret_5);
+    return Number.isFinite(value) && value >= params.boardRet5MinPct / 100 && value <= params.boardRet5MaxPct / 100;
+  });
+  addStep("boardAmount", `板块量能 ${params.boardAmountRatioMin}-${params.boardAmountRatioMax}`, (row) => {
+    if (params.boardAmountRatioMin <= 0 && params.boardAmountRatioMax >= 20) return true;
+    const value = n(row.best_board_amount_ratio);
+    return Number.isFinite(value) && value >= params.boardAmountRatioMin && value <= params.boardAmountRatioMax;
+  });
+  if (params.requireStrongBoard) {
+    addStep("strongBoard", "强板块", (row) => row.has_strong_board === true || row.has_strong_industry === true || row.has_strong_concept === true);
+  }
+  if (params.requireResonance) {
+    addStep("resonance", "个股板块共振", (row) => {
+      const event = featureRowToEvent(row, { key: strategyKey, params });
+      return Boolean(event && isResonanceEvent(event));
+    });
+  }
+
+  return steps;
+}
+
+async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate, temporaryStrategy }) {
+  if (!process.env.DATABASE_URL || !selectedDate) return null;
+  try {
+    const params = await strategyParamsForDiagnostics(sourceKey, strategyKey, temporaryStrategy);
+    const { rows } = await getDbPool().query(
+      `
+        select *
+        from strategy_feature_events
+        where source = $1
+          and feature_set = $2
+          and signal_date = $3::date
+      `,
+      [sourceKey, FEATURE_SET, selectedDate],
+    );
+    const steps = featureRowsFilterDiagnostics(rows, params, strategyKey);
+    const finalCount = steps.at(-1)?.count || 0;
+    const bottleneck =
+      steps
+        .slice(1)
+        .map((step, index) => {
+          const previous = steps[index].count;
+          return { ...step, previous, dropped: Math.max(0, previous - step.count) };
+        })
+        .filter((step) => step.dropped > 0)
+        .sort((a, b) => b.dropped - a.dropped || a.count - b.count)[0] || null;
+    return {
+      selectedDate,
+      sourceKey,
+      strategyKey,
+      params,
+      finalCount,
+      steps,
+      bottleneck,
+    };
+  } catch (error) {
+    return { selectedDate, sourceKey, strategyKey, error: error.message, steps: [] };
   }
 }
 
@@ -3619,7 +3779,10 @@ async function dailyPayload(query) {
       { daySignalCount: events.length },
     ),
   );
-  const freshness = await dailyFreshness({ sourceKey: data.sourceKey, selectedDate });
+  const [freshness, diagnostics] = await Promise.all([
+    dailyFreshness({ sourceKey: data.sourceKey, selectedDate }),
+    strategyDiagnosticsForDate({ sourceKey: data.sourceKey, strategyKey, selectedDate, temporaryStrategy }),
+  ]);
   return {
     selectedDate,
     requestedDate: normalizedRequestedDate,
@@ -3636,6 +3799,7 @@ async function dailyPayload(query) {
     dataStrategy: data.dataSource.strategy,
     rule: data.dataSource.strategy?.rule || STRATEGIES.early.rule,
     freshness,
+    diagnostics,
     stats: summarize(displayEvents),
     signalStats: summarizeSignals(displayEvents),
     boards: aggregateBoards(displayEvents),
@@ -4035,17 +4199,21 @@ async function fetchIfindKlineRow(stock, date) {
 
 async function fetchIfindKlineRange(stock, fromDate, toDate) {
   if (!process.env.IFIND_REFRESH_TOKEN) return [];
+  await getIfindAccessToken();
   const dates = weekdayDatesBetween(fromDate, toDate);
   const rows = [];
+  let firstError = null;
   for (const date of dates) {
     try {
       rows.push(await fetchIfindKlineRow(stock, date));
-    } catch {
+    } catch (error) {
+      firstError ||= error;
       // Non-trading days or incomplete iFind responses are skipped.
     }
     await sleep(80);
   }
   if (rows.length && shouldUseDatabase("em")) await saveKlineToDb(stock, rows, "ifind");
+  if (!rows.length && firstError) throw firstError;
   return rows;
 }
 
@@ -4068,11 +4236,63 @@ async function fetchKlineWithIfindFallback(stock, fromDate, toDate = dateFromYmd
     const latestDate = latestKlineDate(primaryRows);
     const needsSupplement = normalizedFromDate && normalizedToDate && (!rowsContainDate(primaryRows, normalizedFromDate) || (latestDate && latestDate < normalizedToDate));
     if (!needsSupplement) return primaryRows;
-    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch(() => []);
-    return fallbackRows.length ? mergeKlineRows(primaryRows, fallbackRows) : primaryRows;
+    let fallbackError = null;
+    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch((fallbackFetchError) => {
+      fallbackError = fallbackFetchError;
+      return [];
+    });
+    if (fallbackRows.length) return mergeKlineRows(primaryRows, fallbackRows);
+    if (fallbackError) {
+      throw new Error(`K线最新日期 ${latestDate || "未知"}，未补到 ${normalizedToDate}；iFind fallback failed: ${fallbackError.message}`);
+    }
+    return primaryRows;
   } catch (error) {
-    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch(() => []);
+    let fallbackError = null;
+    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch((fallbackFetchError) => {
+      fallbackError = fallbackFetchError;
+      return [];
+    });
     if (fallbackRows.length) return fallbackRows;
+    if (fallbackError) {
+      throw new Error(`${error.message}; iFind fallback failed: ${fallbackError.message}`);
+    }
+    throw error;
+  }
+}
+
+async function loadCachedKlineRows(stock) {
+  let rows = [];
+  if (shouldUseDatabase("em")) {
+    try {
+      rows = mergeKlineRows(rows, await loadKlineFromDb(stock));
+    } catch {
+      // Database/cache fallback is best-effort. The original fetch error remains authoritative.
+    }
+  }
+  if (fs.existsSync(stock.cacheFile)) {
+    try {
+      const cachedRows = JSON.parse(fs.readFileSync(stock.cacheFile, "utf8"));
+      if (Array.isArray(cachedRows)) rows = mergeKlineRows(rows, cachedRows);
+    } catch {
+      // Ignore a broken local cache.
+    }
+  }
+  return rows;
+}
+
+async function loadBestAvailableKlineForSync(stock, fromDate, toDate) {
+  try {
+    const rows = await fetchKlineWithIfindFallback(stock, fromDate, toDate);
+    return { rows, refreshError: null, usedCacheFallback: false };
+  } catch (error) {
+    const rows = await loadCachedKlineRows(stock);
+    if (rows.length) {
+      return {
+        rows,
+        refreshError: error.message,
+        usedCacheFallback: true,
+      };
+    }
     throw error;
   }
 }
@@ -4621,7 +4841,7 @@ async function finishSyncRun(runId, status, summary, errorMessage = null) {
   );
 }
 
-async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, maxStocks, force }) {
+async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, maxStocks, force, targetDate }) {
   const { rows } = await getDbPool().query(
     `
       with source_scope as (
@@ -4732,7 +4952,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
       where $5::boolean
          or lb.latest_bar_updated_at is null
          or lb.latest_bar_date is null
-         or lb.latest_bar_date < d.latest_signal_date
+         or lb.latest_bar_date < greatest(d.latest_signal_date, $7::date)
          or lb.latest_bar_updated_at < now() - interval '18 hours'
       order by
         d.priority asc,
@@ -4743,7 +4963,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
         d.signal_count desc
       limit $2::int
     `,
-    [lookbackDays, maxStocks, sourceKey, strategyKey || null, Boolean(force), FEATURE_SET],
+    [lookbackDays, maxStocks, sourceKey, strategyKey || null, Boolean(force), FEATURE_SET, targetDate],
   );
 
   return rows.map((row) => ({
@@ -4772,8 +4992,63 @@ async function mapLimit(items, limit, worker) {
   return results;
 }
 
-async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
-  const { rows } = await getDbPool().query(
+function dailyUniversePriority(item) {
+  if (item.source === "eastmoney-top100") return 0;
+  if (
+    item.source === "recent-rank-snapshot" &&
+    Number.isFinite(item.currentRank) &&
+    item.currentRank >= STRATEGY_PARAM_DEFAULTS.early.rankMin &&
+    item.currentRank <= STRATEGY_PARAM_DEFAULTS.early.rankMax
+  ) {
+    return 1;
+  }
+  if (item.source === "recent-rank-snapshot") return 2;
+  return 3;
+}
+
+function mergeDailyUniverseItem(byCode, incoming) {
+  if (!incoming?.code) return;
+  const next = {
+    ...incoming,
+    name: incoming.name || incoming.code,
+    concepts: normalizeConceptList(incoming.concepts),
+    listingDate: normalizeDate(incoming.listingDate) || null,
+  };
+  next.universePriority = dailyUniversePriority(next);
+  const existing = byCode.get(next.code);
+  if (!existing) {
+    byCode.set(next.code, next);
+    return;
+  }
+
+  if (next.universePriority < (existing.universePriority ?? dailyUniversePriority(existing))) {
+    existing.source = next.source;
+    existing.universePriority = next.universePriority;
+    existing.currentRank = next.currentRank ?? existing.currentRank ?? null;
+  } else if (!Number.isFinite(existing.currentRank) && Number.isFinite(next.currentRank)) {
+    existing.currentRank = next.currentRank;
+  }
+
+  for (const key of ["name", "bestBoardType", "bestBoardCode", "bestBoardName", "exchange", "board", "industry", "region"]) {
+    if (!existing[key] && next[key]) existing[key] = next[key];
+  }
+  if (!existing.concepts?.length && next.concepts?.length) existing.concepts = next.concepts;
+  if (!existing.listingDate && next.listingDate) existing.listingDate = next.listingDate;
+}
+
+function universeSourceCounts(items) {
+  return items.reduce((acc, item) => {
+    const key = item.source || "unknown";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+}
+
+async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax }) {
+  const historicalLimit = Math.max(maxUniverse * 2, 500);
+  const snapshotLimit = Math.max(maxUniverse * 4, 800);
+  const [historicalResult, snapshotResult] = await Promise.all([
+    getDbPool().query(
     `
       with universe as (
         select
@@ -4822,12 +5097,98 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
       order by signal_date desc nulls last, code asc
       limit $3::int
     `,
-    [sourceKey, FEATURE_SET, maxUniverse],
-  );
+      [sourceKey, FEATURE_SET, historicalLimit],
+    ),
+    getDbPool().query(
+      `
+        with latest as (
+          select
+            p.*,
+            st.exchange,
+            st.board,
+            st.industry,
+            st.region,
+            st.concepts,
+            st.listing_date,
+            row_number() over (
+              partition by p.code
+              order by p.snapshot_date desc, p.snapshot_key desc
+            ) as rn
+          from popularity_snapshots p
+          left join stocks st on st.code = p.code
+          where p.source = $1
+            and p.category = 'stock'
+            and p.metric = 'rank'
+            and p.rank between 1 and $2
+            and p.code ~ '^[036][0-9]{5}$'
+        )
+        select
+          code,
+          coalesce(nullif(trim(name), ''), code) as name,
+          snapshot_date::text as signal_date,
+          rank::int as current_rank,
+          exchange,
+          board,
+          industry,
+          region,
+          concepts,
+          listing_date
+        from latest
+        where rn = 1
+        order by
+          case
+            when rank between $3 and $4 then 0
+            when rank > 100 then 1
+            else 2
+          end,
+          snapshot_date desc,
+          rank asc
+        limit $5::int
+      `,
+      [sourceKey, rankMax || DEFAULT_SIGNAL_RANK_MAX, STRATEGY_PARAM_DEFAULTS.early.rankMin, STRATEGY_PARAM_DEFAULTS.early.rankMax, snapshotLimit],
+    ),
+  ]);
 
   const byCode = new Map();
-  for (const row of rows) {
-    byCode.set(row.code, {
+
+  for (const item of topRanks || []) {
+    mergeDailyUniverseItem(byCode, {
+      code: item.code,
+      name: item.code,
+      bestBoardType: "",
+      bestBoardCode: "",
+      bestBoardName: "",
+      exchange: item.code.startsWith("6") ? "SH" : "SZ",
+      board: null,
+      industry: null,
+      region: null,
+      concepts: [],
+      listingDate: null,
+      currentRank: n(item.rank),
+      source: "eastmoney-top100",
+    });
+  }
+
+  for (const row of snapshotResult.rows) {
+    mergeDailyUniverseItem(byCode, {
+      code: row.code,
+      name: row.name || row.code,
+      bestBoardType: row.industry ? "industry" : row.board ? "concept" : "",
+      bestBoardCode: "",
+      bestBoardName: row.industry || row.board || "",
+      exchange: row.exchange || null,
+      board: row.board || null,
+      industry: row.industry || null,
+      region: row.region || null,
+      concepts: normalizeConceptList(row.concepts),
+      listingDate: normalizeDate(row.listing_date) || null,
+      currentRank: n(row.current_rank),
+      source: "recent-rank-snapshot",
+    });
+  }
+
+  for (const row of historicalResult.rows) {
+    mergeDailyUniverseItem(byCode, {
       code: row.code,
       name: row.name || row.code,
       bestBoardType: row.best_board_type || (row.industry ? "industry" : "concept"),
@@ -4840,24 +5201,6 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
       concepts: normalizeConceptList(row.concepts),
       listingDate: normalizeDate(row.listing_date) || null,
       source: "historical-feature-universe",
-    });
-  }
-
-  for (const item of topRanks || []) {
-    if (byCode.has(item.code)) continue;
-    byCode.set(item.code, {
-      code: item.code,
-      name: item.code,
-      bestBoardType: "",
-      bestBoardCode: "",
-      bestBoardName: "",
-      exchange: item.code.startsWith("6") ? "SH" : "SZ",
-      board: null,
-      industry: null,
-      region: null,
-      concepts: [],
-      listingDate: null,
-      source: "eastmoney-top100",
     });
   }
 
@@ -4938,9 +5281,13 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks }) {
     }
   }
 
-  const topRankCodes = new Set((topRanks || []).map((item) => item.code).filter(Boolean));
   return [...byCode.values()]
-    .sort((a, b) => Number(topRankCodes.has(b.code)) - Number(topRankCodes.has(a.code)))
+    .sort(
+      (a, b) =>
+        (a.universePriority ?? dailyUniversePriority(a)) - (b.universePriority ?? dailyUniversePriority(b)) ||
+        (a.currentRank ?? 999999) - (b.currentRank ?? 999999) ||
+        String(a.code).localeCompare(String(b.code)),
+    )
     .slice(0, maxUniverse);
 }
 
@@ -5021,14 +5368,15 @@ async function runDailySignalGeneration(options = {}) {
     throw error;
   }
 
-  const requestedYmd = normalizeYmd(options.date);
-  const targetDate = dateFromYmd(requestedYmd);
-  const maxUniverse = boundedInteger(
+  const targetDate = await resolveMarketTargetDate(options.date, sourceKey);
+  const requestedYmd = targetDate.replaceAll("-", "");
+  const configuredMaxUniverse = boundedInteger(
     options.maxUniverse ?? process.env.SIGNAL_MAX_UNIVERSE,
     DEFAULT_SIGNAL_MAX_UNIVERSE,
     1,
     2000,
   );
+  const maxUniverse = options.maxUniverse === undefined ? Math.max(configuredMaxUniverse, DEFAULT_SIGNAL_MAX_UNIVERSE) : configuredMaxUniverse;
   const rankMax = boundedInteger(options.rankMax ?? process.env.SIGNAL_RANK_MAX, DEFAULT_SIGNAL_RANK_MAX, 1, 5000);
   const concurrency = boundedInteger(
     options.concurrency ?? process.env.SIGNAL_CONCURRENCY,
@@ -5052,7 +5400,8 @@ async function runDailySignalGeneration(options = {}) {
   const results = [];
   try {
     const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
-    const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks });
+    const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax });
+    const universeSources = universeSourceCounts(universe);
     const histories = [];
     let rankSnapshotCount = 0;
     let savedRankSnapshots = 0;
@@ -5193,6 +5542,7 @@ async function runDailySignalGeneration(options = {}) {
       rankedCandidateCount: rankedCandidates.length,
       featureCount: featureRecords.length,
       generatedDate: targetDate,
+      universeSources,
       processedUniverseCount: histories.length,
       remainingUniverseCount: Math.max(0, universe.length - histories.length),
       stoppedByTimeBudget,
@@ -5267,12 +5617,13 @@ async function runDailyKlineSync(options = {}) {
     1,
     365,
   );
-  const maxStocks = boundedInteger(
+  const configuredMaxStocks = boundedInteger(
     options.maxStocks ?? process.env.SYNC_MAX_STOCKS,
     DEFAULT_SYNC_MAX_STOCKS,
     1,
     500,
   );
+  const maxStocks = options.maxStocks === undefined ? Math.max(configuredMaxStocks, DEFAULT_SYNC_MAX_STOCKS) : configuredMaxStocks;
   const concurrency = boundedInteger(
     options.concurrency ?? process.env.SYNC_CONCURRENCY,
     DEFAULT_SYNC_CONCURRENCY,
@@ -5286,7 +5637,7 @@ async function runDailyKlineSync(options = {}) {
     300000,
   );
   const force = options.force === true || options.force === "1" || options.force === "true";
-  const targetDate = dateFromYmd(normalizeYmd(options.date));
+  const targetDate = await resolveMarketTargetDate(options.date, sourceKey);
   const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force, timeBudgetMs, concurrency, targetDate };
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
@@ -5296,6 +5647,7 @@ async function runDailyKlineSync(options = {}) {
   try {
     const candidates = await selectDailySyncStocks(params);
     let successCount = 0;
+    let staleCount = 0;
     let failedCount = 0;
     let stoppedByTimeBudget = false;
 
@@ -5315,15 +5667,17 @@ async function runDailyKlineSync(options = {}) {
         status: "pending",
       };
       try {
-        const rows = await fetchKlineWithIfindFallback(stock, fallbackFromDate, targetDate);
+        const { rows, refreshError, usedCacheFallback } = await loadBestAvailableKlineForSync(stock, fallbackFromDate, targetDate);
         const latestRow = rows[rows.length - 1] || null;
         const hasTargetDate = rowsContainDate(rows, targetDate);
         const usedFallbackOnly = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS;
-        item.status = hasTargetDate ? (usedFallbackOnly ? "synced_fallback" : "synced") : "stale";
+        item.status = hasTargetDate ? (usedFallbackOnly ? "synced_fallback" : usedCacheFallback ? "synced_cached" : "synced") : "stale";
         item.rowCount = rows.length;
         item.latestBarDate = latestRow?.date || null;
         item.targetDate = targetDate;
         item.hasTargetDate = hasTargetDate;
+        item.usedCacheFallback = usedCacheFallback;
+        if (refreshError) item.refreshError = refreshError;
       } catch (error) {
         item.status = "failed";
         item.error = error.message;
@@ -5344,8 +5698,9 @@ async function runDailyKlineSync(options = {}) {
           continue;
         }
         results.push(item);
-        if (item.status === "synced" || item.status === "synced_fallback") successCount += 1;
-        if (item.status === "failed" || item.status === "stale") failedCount += 1;
+        if (item.status === "synced" || item.status === "synced_fallback" || item.status === "synced_cached") successCount += 1;
+        if (item.status === "stale") staleCount += 1;
+        if (item.status === "failed") failedCount += 1;
       }
       if (stoppedByTimeBudget) break;
     }
@@ -5358,12 +5713,13 @@ async function runDailyKlineSync(options = {}) {
       params,
       selectedCount: candidates.length,
       successCount,
+      staleCount,
       failedCount,
       results,
       stoppedByTimeBudget,
       remainingCount: Math.max(0, candidates.length - results.length),
     };
-    const status = stoppedByTimeBudget || failedCount ? (successCount ? "partial" : "failed") : "success";
+    const status = stoppedByTimeBudget || failedCount || staleCount ? (successCount || staleCount ? "partial" : "failed") : "success";
     const errorMessage = stoppedByTimeBudget
       ? "time budget reached before all selected stocks were synced"
       : failedCount && !successCount
@@ -5380,7 +5736,8 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: results.length,
-      successCount: results.filter((item) => item.status === "synced").length,
+      successCount: results.filter((item) => item.status === "synced" || item.status === "synced_fallback" || item.status === "synced_cached").length,
+      staleCount: results.filter((item) => item.status === "stale").length,
       failedCount: results.filter((item) => item.status === "failed").length,
       results,
     };
@@ -5812,19 +6169,22 @@ async function bulkUpsertStocksForSnapshots(records) {
 
 async function runThsPopularitySync(options = {}) {
   requireDatabase();
-  const requestedYmd = normalizeYmd(options.date);
+  const requestedDate = await resolveMarketTargetDate(options.date, "ths");
+  const requestedYmd = requestedDate.replaceAll("-", "");
   const lookbackDays = boundedInteger(
     options.lookbackDays ?? process.env.THS_WATCHLIST_LOOKBACK_DAYS ?? process.env.SYNC_LOOKBACK_DAYS,
     DEFAULT_SYNC_LOOKBACK_DAYS,
     1,
     365,
   );
-  const watchlistMax = boundedInteger(
+  const configuredWatchlistMax = boundedInteger(
     options.watchlistMax ?? process.env.THS_WATCHLIST_MAX,
     DEFAULT_THS_WATCHLIST_MAX,
     0,
     200,
   );
+  const watchlistMax =
+    options.watchlistMax === undefined ? Math.max(configuredWatchlistMax, DEFAULT_THS_WATCHLIST_MAX) : configuredWatchlistMax;
   const includeAttention = options.includeAttention !== false && options.includeAttention !== "false";
   const categories = String(options.categories || process.env.THS_HOT_CATEGORIES || "stock,concept,industry")
     .split(",")
@@ -5925,8 +6285,8 @@ async function runThsPopularitySync(options = {}) {
 
 async function runThsFeatureGeneration(options = {}) {
   requireDatabase();
-  const requestedYmd = normalizeYmd(options.date);
-  const targetDate = dateFromYmd(requestedYmd);
+  const targetDate = await resolveMarketTargetDate(options.date, "ths");
+  const requestedYmd = targetDate.replaceAll("-", "");
   const rankMax = boundedInteger(options.rankMax ?? process.env.IFIND_FEATURE_RANK_MAX, 1600, 1, 5000);
   const minRankDelta20 = Number.isFinite(Number(options.minRankDelta20 ?? process.env.IFIND_FEATURE_MIN_RANK_DELTA_20))
     ? Number(options.minRankDelta20 ?? process.env.IFIND_FEATURE_MIN_RANK_DELTA_20)
@@ -5951,12 +6311,16 @@ async function runThsFeatureGeneration(options = {}) {
     5000,
     300000,
   );
-  const fetchMissingKlineMax = boundedInteger(
+  const configuredFetchMissingKlineMax = boundedInteger(
     options.fetchMissingKlineMax ?? process.env.IFIND_FEATURE_FETCH_MISSING_KLINE_MAX,
     DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
     0,
     200,
   );
+  const fetchMissingKlineMax =
+    options.fetchMissingKlineMax === undefined
+      ? Math.max(configuredFetchMissingKlineMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX)
+      : configuredFetchMissingKlineMax;
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
   const params = {
@@ -6033,7 +6397,7 @@ async function runThsFeatureGeneration(options = {}) {
       )
     : { rows: [] };
   const [klineByCode, donorByKey] = await Promise.all([
-    loadStockDailyBarsForFeatures(codes, targetDate, { fetchMissingMax: fetchMissingKlineMax }),
+    loadStockDailyBarsForFeatures(codes, targetDate, { fetchMissingMax: fetchMissingKlineMax, startedAtMs, timeBudgetMs }),
     loadEmBoardDonorsForFeatures(codes, targetDate),
   ]);
   const historyByCode = new Map();
@@ -6214,10 +6578,14 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   }
 
   const fetchMissingMax = boundedInteger(options.fetchMissingMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX, 0, 200);
+  const startedAtMs = Number(options.startedAtMs) || Date.now();
+  const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
+  const safetyWindowMs = 15000;
   const missingCodes = codes
     .filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate))
     .slice(0, fetchMissingMax);
   for (const code of missingCodes) {
+    if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)) break;
     try {
       const stockRows = await loadKlineForDate(normalizeStock(code), targetDate);
       if (stockRows?.length) byCode.set(code, stockRows);

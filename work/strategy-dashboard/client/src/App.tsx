@@ -397,6 +397,7 @@ function syncJobLabel(jobName: string) {
 
 function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
   const freshness = daily?.freshness || {};
+  const diagnostics = daily?.diagnostics || {};
   const hitCount = daily?.stats?.count ?? 0;
   const computed = Boolean(freshness.computed);
   const computedLabel = daily?.selectedDate ? `${computed ? "已计算" : "未计算"} · ${hitCount} 命中` : "等待日期";
@@ -408,9 +409,14 @@ function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
       <Text size="xs">特征记录：{freshness.featureCount ?? 0} 条 · {formatDateTime(freshness.featureUpdatedAt, true)}</Text>
       <Text size="xs">榜单快照：{freshness.snapshotCount ?? 0} 条 · {formatDateTime(freshness.snapshotUpdatedAt || freshness.snapshotTime, true)}</Text>
       <Text size="xs">K线记录：{freshness.klineCount ?? 0} 条 · {formatDateTime(freshness.klineUpdatedAt, true)}</Text>
+      {Array.isArray(diagnostics.steps) && diagnostics.steps.length ? (
+        <Text size="xs">
+          筛选漏斗：{diagnostics.steps.map((step: AnyRecord) => `${step.label} ${step.count}`).join(" / ")}
+        </Text>
+      ) : null}
       {(freshness.lastSynces || []).slice(0, 3).map((item: AnyRecord) => (
         <Text key={`${item.jobName}-${item.startedAt}`} size="xs">
-          {syncJobLabel(item.jobName)}：{item.status} · {formatDateTime(item.finishedAt || item.startedAt, true)}
+          {syncJobLabel(item.jobName)}：{item.status} · 成功 {item.successCount ?? 0} / 过期 {item.staleCount ?? 0} / 失败 {item.failedCount ?? 0} · {formatDateTime(item.finishedAt || item.startedAt, true)}
         </Text>
       ))}
       {freshness.error ? <Text size="xs" c="red">更新时间读取失败：{freshness.error}</Text> : null}
@@ -593,10 +599,15 @@ function DateBanner({ daily }: { daily?: AnyRecord }) {
   const status = daily.dateStatus || {};
   if (!daily.requestedDate || (status.isTradingDate !== false && status.hasSignal !== false)) return null;
   const strategyLabel = daily.dataStrategy?.shortLabel || daily.dataStrategy?.label || "当前策略";
+  const bottleneck = daily.diagnostics?.bottleneck;
+  const bottleneckText =
+    bottleneck?.label && Number.isFinite(Number(bottleneck.previous))
+      ? `主要卡在：${bottleneck.label}（${bottleneck.previous} -> ${bottleneck.count}）。`
+      : "";
   const text =
     status.isTradingDate === false
       ? "当前日期不是交易日，已按交易日历切换到可用日期。"
-      : `${strategyLabel} 在 ${daily.selectedDate || daily.requestedDate} 没有命中候选；这不代表其他策略没有信号，可以在顶部“策略”下拉切换热门确认、早期发现等策略查看。当前规则：${daily.rule || "当前日期没有符合策略的候选。"}`;
+      : `${strategyLabel} 在 ${daily.selectedDate || daily.requestedDate} 没有命中候选；这不代表其他策略没有信号，可以在顶部“策略”下拉切换热门确认、早期发现等策略查看。${bottleneckText}当前规则：${daily.rule || "当前日期没有符合策略的候选。"}`;
   return <Alert color={status.isTradingDate === false ? "blue" : "yellow"} icon={<IconAlertTriangle size={18} />}>{text}</Alert>;
 }
 
