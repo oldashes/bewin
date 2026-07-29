@@ -400,7 +400,10 @@ function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
   const diagnostics = daily?.diagnostics || {};
   const hitCount = daily?.stats?.count ?? 0;
   const computed = Boolean(freshness.computed);
-  const computedLabel = daily?.selectedDate ? `${computed ? "已计算" : "未计算"} · ${hitCount} 命中` : "等待日期";
+  const dataIssue = freshness.dataIssue;
+  const computedLabel = daily?.selectedDate
+    ? `${dataIssue ? "部分计算" : computed ? "已计算" : "未计算"} · ${hitCount} 命中`
+    : "等待日期";
   const updatedLabel = freshness.updatedAt ? `更新时间 ${formatDateTime(freshness.updatedAt)}` : "更新时间 -";
   const tooltip = (
     <Stack gap={4}>
@@ -409,6 +412,17 @@ function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
       <Text size="xs">特征记录：{freshness.featureCount ?? 0} 条 · {formatDateTime(freshness.featureUpdatedAt, true)}</Text>
       <Text size="xs">榜单快照：{freshness.snapshotCount ?? 0} 条 · {formatDateTime(freshness.snapshotUpdatedAt || freshness.snapshotTime, true)}</Text>
       <Text size="xs">K线记录：{freshness.klineCount ?? 0} 条 · {formatDateTime(freshness.klineUpdatedAt, true)}</Text>
+      {diagnostics.rankCoverage ? (
+        <Text size="xs">
+          特征排名覆盖：{diagnostics.rankCoverage.minRank ?? "-"}-{diagnostics.rankCoverage.maxRank ?? "-"}；规则区间 {diagnostics.rankCoverage.requiredMin ?? "-"}-{diagnostics.rankCoverage.requiredMax ?? "-"} 内 {diagnostics.rankCoverage.inRangeCount ?? 0} 条
+        </Text>
+      ) : null}
+      {dataIssue ? <Text size="xs" c={dataIssue.level === "error" ? "red" : "yellow"}>{dataIssue.message}</Text> : null}
+      {freshness.klineStats ? (
+        <Text size="xs">
+          K线补齐：目标缺 {freshness.klineStats.missingTargetCount ?? 0} · 尝试 {freshness.klineStats.fetchAttempted ?? 0} · 成功 {freshness.klineStats.fetchSucceeded ?? 0} · 失败 {freshness.klineStats.fetchFailed ?? 0}
+        </Text>
+      ) : null}
       {Array.isArray(diagnostics.steps) && diagnostics.steps.length ? (
         <Text size="xs">
           筛选漏斗：{diagnostics.steps.map((step: AnyRecord) => `${step.label} ${step.count}`).join(" / ")}
@@ -426,10 +440,17 @@ function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
   return (
     <>
       <Tooltip label={tooltip} multiline maw={360} withArrow>
-        <Badge size="lg" variant="light" color={computed ? "green" : "yellow"}>
+        <Badge size="lg" variant="light" color={dataIssue?.level === "error" ? "red" : computed ? "green" : "yellow"}>
           {computedLabel}
         </Badge>
       </Tooltip>
+      {dataIssue ? (
+        <Tooltip label={tooltip} multiline maw={360} withArrow>
+          <Badge size="lg" variant="light" color={dataIssue.level === "error" ? "red" : "yellow"}>
+            {dataIssue.level === "error" ? "数据异常" : "覆盖不足"}
+          </Badge>
+        </Tooltip>
+      ) : null}
       <Tooltip label={tooltip} multiline maw={360} withArrow>
         <Badge size="lg" variant="default">
           {updatedLabel}
@@ -597,6 +618,10 @@ function DateBanner({ daily }: { daily?: AnyRecord }) {
     return <Alert color="yellow" icon={<IconAlertTriangle size={18} />}>{daily.dataSource.message || "当前数据源暂无可用历史数据。"}</Alert>;
   }
   const status = daily.dateStatus || {};
+  const dataIssue = daily.freshness?.dataIssue;
+  if (dataIssue) {
+    return <Alert color={dataIssue.level === "error" ? "red" : "yellow"} icon={<IconAlertTriangle size={18} />}>{dataIssue.message}</Alert>;
+  }
   if (!daily.requestedDate || (status.isTradingDate !== false && status.hasSignal !== false)) return null;
   const strategyLabel = daily.dataStrategy?.shortLabel || daily.dataStrategy?.label || "当前策略";
   const bottleneck = daily.diagnostics?.bottleneck;
@@ -765,7 +790,7 @@ function DailyCandidates({ daily, loading, refresh, onVerify }: AnyRecord) {
 }
 
 function TimelinePanel({ rows, selectedDate, setDate }: { rows: AnyRecord[]; selectedDate?: string; setDate: (date: string) => void }) {
-  const visibleRows = rows.filter((row) => (row.count || 0) > 0 || row.date === selectedDate);
+  const visibleRows = rows;
   const maxCount = Math.max(1, ...visibleRows.map((item) => item.count || 0));
   return (
     <Paper className="sidePanel historyPanel" withBorder>

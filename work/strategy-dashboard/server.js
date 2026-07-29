@@ -33,6 +33,8 @@ const DEFAULT_SIGNAL_MAX_UNIVERSE = 240;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 6;
 const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
+const DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX = 32;
+const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX = 80;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const DEFAULT_CRON_TIME_BUDGET_MS = 55000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
@@ -2542,10 +2544,10 @@ async function loadDynamicStrategyData(sourceKey, strategyKey, config, descripto
   if (!process.env.DATABASE_URL) {
     return emptyData(sourceKey, "neon:strategy_feature_events", "动态策略计算需要先连接数据库。");
   }
-  const cacheKey = `${sourceKey}:dynamic:${strategyKey}`;
+  const params = normalizeStrategyParams(config.params || {}, baseKey);
+  const cacheKey = `${sourceKey}:dynamic:${strategyKey}:${simpleHash(JSON.stringify({ baseKey, params }))}`;
   if (cachedDbData.has(cacheKey)) return cachedDbData.get(cacheKey);
 
-  const params = normalizeStrategyParams(config.params || {}, baseKey);
   const { rows } = await getDbPool().query(
     `
       select
@@ -3593,7 +3595,7 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
     const snapshotCount = Number(snapshotRow.count) || 0;
     const klineCount = Number(klineRow.count) || 0;
     const featureJobName = sourceKey === "ths" ? THS_FEATURE_JOB : DAILY_SIGNAL_JOB;
-    const featureRunForDate = lastSynces.find((row) => {
+    const isFeatureRunForSelectedDate = (row) => {
       if (row.jobName !== featureJobName) return false;
       const details = row.details || {};
       const params = details.params || {};
@@ -3602,8 +3604,32 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
         normalizeDate(details.targetDate) ||
         normalizeDate(params.targetDate) ||
         dateFromYmd(params.requestedYmd);
-      return runDate === selectedDate && row.finishedAt && !["running", "failed", "timeout"].includes(row.status);
-    });
+      return runDate === selectedDate;
+    };
+    const latestFeatureRunForDate = lastSynces.find(isFeatureRunForSelectedDate);
+    const featureRunForDate =
+      latestFeatureRunForDate && latestFeatureRunForDate.finishedAt && !["running", "failed", "timeout"].includes(latestFeatureRunForDate.status)
+        ? latestFeatureRunForDate
+        : null;
+    const klineStats =
+      latestFeatureRunForDate?.details?.klineStats && typeof latestFeatureRunForDate.details.klineStats === "object"
+        ? latestFeatureRunForDate.details.klineStats
+        : null;
+    const dataIssue = klineStats?.authError
+      ? {
+          level: "error",
+          code: "kline_auth_error",
+          message: "K线补齐失败：iFind refresh token 已过期或无效，依赖量价特征的候选可能无法完整计算。",
+          detail: klineStats.authError,
+        }
+      : klineStats && Number(klineStats.missingTargetCount) > Number(klineStats.cachedTargetCount || 0) + Number(klineStats.fetchSucceeded || 0)
+        ? {
+            level: "warning",
+            code: "kline_coverage_low",
+            message: "K线目标日覆盖不足，部分候选会被跳过。",
+            detail: `缺 ${klineStats.missingTargetCount}，尝试补 ${klineStats.fetchAttempted || 0}，成功 ${klineStats.fetchSucceeded || 0}`,
+          }
+        : null;
     return {
       sourceKey,
       selectedDate,
@@ -3617,6 +3643,8 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
       klineUpdatedAt,
       klineCount,
       latestSyncFinishedAt,
+      klineStats,
+      dataIssue,
       lastSynces: lastSynces.map(({ details, ...row }) => row),
     };
   } catch (error) {
@@ -3688,6 +3716,27 @@ function featureRowsFilterDiagnostics(rows, params, strategyKey) {
   return steps;
 }
 
+function featureRankCoverage(rows, params) {
+  const ranks = rows
+    .map((row) => n(row.rank))
+    .filter((rank) => Number.isFinite(rank))
+    .sort((a, b) => a - b);
+  const rankMin = Number(params?.rankMin);
+  const rankMax = Number(params?.rankMax);
+  const inRangeCount =
+    Number.isFinite(rankMin) && Number.isFinite(rankMax)
+      ? ranks.filter((rank) => rank >= rankMin && rank <= rankMax).length
+      : 0;
+  return {
+    count: ranks.length,
+    minRank: ranks.length ? ranks[0] : null,
+    maxRank: ranks.length ? ranks[ranks.length - 1] : null,
+    requiredMin: Number.isFinite(rankMin) ? rankMin : null,
+    requiredMax: Number.isFinite(rankMax) ? rankMax : null,
+    inRangeCount,
+  };
+}
+
 async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate, temporaryStrategy }) {
   if (!process.env.DATABASE_URL || !selectedDate) return null;
   try {
@@ -3721,10 +3770,72 @@ async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate
       finalCount,
       steps,
       bottleneck,
+      rankCoverage: featureRankCoverage(rows, params),
     };
   } catch (error) {
     return { selectedDate, sourceKey, strategyKey, error: error.message, steps: [] };
   }
+}
+
+function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
+  const coverage = diagnostics?.rankCoverage;
+  if (!coverage || Number(diagnostics?.finalCount) > 0) return null;
+  const minRank = Number(coverage.minRank);
+  const maxRank = Number(coverage.maxRank);
+  const requiredMin = Number(coverage.requiredMin);
+  const requiredMax = Number(coverage.requiredMax);
+  if (
+    !Number.isFinite(minRank) ||
+    !Number.isFinite(maxRank) ||
+    !Number.isFinite(requiredMin) ||
+    !Number.isFinite(requiredMax) ||
+    Number(coverage.inRangeCount) > 0
+  ) {
+    return null;
+  }
+
+  const sourceLabel = DATA_SOURCES[sourceKey]?.label || sourceKey;
+  const strategyName = strategyLabel || "当前策略";
+  if (maxRank < requiredMin) {
+    return {
+      level: "warning",
+      code: "rank_coverage_too_shallow",
+      message: `${sourceLabel}当前特征池只覆盖到人气排名 ${minRank}-${maxRank}，${strategyName}需要 ${requiredMin}-${requiredMax}，因此无法完整计算早期区间信号。`,
+      detail: `feature rank coverage ${minRank}-${maxRank}; required ${requiredMin}-${requiredMax}`,
+    };
+  }
+  if (minRank > requiredMax) {
+    return {
+      level: "warning",
+      code: "rank_coverage_too_deep",
+      message: `${sourceLabel}当前特征池覆盖的人气排名从 ${minRank} 开始，${strategyName}需要 ${requiredMin}-${requiredMax}，因此当前日期缺少目标区间样本。`,
+      detail: `feature rank coverage ${minRank}-${maxRank}; required ${requiredMin}-${requiredMax}`,
+    };
+  }
+  return null;
+}
+
+function applyStrategyDataIssue(freshness, diagnostics, dataSource) {
+  if (!freshness) return freshness;
+  if (freshness.dataIssue) {
+    if (freshness.dataIssue.code === "kline_auth_error" && Number(diagnostics?.finalCount) > 0) {
+      return {
+        ...freshness,
+        dataIssue: {
+          ...freshness.dataIssue,
+          level: "warning",
+          message: "K线补齐失败：当前策略已有候选，但候选池和收益验证可能不完整。",
+        },
+      };
+    }
+    return freshness;
+  }
+  const coverageIssue = strategyCoverageIssue({
+    sourceKey: freshness.sourceKey,
+    strategyLabel: dataSource?.strategy?.shortLabel || dataSource?.strategy?.label,
+    diagnostics,
+  });
+  return coverageIssue ? { ...freshness, dataIssue: coverageIssue } : freshness;
 }
 
 async function dualSourceCodesForDate({ events, selectedDate, sourceKey, strategyKey, strict, temporaryStrategy }) {
@@ -3783,6 +3894,7 @@ async function dailyPayload(query) {
     dailyFreshness({ sourceKey: data.sourceKey, selectedDate }),
     strategyDiagnosticsForDate({ sourceKey: data.sourceKey, strategyKey, selectedDate, temporaryStrategy }),
   ]);
+  const displayFreshness = applyStrategyDataIssue(freshness, diagnostics, data.dataSource);
   return {
     selectedDate,
     requestedDate: normalizedRequestedDate,
@@ -3798,7 +3910,7 @@ async function dailyPayload(query) {
     dataSource: data.dataSource,
     dataStrategy: data.dataSource.strategy,
     rule: data.dataSource.strategy?.rule || STRATEGIES.early.rule,
-    freshness,
+    freshness: displayFreshness,
     diagnostics,
     stats: summarize(displayEvents),
     signalStats: summarizeSignals(displayEvents),
@@ -4397,6 +4509,65 @@ function rankAtOffset(history, targetDate, offset) {
   return rows[Math.max(0, index - offset)]?.rank ?? null;
 }
 
+async function loadCachedRankHistories({ sourceKey, codes, targetDate, lookbackDays = 150, metric = "rank" }) {
+  const cleanCodes = [
+    ...new Set(
+      (codes || [])
+        .map((code) => {
+          try {
+            return normalizeStock(code).code;
+          } catch {
+            return "";
+          }
+        })
+        .filter(Boolean),
+    ),
+  ];
+  if (!cleanCodes.length || !targetDate) return new Map();
+  const { rows } = await getDbPool().query(
+    `
+      with ranked as (
+        select distinct on (code, snapshot_date)
+          code,
+          snapshot_date::text as date,
+          rank::int as rank,
+          raw,
+          snapshot_key
+        from popularity_snapshots
+        where source = $1
+          and category = 'stock'
+          and metric = $5
+          and code = any($2)
+          and snapshot_date between ($3::date - ($4::int * interval '1 day')) and $3::date
+          and rank is not null
+        order by code, snapshot_date, snapshot_key desc
+      )
+      select *
+      from ranked
+      order by code asc, date asc
+    `,
+    [sourceKey, cleanCodes, targetDate, lookbackDays, metric],
+  );
+  const histories = new Map();
+  for (const row of rows) {
+    const code = normalizeStock(row.code).code;
+    const rank = n(row.rank);
+    const date = normalizeDate(row.date);
+    if (!code || !date || !Number.isFinite(rank)) continue;
+    if (!histories.has(code)) histories.set(code, []);
+    histories.get(code).push({
+      date,
+      rank,
+      raw: {
+        ...(row.raw && typeof row.raw === "object" ? row.raw : {}),
+        cachedSnapshot: true,
+        snapshotKey: row.snapshot_key,
+      },
+    });
+  }
+  return histories;
+}
+
 function eastmoneyRankHistoryToSnapshots({ code, name, history }) {
   return history.map((item) => {
     const ymd = item.date.replaceAll("-", "");
@@ -4525,10 +4696,14 @@ async function loadKlineForDate(stock, date) {
   }
 
   try {
-    const freshRows = await fetchKlineWithIfindFallback(stock, date);
-    return mergeKlineRows(localRows, freshRows);
+    const freshRows = await fetchKlineWithIfindFallback(stock, date, date);
+    const mergedRows = mergeKlineRows(localRows, freshRows);
+    if (date && !rowsContainDate(mergedRows, date)) {
+      throw new Error(`${stock.code} K线缺少目标日 ${date}`);
+    }
+    return mergedRows;
   } catch (error) {
-    if (localRows.length) return localRows;
+    if (localRows.length && (!date || rowsContainDate(localRows, date))) return localRows;
     throw error;
   }
 }
@@ -5044,7 +5219,31 @@ function universeSourceCounts(items) {
   }, {});
 }
 
-async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax }) {
+function dailyFeatureGenerationPriority(entry, targetDate, rankMax) {
+  const rank = rankAtOffset(entry.history, targetDate, 0);
+  const rank20 = rankAtOffset(entry.history, targetDate, 20);
+  const rankDelta20 = Number.isFinite(rank20) && Number.isFinite(rank) ? rank20 - rank : -Infinity;
+  const earlyMin = STRATEGY_PARAM_DEFAULTS.early.rankMin;
+  const earlyMax = STRATEGY_PARAM_DEFAULTS.early.rankMax;
+  const hotMax = STRATEGY_PARAM_DEFAULTS.hot.rankMax;
+
+  if (Number.isFinite(rank) && rank >= earlyMin && rank <= earlyMax) return [0, -rankDelta20, rank];
+  if (Number.isFinite(rank) && rank > hotMax && rank <= rankMax) return [1, -rankDelta20, rank];
+  if (Number.isFinite(rank) && rank <= hotMax) return [2, -rankDelta20, rank];
+  return [3, -rankDelta20, rank || 999999];
+}
+
+function compareDailyFeatureCandidates(a, b, targetDate, rankMax) {
+  const left = dailyFeatureGenerationPriority(a, targetDate, rankMax);
+  const right = dailyFeatureGenerationPriority(b, targetDate, rankMax);
+  for (let index = 0; index < left.length; index += 1) {
+    const delta = left[index] - right[index];
+    if (delta) return delta;
+  }
+  return String(a.item.code).localeCompare(String(b.item.code));
+}
+
+async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax, targetDate }) {
   const historicalLimit = Math.max(maxUniverse * 2, 500);
   const snapshotLimit = Math.max(maxUniverse * 4, 800);
   const [historicalResult, snapshotResult] = await Promise.all([
@@ -5067,6 +5266,7 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, ran
         from strategy_feature_events f
         left join stocks st on st.code = f.code
         where f.source = $1 and f.feature_set = $2
+          and ($4::date is null or f.signal_date <= $4::date)
         union all
         select
           s.code,
@@ -5084,6 +5284,7 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, ran
         from strategy_signals s
         left join stocks st on st.code = s.code
         where s.source = $1 and s.strategy in ('early', 'hot')
+          and ($4::date is null or s.signal_date <= $4::date)
       ),
       ranked as (
         select *,
@@ -5097,7 +5298,7 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, ran
       order by signal_date desc nulls last, code asc
       limit $3::int
     `,
-      [sourceKey, FEATURE_SET, historicalLimit],
+      [sourceKey, FEATURE_SET, historicalLimit, targetDate || null],
     ),
     getDbPool().query(
       `
@@ -5120,6 +5321,7 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, ran
             and p.category = 'stock'
             and p.metric = 'rank'
             and p.rank between 1 and $2
+            and ($5::date is null or p.snapshot_date <= $5::date)
             and p.code ~ '^[036][0-9]{5}$'
         )
         select
@@ -5143,9 +5345,16 @@ async function selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, ran
           end,
           snapshot_date desc,
           rank asc
-        limit $5::int
+        limit $6::int
       `,
-      [sourceKey, rankMax || DEFAULT_SIGNAL_RANK_MAX, STRATEGY_PARAM_DEFAULTS.early.rankMin, STRATEGY_PARAM_DEFAULTS.early.rankMax, snapshotLimit],
+      [
+        sourceKey,
+        rankMax || DEFAULT_SIGNAL_RANK_MAX,
+        STRATEGY_PARAM_DEFAULTS.early.rankMin,
+        STRATEGY_PARAM_DEFAULTS.early.rankMax,
+        targetDate || null,
+        snapshotLimit,
+      ],
     ),
   ]);
 
@@ -5390,66 +5599,61 @@ async function runDailySignalGeneration(options = {}) {
     5000,
     300000,
   );
+  const configuredFetchMissingKlineMax = boundedInteger(
+    options.fetchMissingKlineMax ?? process.env.SIGNAL_FETCH_MISSING_KLINE_MAX,
+    DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX,
+    0,
+    300,
+  );
+  const fetchMissingKlineMax =
+    options.fetchMissingKlineMax === undefined
+      ? Math.max(configuredFetchMissingKlineMax, DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX)
+      : configuredFetchMissingKlineMax;
   const boardMode = String(options.boardMode || process.env.SIGNAL_BOARD_MODE || "fetch").toLowerCase();
   const force = options.force === true || options.force === "1" || options.force === "true";
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
-  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, boardMode, force, timeBudgetMs };
+  const params = { sourceKey, targetDate, maxUniverse, rankMax, concurrency, boardMode, force, timeBudgetMs, fetchMissingKlineMax };
   const run = await createSyncRun(DAILY_SIGNAL_JOB, { params, startedAt });
 
   const results = [];
   try {
     const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
-    const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax });
+    const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax, targetDate });
     const universeSources = universeSourceCounts(universe);
-    const histories = [];
-    let rankSnapshotCount = 0;
-    let savedRankSnapshots = 0;
-    let stoppedByTimeBudget = false;
-    const historyChunkSize = Math.max(concurrency * 2, 8);
-
-    const fetchHistoryEntry = async (item) => {
-      const result = { code: item.code, name: item.name, status: "pending" };
-      try {
-        const history = await fetchEastmoneyRankHistory(item.code);
-        const snapshots = eastmoneyRankHistoryToSnapshots({ code: item.code, name: item.name, history });
-        result.status = "rank_synced";
-        result.historyCount = history.length;
-        result.rank = rankAtOffset(history, targetDate, 0);
-        return { item, history, snapshots, result };
-      } catch (error) {
-        result.status = "rank_failed";
-        result.error = error.message;
-        return { item, history: [], snapshots: [], result };
-      }
-    };
-
-    for (let index = 0; index < universe.length; index += historyChunkSize) {
-      if (Date.now() - startedAtMs > timeBudgetMs) {
-        stoppedByTimeBudget = true;
-        break;
-      }
-      const chunk = universe.slice(index, index + historyChunkSize);
-      const chunkHistories = await mapLimit(chunk, concurrency, fetchHistoryEntry);
-      histories.push(...chunkHistories);
-      const chunkSnapshots = chunkHistories.flatMap((entry) => entry.snapshots);
-      rankSnapshotCount += chunkSnapshots.length;
-      savedRankSnapshots += await upsertPopularitySnapshotsInChunks(chunkSnapshots);
-      if (Date.now() - startedAtMs > timeBudgetMs) {
-        stoppedByTimeBudget = true;
-        break;
-      }
-    }
-
-    const rankedCandidates = histories.filter((entry) => {
-      const rank = rankAtOffset(entry.history, targetDate, 0);
-      const rank20 = rankAtOffset(entry.history, targetDate, 20);
-      if (!Number.isFinite(rank) || !Number.isFinite(rank20)) return false;
-      const rankDelta20 = rank20 - rank;
-      const potentialHotConfirm = rank <= 100 && rankDelta20 >= STRATEGY_PARAM_DEFAULTS.hot.rankDelta20Min;
-      const potentialEarlyDiscovery = rank > 100 && rank <= rankMax && rankDelta20 >= 0;
-      return potentialHotConfirm || potentialEarlyDiscovery;
+    const rankHistoryByCode = await loadCachedRankHistories({
+      sourceKey,
+      codes: universe.map((item) => item.code),
+      targetDate,
+      lookbackDays: 150,
+      metric: "rank",
     });
+    const histories = universe.map((item) => {
+      const history = rankHistoryByCode.get(normalizeStock(item.code).code) || [];
+      const result = {
+        code: item.code,
+        name: item.name,
+        status: history.length ? "rank_cached" : "rank_missing",
+        historyCount: history.length,
+        rank: rankAtOffset(history, targetDate, 0),
+      };
+      return { item, history, snapshots: [], result };
+    });
+    const rankSnapshotCount = [...rankHistoryByCode.values()].reduce((total, history) => total + history.length, 0);
+    const savedRankSnapshots = 0;
+    let stoppedByTimeBudget = false;
+
+    const rankedCandidates = histories
+      .filter((entry) => {
+        const rank = rankAtOffset(entry.history, targetDate, 0);
+        const rank20 = rankAtOffset(entry.history, targetDate, 20);
+        if (!Number.isFinite(rank) || !Number.isFinite(rank20)) return false;
+        const rankDelta20 = rank20 - rank;
+        const potentialHotConfirm = rank <= 100 && rankDelta20 >= STRATEGY_PARAM_DEFAULTS.hot.rankDelta20Min;
+        const potentialEarlyDiscovery = rank > 100 && rank <= rankMax && rankDelta20 >= 0;
+        return potentialHotConfirm || potentialEarlyDiscovery;
+      })
+      .sort((a, b) => compareDailyFeatureCandidates(a, b, targetDate, rankMax));
 
     const boardRowsByCode = new Map();
     const boardMetricsByKey = new Map();
@@ -5457,11 +5661,19 @@ async function runDailySignalGeneration(options = {}) {
     let savedFeatures = 0;
     const featureConcurrency = Math.min(concurrency, 6);
     const featureChunkSize = Math.max(featureConcurrency * 2, 6);
+    const klineStats = {};
+    const rankedCodes = rankedCandidates.map((entry) => normalizeStock(entry.item.code).code);
+    const stockRowsByCode = await loadStockDailyBarsForFeatures(rankedCodes, targetDate, {
+      fetchMissingMax: fetchMissingKlineMax,
+      startedAtMs,
+      timeBudgetMs,
+      stats: klineStats,
+    });
     const buildFeatureEntry = async (entry) => {
       const item = entry.item;
       const result = entry.result;
       try {
-        const stockRows = await loadKlineForDate(normalizeStock(item.code), targetDate);
+        const stockRows = stockRowsByCode.get(normalizeStock(item.code).code) || [];
         const stockMetrics = stockPreSignalMetricsFromRows(stockRows, targetDate);
         if (
           !Number.isFinite(stockMetrics.prev5) ||
@@ -5527,7 +5739,8 @@ async function runDailySignalGeneration(options = {}) {
     }
     results.push(...histories.map((entry) => entry.result));
 
-    const failedCount = results.filter((item) => /failed$/.test(item.status)).length;
+    const featureFailedCount = results.filter((item) => /failed$/.test(item.status)).length;
+    const failedCount = featureFailedCount + (Number(klineStats.fetchFailed) || 0);
     const summary = {
       jobName: DAILY_SIGNAL_JOB,
       runId: run.id,
@@ -5546,9 +5759,10 @@ async function runDailySignalGeneration(options = {}) {
       processedUniverseCount: histories.length,
       remainingUniverseCount: Math.max(0, universe.length - histories.length),
       stoppedByTimeBudget,
+      klineStats,
       results: results.slice(0, 200),
     };
-    const status = stoppedByTimeBudget
+    const status = stoppedByTimeBudget || klineStats.authError
       ? savedFeatures || savedRankSnapshots
         ? "partial"
         : "failed"
@@ -5561,7 +5775,7 @@ async function runDailySignalGeneration(options = {}) {
       run.id,
       status === "empty" ? "success" : status,
       summary,
-      status === "failed" ? "no daily features generated before time budget" : null,
+      klineStats.authError || (status === "failed" ? "no daily features generated before time budget" : null),
     );
     cachedDbData.clear();
     cachedThsData.clear();
@@ -5593,12 +5807,23 @@ async function dailySignalPayload(query = {}, headers = {}) {
     concurrency: query.concurrency,
     timeBudgetMs: query.timeBudgetMs,
     boardMode: query.boardMode,
+    fetchMissingKlineMax: query.fetchMissingKlineMax,
     force: query.force,
   });
 }
 
 async function dailySignalFallbackPayload(query = {}, headers = {}) {
-  return dailySignalPayload({ ...query, force: query.force || "1" }, headers);
+  return dailySignalPayload(
+    {
+      ...query,
+      force: query.force || "1",
+      maxUniverse: query.maxUniverse || process.env.SIGNAL_FALLBACK_MAX_UNIVERSE || "480",
+      boardMode: query.boardMode || process.env.SIGNAL_FALLBACK_BOARD_MODE || "cached",
+      fetchMissingKlineMax:
+        query.fetchMissingKlineMax || process.env.SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX || String(DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX),
+    },
+    headers,
+  );
 }
 
 async function runDailyKlineSync(options = {}) {
@@ -6560,6 +6785,7 @@ async function runThsFeatureGeneration(options = {}) {
 
 async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   if (!codes.length) return new Map();
+  const stats = options.stats && typeof options.stats === "object" ? options.stats : null;
   const { rows } = await getDbPool().query(
     `
       select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
@@ -6581,15 +6807,35 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   const startedAtMs = Number(options.startedAtMs) || Date.now();
   const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
   const safetyWindowMs = 15000;
-  const missingCodes = codes
-    .filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate))
-    .slice(0, fetchMissingMax);
+  const missingAllCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
+  const missingCodes = missingAllCodes.slice(0, fetchMissingMax);
+  if (stats) {
+    stats.requestedCount = codes.length;
+    stats.cachedRowCount = rows.length;
+    stats.cachedTargetCount = codes.length - missingAllCodes.length;
+    stats.missingTargetCount = missingAllCodes.length;
+    stats.fetchLimit = fetchMissingMax;
+    stats.fetchAttempted = 0;
+    stats.fetchSucceeded = 0;
+    stats.fetchFailed = 0;
+  }
   for (const code of missingCodes) {
     if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)) break;
     try {
+      if (stats) stats.fetchAttempted += 1;
       const stockRows = await loadKlineForDate(normalizeStock(code), targetDate);
-      if (stockRows?.length) byCode.set(code, stockRows);
-    } catch {
+      if (stockRows?.length && rowsContainDate(stockRows, targetDate)) {
+        byCode.set(code, stockRows);
+        if (stats) stats.fetchSucceeded += 1;
+      }
+    } catch (error) {
+      if (stats) {
+        stats.fetchFailed += 1;
+        stats.lastFetchError = error.message;
+        if (/Refresh_Token is expired|refresh token|access token/i.test(error.message)) {
+          stats.authError = error.message;
+        }
+      }
       // Keep the feature generator best-effort; stocks without K-line data are skipped later.
     }
   }
