@@ -3930,17 +3930,70 @@ async function timelinePayload(query) {
   if (!temporaryStrategyConfigFromQuery(query) && normalizeSourceKey(query.source) === "ths" && normalizeStrategyKey(query.strategy) === "hot") {
     return thsHotTimelinePayload(query);
   }
-  const data = await loadDataForSource(query.source, query.strategy, { temporaryStrategy: temporaryStrategyConfigFromQuery(query) });
+  const temporaryStrategy = temporaryStrategyConfigFromQuery(query);
+  const strategyKey = normalizeStrategyKey(query.strategy);
+  const data = await loadDataForSource(query.source, strategyKey, { temporaryStrategy });
   const strict = query.strict !== "false";
   const signalDates = strict ? data.dates : data.allDates;
   const coverageDates = await computedDataCoverageDates(data.sourceKey);
   const dates = displayDateRange(coverageDates.length ? coverageDates : signalDates, query.date);
   const map = strict ? data.byDate : data.allByDate;
+  let rankCoverageByDate = new Map();
+  if (process.env.DATABASE_URL && dates.length) {
+    try {
+      const params = await strategyParamsForDiagnostics(data.sourceKey, strategyKey, temporaryStrategy);
+      const { rows } = await getDbPool().query(
+        `
+          select
+            signal_date::text as date,
+            count(rank)::int as count,
+            min(rank)::int as min_rank,
+            max(rank)::int as max_rank,
+            count(*) filter (where rank between $4 and $5)::int as in_range_count
+          from strategy_feature_events
+          where source = $1
+            and feature_set = $2
+            and signal_date = any($3::date[])
+          group by signal_date
+        `,
+        [data.sourceKey, FEATURE_SET, dates, params.rankMin, params.rankMax],
+      );
+      rankCoverageByDate = new Map(
+        rows.map((row) => [
+          normalizeDate(row.date),
+          {
+            count: Number(row.count) || 0,
+            minRank: n(row.min_rank),
+            maxRank: n(row.max_rank),
+            requiredMin: params.rankMin,
+            requiredMax: params.rankMax,
+            inRangeCount: Number(row.in_range_count) || 0,
+          },
+        ]),
+      );
+    } catch {
+      // Timeline coverage annotations are best-effort; signal rows remain usable.
+    }
+  }
   return dates.map((date) => {
     const events = map.get(date) || [];
+    const summary = summarize(events);
+    const coverageIssue =
+      summary.count === 0
+        ? strategyCoverageIssue({
+            sourceKey: data.sourceKey,
+            strategyLabel: data.dataSource?.strategy?.shortLabel || data.dataSource?.strategy?.label,
+            diagnostics: {
+              finalCount: 0,
+              rankCoverage: rankCoverageByDate.get(date),
+            },
+          })
+        : null;
     return {
       date,
-      ...summarize(events),
+      ...summary,
+      computable: !coverageIssue,
+      dataIssue: coverageIssue,
       boardCount: aggregateBoards(events).length,
       topBoards: aggregateBoards(events).slice(0, 3).map((board) => board.name),
     };
@@ -4456,19 +4509,19 @@ async function fetchKlineWithProviderFallback(stock, fromDate, toDate = dateFrom
   const providerErrors = [];
 
   try {
-    const primaryRows = await fetchKlineWithRetry(stock);
+    const primaryRows = await fetchTencentKlineWithRetry(stock, normalizedFromDate, normalizedToDate);
     rows = mergeKlineRows(rows, primaryRows);
-  } catch (error) {
-    providerErrors.push(`东方财富: ${error.message}`);
-  }
-  if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate, 0)) return rows;
-
-  try {
-    rows = mergeKlineRows(rows, await fetchTencentKlineWithRetry(stock, normalizedFromDate, normalizedToDate));
   } catch (error) {
     providerErrors.push(`腾讯: ${error.message}`);
   }
   if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate)) return rows;
+
+  try {
+    rows = mergeKlineRows(rows, await fetchKlineWithRetry(stock));
+  } catch (error) {
+    providerErrors.push(`东方财富: ${error.message}`);
+  }
+  if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate, 0)) return rows;
 
   if (IFIND_KLINE_FALLBACK_ENABLED && process.env.IFIND_REFRESH_TOKEN) {
     try {
@@ -7392,6 +7445,7 @@ module.exports = {
   fetchTencentKline,
   parseTencentKlineRows,
   klineRowsCoverTarget,
+  strategyCoverageIssue,
   fetchKlineWithProviderFallback,
   fetchMarketIndexKline,
   loadKlineForDate,

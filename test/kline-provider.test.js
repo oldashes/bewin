@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { klineRowsCoverTarget, normalizeStock, parseTencentKlineRows } = require("../work/strategy-dashboard/server");
+const { klineRowsCoverTarget, normalizeStock, parseTencentKlineRows, strategyCoverageIssue } = require("../work/strategy-dashboard/server");
 
 test("parses Tencent enriched qfq daily bars", () => {
   const rows = parseTencentKlineRows({
@@ -44,4 +44,42 @@ test("accepts a recent prior trading day but rejects stale K-line coverage", () 
   assert.equal(klineRowsCoverTarget(rows, "2026-07-01", "2026-07-30", 0), false);
   assert.equal(klineRowsCoverTarget(rows, "2026-06-01", "2026-08-15"), false);
   assert.equal(klineRowsCoverTarget(rows, "2026-07-30", "2026-07-30"), false);
+});
+
+test("marks a zero-hit day as not computable when popularity ranks are too shallow", () => {
+  const issue = strategyCoverageIssue({
+    sourceKey: "ths",
+    strategyLabel: "强共振收益",
+    diagnostics: {
+      finalCount: 0,
+      rankCoverage: {
+        minRank: 3,
+        maxRank: 85,
+        requiredMin: 400,
+        requiredMax: 1200,
+        inRangeCount: 0,
+      },
+    },
+  });
+
+  assert.equal(issue.code, "rank_coverage_too_shallow");
+});
+
+test("keeps zero hits valid when the required popularity range is covered", () => {
+  const issue = strategyCoverageIssue({
+    sourceKey: "em",
+    strategyLabel: "强共振收益",
+    diagnostics: {
+      finalCount: 0,
+      rankCoverage: {
+        minRank: 3,
+        maxRank: 1512,
+        requiredMin: 400,
+        requiredMax: 1200,
+        inRangeCount: 15,
+      },
+    },
+  });
+
+  assert.equal(issue, null);
 });

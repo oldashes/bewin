@@ -811,12 +811,17 @@ function TimelinePanel({ rows, selectedDate, setDate }: { rows: AnyRecord[]; sel
       <ScrollArea.Autosize mah={520} type="auto" offsetScrollbars>
         <Stack gap={4} p="xs">
           {visibleRows.slice().reverse().map((row) => (
-            <UnstyledButton key={row.date} className={`timelineGrid row ${row.date === selectedDate ? "active" : ""}`} onClick={() => setDate(row.date)}>
+            <UnstyledButton
+              key={row.date}
+              className={`timelineGrid row ${row.date === selectedDate ? "active" : ""} ${row.computable === false ? "insufficient" : ""}`}
+              onClick={() => setDate(row.date)}
+              title={row.dataIssue?.message || undefined}
+            >
               <strong>{row.date}</strong>
-              <span>{row.count}只</span>
-              <Progress value={Math.max(6, (row.count / maxCount) * 100)} size="sm" radius="xl" />
-              <ToneText value={row.avgRet5} />
-              <ToneText value={row.avgRet20} />
+              <span className={row.computable === false ? "coverageMissing" : ""}>{row.computable === false ? "不足" : `${row.count}只`}</span>
+              <Progress value={row.computable === false ? 0 : Math.max(6, (row.count / maxCount) * 100)} size="sm" radius="xl" color={row.computable === false ? "yellow" : undefined} />
+              {row.computable === false ? <span className="coverageMissing">不可算</span> : <ToneText value={row.avgRet5} />}
+              {row.computable === false ? <span className="coverageMissing">不可算</span> : <ToneText value={row.avgRet20} />}
             </UnstyledButton>
           ))}
         </Stack>

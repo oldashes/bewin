@@ -408,6 +408,17 @@ a {
   box-shadow: inset 3px 0 0 var(--blue);
 }
 
+.timelineGrid.row.insufficient {
+  background: #fffbeb;
+}
+
+.timelineGrid .coverageMissing {
+  color: #b7791f;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .timelineGrid strong {
   font-size: 15px;
 }
