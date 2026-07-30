@@ -242,6 +242,7 @@ Install Command: npm install
 
 ```text
 DATABASE_URL=postgresql://...
+DB_POOL_MAX=2
 CRON_SECRET=一段随机长字符串
 SYNC_LOOKBACK_DAYS=60
 SYNC_MAX_STOCKS=160
@@ -249,6 +250,9 @@ THS_HOT_CATEGORIES=stock,concept,industry
 THS_WATCHLIST_MAX=80
 SIGNAL_MAX_UNIVERSE=240
 ```
+
+数据库连接兼容标准 PostgreSQL 服务。迁移到 Aiven 的完整导出、校验、Vercel 切换和回滚步骤见
+[`docs/runbooks/aiven-postgres-migration.md`](docs/runbooks/aiven-postgres-migration.md)。
 
 `vercel.json` 当前配置：
 

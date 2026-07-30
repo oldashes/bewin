@@ -19,3 +19,5 @@ outputs/*.webp
 
 # Local database safety exports.
 backups/
+*.dump
+*.backup

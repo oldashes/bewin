@@ -3,7 +3,8 @@
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
-const { Pool, types } = require("pg");
+const { types } = require("pg");
+const { createDatabasePool } = require("../../lib/postgres");
 
 types.setTypeParser(1082, (value) => value);
 
@@ -1647,10 +1648,7 @@ function shouldUseDatabase(sourceKey) {
 
 function getDbPool() {
   if (!dbPool) {
-    dbPool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      max: 3,
-    });
+    dbPool = createDatabasePool(process.env.DATABASE_URL);
   }
   return dbPool;
 }
