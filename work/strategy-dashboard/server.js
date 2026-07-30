@@ -3913,6 +3913,45 @@ async function dualSourceCodesForDate({ events, selectedDate, sourceKey, strateg
   if (!events.length || !selectedDate || !["em", "ths"].includes(sourceKey)) return new Set();
   const otherSource = sourceKey === "em" ? "ths" : "em";
   try {
+    if (process.env.DATABASE_URL && otherSource === "ths" && strategyKey === "hot") {
+      const { rows } = await getDbPool().query(
+        `
+          with latest as (
+            select max(snapshot_key) as snapshot_key
+            from popularity_snapshots
+            where source = 'ths'
+              and category = 'stock'
+              and metric = 'hot'
+              and snapshot_date = $1::date
+          )
+          select
+            p.*,
+            st.name as stock_name,
+            st.exchange,
+            st.board,
+            st.industry,
+            st.region,
+            st.concepts,
+            st.listing_date
+          from popularity_snapshots p
+          join latest l on l.snapshot_key = p.snapshot_key
+          left join stocks st on st.code = p.code
+          where p.source = 'ths'
+            and p.category = 'stock'
+            and p.metric = 'hot'
+            and p.snapshot_date = $1::date
+            and p.rank between 1 and 100
+        `,
+        [selectedDate],
+      );
+      const rankWindows = snapshotRankWindowMaps(rows);
+      const sameDayEvents = rows.map((row) => snapshotRowToHotEvent(row, rankWindows)).filter(Boolean);
+      return new Set(
+        sameDayEvents
+          .filter((event) => !strict || event.strictBoard)
+          .map((event) => event.code),
+      );
+    }
     const otherData = await loadDataForSource(otherSource, strategyKey, { temporaryStrategy });
     const otherMap = strict ? otherData.byDate : otherData.allByDate;
     return new Set((otherMap.get(selectedDate) || []).map((event) => event.code));
