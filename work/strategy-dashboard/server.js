@@ -6213,8 +6213,63 @@ async function dailySignalPayload(query = {}, headers = {}) {
   });
 }
 
+async function dailySignalFeatureCoverage(date) {
+  requireDatabase();
+  const selectedDate = normalizeDate(date);
+  if (!selectedDate) return { complete: false, featureCount: 0, run: null, issue: null };
+  const [featureRows, runRows] = await Promise.all([
+    getDbPool().query(
+      `
+        select count(*)::int as count
+        from strategy_feature_events
+        where source = 'em'
+          and feature_set = $1
+          and signal_date = $2::date
+      `,
+      [FEATURE_SET, selectedDate],
+    ),
+    getDbPool().query(
+      `
+        select job_name, status, started_at, finished_at, selected_count, success_count, failed_count, error, details
+        from sync_runs
+        where job_name = $1
+          and coalesce(
+            details->>'generatedDate',
+            details->>'targetDate',
+            details->'params'->>'targetDate'
+          ) = $2
+        order by started_at desc
+        limit 1
+      `,
+      [DAILY_SIGNAL_JOB, selectedDate],
+    ),
+  ]);
+  const featureCount = Number(featureRows.rows[0]?.count) || 0;
+  const run = syncRunView(runRows.rows[0]);
+  const issue = run
+    ? featureRunCoverageIssue({ sourceKey: "em", selectedDate, featureCount, run })
+    : {
+        code: "feature_generation_missing",
+        message: `东方财富 ${selectedDate} 尚未生成策略特征。`,
+      };
+  return { complete: Boolean(run) && !issue, featureCount, run, issue };
+}
+
 async function dailySignalFallbackPayload(query = {}, headers = {}) {
-  return dailySignalPayload(
+  assertCronAuthorized(query, headers);
+  if (query.mode === "backfill") return dailySignalBackfillPayload(query, headers);
+
+  const targetDate = await resolveMarketTargetDate(query.date, "em");
+  const explicitCurrentRun = Boolean(normalizeDate(query.date)) || query.force === "1" || query.force === "true";
+  if (!explicitCurrentRun) {
+    const coverage = await dailySignalFeatureCoverage(targetDate);
+    if (coverage.complete) {
+      const backfill = await dailySignalBackfillPayload(query, headers);
+      return { ...backfill, fallbackTargetDate: targetDate, fallbackAction: "historical_backfill" };
+    }
+  }
+
+  const result = await runDailySignalGeneration(
     {
       ...query,
       force: query.force || "1",
@@ -6225,8 +6280,8 @@ async function dailySignalFallbackPayload(query = {}, headers = {}) {
       fetchMissingKlineMax:
         query.fetchMissingKlineMax || process.env.SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX || String(DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX),
     },
-    headers,
   );
+  return { ...result, fallbackTargetDate: targetDate, fallbackAction: "current_date_repair" };
 }
 
 async function selectDailySignalBackfillDate(options = {}) {
@@ -7747,7 +7802,6 @@ async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   if (pathname === "/api/cron/ths-feature-sync") return thsFeaturePayload(query, headers);
   if (pathname === "/api/cron/daily-signal-sync") return dailySignalPayload(query, headers);
   if (pathname === "/api/cron/daily-signal-fallback") return dailySignalFallbackPayload(query, headers);
-  if (pathname === "/api/cron/daily-signal-backfill") return dailySignalBackfillPayload(query, headers);
   const error = new Error("Not found");
   error.statusCode = 404;
   throw error;
