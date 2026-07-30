@@ -16,3 +16,6 @@ outputs/*.webp
 .env.*
 !.env.example
 .vercel
+
+# Local database safety exports.
+backups/

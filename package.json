@@ -15,6 +15,7 @@
     "db:import-klines": "node scripts/import-klines.js",
     "db:import-market-baseline": "node scripts/import-market-baseline.js",
     "db:import-ths": "node scripts/import-ths-history.js",
+    "db:compact-popularity": "node scripts/compact-popularity-snapshots.js",
     "lab:strategy": "node scripts/strategy-lab.js",
     "sync:daily": "node scripts/daily-sync.js",
     "sync:ths": "node scripts/ths-sync.js",

@@ -22,7 +22,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 const DATA_MODE = process.env.DATA_MODE || "auto";
 const KLINE_DB_START_DATE = process.env.KLINE_DB_START_DATE || "2025-08-01";
 const DEFAULT_SYNC_LOOKBACK_DAYS = 60;
-const DEFAULT_SYNC_MAX_STOCKS = 160;
+const DEFAULT_SYNC_MAX_STOCKS = 320;
 const DEFAULT_SYNC_CONCURRENCY = 4;
 const DAILY_SYNC_JOB = "daily-kline-refresh";
 const THS_SYNC_JOB = "ths-popularity-refresh";
@@ -5420,6 +5420,38 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
           and f.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
         group by f.code
       ),
+      recent_strategy_candidates as (
+        select
+          f.code,
+          max(f.name) as name,
+          max(f.signal_date) as latest_signal_date,
+          count(*)::int as signal_count,
+          min(f.rank)::int as best_rank,
+          1 as priority
+        from strategy_feature_events f
+        cross join feature_bounds b
+        where f.source in (select source from source_scope)
+          and f.feature_set = $6
+          and f.signal_date >= b.max_signal_date - ($1::int * interval '1 day')
+          and (
+            (
+              f.rank between 400 and 1200
+              and coalesce(f.rank_delta_20, f.rank_20 - f.rank) >= 0
+              and f.amount_ratio between 1 and 3
+              and f.prev_5 between -0.20 and 0.35
+              and f.best_board_ret_5 between 0.03 and 0.20
+              and f.best_board_amount_ratio between 1.2 and 2.0
+              and (f.has_strong_board is true or f.has_strong_industry is true or f.has_strong_concept is true)
+            )
+            or (
+              f.rank between 1 and 100
+              and coalesce(f.rank_delta_20, f.rank_20 - f.rank) >= 300
+              and f.amount_ratio between 0.8 and 3.5
+              and f.prev_5 between -0.20 and 0.35
+            )
+          )
+        group by f.code
+      ),
       recent_signals as (
         select
           s.code,
@@ -5427,7 +5459,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
           max(s.signal_date) as latest_signal_date,
           count(*)::int as signal_count,
           min(s.rank)::int as best_rank,
-          3 as priority
+          0 as priority
         from strategy_signals s
         cross join signal_bounds b
         where s.source in (select source from source_scope)
@@ -5442,7 +5474,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
           max(p.snapshot_date) as latest_signal_date,
           count(*)::int as signal_count,
           min(p.rank)::int as best_rank,
-          1 as priority
+          3 as priority
         from popularity_snapshots p
         cross join snapshot_bounds b
         where p.source in (select source from source_scope)
@@ -5451,7 +5483,28 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
           and p.rank between 1 and 1600
         group by p.code
       ),
+      recent_hot_snapshots as (
+        select
+          p.code,
+          max(p.name) as name,
+          max(p.snapshot_date) as latest_signal_date,
+          count(*)::int as signal_count,
+          min(p.rank)::int as best_rank,
+          1 as priority
+        from popularity_snapshots p
+        cross join snapshot_bounds b
+        where p.source in (select source from source_scope)
+          and p.category = 'stock'
+          and p.metric = 'hot'
+          and p.snapshot_date >= b.max_snapshot_date - ($1::int * interval '1 day')
+          and p.rank between 1 and 100
+        group by p.code
+      ),
       candidates as (
+        select * from recent_strategy_candidates
+        union all
+        select * from recent_hot_snapshots
+        union all
         select * from recent_snapshots
         union all
         select * from recent_features
@@ -5469,14 +5522,6 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
         from candidates
         where code ~ '^[036][0-9]{5}$'
         group by code
-      ),
-      latest_bars as (
-        select
-          code,
-          max(trade_date) as latest_bar_date,
-          max(updated_at) as latest_bar_updated_at
-        from stock_daily_bars
-        group by code
       )
       select
         d.code,
@@ -5486,19 +5531,33 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
         d.best_rank,
         d.priority,
         lb.latest_bar_date::text as latest_bar_date,
-        lb.latest_bar_updated_at
+        lb.latest_bar_updated_at,
+        coalesce(lb.post_signal_bar_count, 0)::int as post_signal_bar_count,
+        count(*) over()::int as pending_count
       from deduped d
-      left join latest_bars lb on lb.code = d.code
+      left join lateral (
+        select
+          max(b.trade_date) as latest_bar_date,
+          max(b.updated_at) as latest_bar_updated_at,
+          count(*) filter (where b.trade_date > d.latest_signal_date) as post_signal_bar_count
+        from stock_daily_bars b
+        where b.code = d.code
+      ) lb on true
       where $5::boolean
          or lb.latest_bar_updated_at is null
          or lb.latest_bar_date is null
-         or lb.latest_bar_date < greatest(d.latest_signal_date, $7::date)
-         or lb.latest_bar_updated_at < now() - interval '18 hours'
+         or (
+           coalesce(lb.post_signal_bar_count, 0) < 21
+           and (
+             lb.latest_bar_date < $7::date
+             or lb.latest_bar_updated_at < now() - interval '18 hours'
+           )
+         )
       order by
         d.priority asc,
-        (lb.latest_bar_date is null or lb.latest_bar_date < d.latest_signal_date) desc,
-        lb.latest_bar_updated_at asc nulls first,
         d.latest_signal_date desc,
+        coalesce(lb.post_signal_bar_count, 0) asc,
+        lb.latest_bar_updated_at asc nulls first,
         d.best_rank asc nulls last,
         d.signal_count desc
       limit $2::int
@@ -5515,6 +5574,8 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
     priority: n(row.priority),
     latestBarDate: normalizeDate(row.latest_bar_date),
     latestBarUpdatedAt: row.latest_bar_updated_at ? new Date(row.latest_bar_updated_at).toISOString() : null,
+    postSignalBarCount: n(row.post_signal_bar_count) || 0,
+    pendingCount: n(row.pending_count) || 0,
   }));
 }
 
@@ -6445,6 +6506,7 @@ async function runDailyKlineSync(options = {}) {
 
   try {
     const candidates = await selectDailySyncStocks(params);
+    const pendingCount = candidates[0]?.pendingCount || candidates.length;
     let successCount = 0;
     let staleCount = 0;
     let failedCount = 0;
@@ -6511,14 +6573,17 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: candidates.length,
+      pendingCount,
       successCount,
       staleCount,
       failedCount,
       results,
       stoppedByTimeBudget,
-      remainingCount: Math.max(0, candidates.length - results.length),
+      remainingCount: Math.max(0, pendingCount - results.length),
     };
-    const status = stoppedByTimeBudget || failedCount || staleCount ? (successCount || staleCount ? "partial" : "failed") : "success";
+    const status = stoppedByTimeBudget || failedCount || staleCount || pendingCount > results.length
+      ? (successCount || staleCount ? "partial" : "failed")
+      : "success";
     const errorMessage = stoppedByTimeBudget
       ? "time budget reached before all selected stocks were synced"
       : failedCount && !successCount
@@ -6692,7 +6757,10 @@ async function upsertPopularitySnapshots(records) {
     .filter((record) => record.source && record.category && record.metric && record.snapshot_date && record.snapshot_key && record.code)
     .map((record) => ({
       ...record,
-      raw: record.raw || {},
+      // Every field used by ranking and feature generation is stored in a typed
+      // column. Keeping the provider payload here duplicated most of each row
+      // and exhausted the Neon free-tier database.
+      raw: {},
     }));
   if (!cleanRecords.length) return 0;
 

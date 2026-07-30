@@ -13,7 +13,7 @@ runDailyKlineSync({
   source: process.env.SYNC_SOURCE || "em",
   strategy: process.env.SYNC_STRATEGY || null,
   lookbackDays: process.env.SYNC_LOOKBACK_DAYS,
-  maxStocks: envAtLeast("SYNC_MAX_STOCKS", 160),
+  maxStocks: envAtLeast("SYNC_MAX_STOCKS", 320),
   force: process.env.SYNC_FORCE,
 })
   .then((summary) => {
