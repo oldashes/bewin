@@ -37,7 +37,8 @@ Bewin 是一个本地回测与线上看板项目，用来研究 A 股“人气�
 ```mermaid
 flowchart LR
   subgraph External["外部数据"]
-    EM["东方财富\n历史人气 / 日K / 沪深300"]
+    EM["东方财富\n历史人气 / 日K"]
+    TX["腾讯行情\n免登录日K / 沪深300兜底"]
     THS["同花顺\n每日人气榜快照"]
   end
 
@@ -63,8 +64,10 @@ flowchart LR
   Public --> Server
   Server --> Neon
   Server --> EM
+  Server --> TX
   Vercel --> Neon
   Vercel --> EM
+  Vercel --> TX
 ```
 
 ### 运行形态
@@ -130,6 +133,12 @@ THS_WATCHLIST_MAX=80
 THS_WATCHLIST_LOOKBACK_DAYS=60
 SIGNAL_MAX_UNIVERSE=240
 IFIND_FEATURE_FETCH_MISSING_KLINE_MAX=8
+EASTMONEY_KLINE_FETCH_TIMEOUT_MS=6000
+TENCENT_KLINE_FETCH_TIMEOUT_MS=10000
+KLINE_PROVIDER_MAX_LAG_DAYS=7
+# 可选三级兜底；没有付费 iFind 账户时留空
+IFIND_KLINE_FALLBACK_ENABLED=false
+IFIND_REFRESH_TOKEN=""
 ```
 
 ## 数据来源
@@ -138,8 +147,8 @@ IFIND_FEATURE_FETCH_MISSING_KLINE_MAX=8
 |---|---|---|---|
 | 东方财富历史人气 | 已沉淀在 `outputs/` / Neon | 回测主数据源 | 可回溯更长周期，支撑策略实验 |
 | 同花顺人气榜 | 每日抓取后写入 `popularity_snapshots` | 未来同花顺历史回测 | 历史较短，需要从现在开始积累 |
-| 股票日 K | 东方财富 | 收益验证、回测、当前收益 | 优先读 Neon；缺失时请求并回写 |
-| 沪深300日 K | 东方财富 | 个股收益对照 | 用于展示同期指数收益和超额收益 |
+| 股票日 K | 东方财富 + 腾讯行情 | 收益验证、回测、当前收益 | 优先读 Neon；东财失败或数据滞后时用腾讯前复权日 K 补齐并回写 |
+| 沪深300日 K | 东方财富 + 腾讯行情 | 个股收益对照 | 同样采用双源兜底，用于展示同期指数收益和超额收益 |
 | 市场随机基准 | 本地 K 线宇宙 / `market_daily_baselines` | 策略测评 | 同日期全市场随机 A 股篮子的期望收益 |
 | 股票元数据 | 缓存 + Neon `stocks` | 交易所、板块、新股、涨跌幅标签 | 不足时按代码规则推断 |
 | 板块成员和板块表现 | `work/cache/sector-filter-backtest` | 板块共振与伪板块过滤 | 用于强板块、板块量能、板块热度计算 |

@@ -36,8 +36,15 @@ const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
 const DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX = 32;
 const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX = 80;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
+const EASTMONEY_KLINE_FETCH_TIMEOUT_MS = Number(process.env.EASTMONEY_KLINE_FETCH_TIMEOUT_MS || 6000);
+const TENCENT_KLINE_FETCH_TIMEOUT_MS = Number(process.env.TENCENT_KLINE_FETCH_TIMEOUT_MS || 10000);
+const TENCENT_KLINE_BASE_URL =
+  process.env.TENCENT_KLINE_BASE_URL || "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get";
+const TENCENT_KLINE_MAX_COUNT = Number(process.env.TENCENT_KLINE_MAX_COUNT || 1095);
+const KLINE_PROVIDER_MAX_LAG_DAYS = Number(process.env.KLINE_PROVIDER_MAX_LAG_DAYS || 7);
 const DEFAULT_CRON_TIME_BUDGET_MS = 55000;
 const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
+const IFIND_KLINE_FALLBACK_ENABLED = /^(?:1|true)$/i.test(process.env.IFIND_KLINE_FALLBACK_ENABLED || "");
 const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
 const MARKET_INDEX = {
   key: "csi300",
@@ -4136,7 +4143,7 @@ function normalizeStock(input) {
   const raw = String(input || "").trim().toUpperCase();
   const code = raw.match(/\d{6}/)?.[0] || "";
   if (!code) throw new Error("请输入 6 位股票代码");
-  const market = raw.startsWith("SH") || code.startsWith("6") ? "SH" : "SZ";
+  const market = raw.startsWith("BJ") || /^(?:4|8|92)/.test(code) ? "BJ" : raw.startsWith("SH") || code.startsWith("6") ? "SH" : "SZ";
   const marketId = market === "SH" ? "1" : "0";
   return {
     code,
@@ -4182,12 +4189,16 @@ async function fetchKline(stock) {
     "&fields1=f1,f2,f3,f4,f5,f6" +
     "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
     "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
-  const response = await fetchWithTimeout(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Referer: "https://quote.eastmoney.com/",
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://quote.eastmoney.com/",
+      },
     },
-  });
+    EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
+  );
   if (!response.ok) throw new Error(`K线请求失败：${response.status}`);
   const json = await response.json();
   const rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
@@ -4205,7 +4216,93 @@ async function fetchKline(stock) {
 }
 
 async function fetchKlineWithRetry(stock) {
-  return retryFetch(() => fetchKline(stock), { attempts: 3, delayMs: 700 });
+  return retryFetch(() => fetchKline(stock), { attempts: 2, delayMs: 500 });
+}
+
+function tencentStockSymbol(stock) {
+  const prefix = stock.market === "SH" ? "sh" : stock.market === "BJ" ? "bj" : "sz";
+  return `${prefix}${stock.code}`;
+}
+
+function tencentKlineCount(fromDate, toDate) {
+  const from = new Date(`${normalizeDate(fromDate) || KLINE_DB_START_DATE}T00:00:00Z`);
+  const to = new Date(`${normalizeDate(toDate) || dateFromYmd(chinaDateYmd())}T00:00:00Z`);
+  const calendarDays = Number.isFinite(from.getTime()) && Number.isFinite(to.getTime()) ? Math.max(1, Math.ceil((to - from) / 86400000) + 1) : 180;
+  const configuredMax = boundedInteger(TENCENT_KLINE_MAX_COUNT, 1095, 120, 5000);
+  return Math.min(configuredMax, Math.max(180, Math.ceil(calendarDays * 0.9) + 60));
+}
+
+function parseTencentKlineRows(table) {
+  const sourceRows = [table?.qfqday, table?.day, table?.hfqday].find((rows) => Array.isArray(rows) && rows.length) || [];
+  const parsed = sourceRows
+    .map((parts) => {
+      if (!Array.isArray(parts) || parts.length < 6) return null;
+      const date = normalizeDate(parts[0]);
+      const open = n(parts[1]);
+      const close = n(parts[2]);
+      const high = n(parts[3]);
+      const low = n(parts[4]);
+      const volume = n(parts[5]);
+      const turnover = n(parts[7]);
+      const amountWan = n(parts[8]);
+      if (!date || !Number.isFinite(open) || !Number.isFinite(close)) return null;
+      return {
+        date,
+        open,
+        close,
+        high,
+        low,
+        volume,
+        amount: Number.isFinite(amountWan) ? amountWan * 10000 : null,
+        amplitude: null,
+        pct: null,
+        change: null,
+        turnover,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  for (let index = 1; index < parsed.length; index += 1) {
+    const row = parsed[index];
+    const previousClose = parsed[index - 1].close;
+    if (!Number.isFinite(previousClose) || previousClose === 0) continue;
+    row.change = row.close - previousClose;
+    row.pct = (row.change / previousClose) * 100;
+    if (Number.isFinite(row.high) && Number.isFinite(row.low)) row.amplitude = ((row.high - row.low) / previousClose) * 100;
+  }
+  return parsed;
+}
+
+async function fetchTencentKline(stock, fromDate, toDate, options = {}) {
+  const symbol = tencentStockSymbol(stock);
+  const endDate = normalizeDate(toDate) || dateFromYmd(chinaDateYmd());
+  const startDate = normalizeDate(fromDate) || KLINE_DB_START_DATE;
+  const param = `${symbol},day,${startDate},${endDate},${tencentKlineCount(startDate, endDate)},qfq`;
+  const url = `${TENCENT_KLINE_BASE_URL}?param=${encodeURIComponent(param)}`;
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: `https://gu.qq.com/${symbol}/gp`,
+      },
+    },
+    TENCENT_KLINE_FETCH_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`腾讯K线请求失败：${response.status}`);
+  const payload = await response.json();
+  if (Number(payload?.code) !== 0 || !payload?.data?.[symbol]) {
+    throw new Error(`腾讯K线返回异常：${payload?.msg || stock.code}`);
+  }
+  const rows = parseTencentKlineRows(payload.data[symbol]);
+  if (!rows.length) throw new Error(`腾讯没有返回 ${stock.code} 的日 K 数据`);
+  if (options.persist !== false && shouldUseDatabase("em")) await saveKlineToDb(stock, rows, "tencent");
+  return rows;
+}
+
+async function fetchTencentKlineWithRetry(stock, fromDate, toDate, options = {}) {
+  return retryFetch(() => fetchTencentKline(stock, fromDate, toDate, options), { attempts: 2, delayMs: 500 });
 }
 
 let cachedIfindAccessToken = null;
@@ -4340,36 +4437,51 @@ function mergeKlineRows(baseRows, freshRows) {
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
-async function fetchKlineWithIfindFallback(stock, fromDate, toDate = dateFromYmd(chinaDateYmd())) {
+function klineRowsCoverTarget(rows, fromDate, toDate, maxLagDays = KLINE_PROVIDER_MAX_LAG_DAYS) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+  if (fromDate && toDate && fromDate === toDate && !rowsContainDate(rows, fromDate)) return false;
+  const latestDate = latestKlineDate(rows);
+  if (!toDate || !latestDate || latestDate >= toDate) return Boolean(latestDate);
+  const latestTime = new Date(`${latestDate}T00:00:00Z`).getTime();
+  const targetTime = new Date(`${toDate}T00:00:00Z`).getTime();
+  if (!Number.isFinite(latestTime) || !Number.isFinite(targetTime)) return false;
+  const lagDays = Math.floor((targetTime - latestTime) / 86400000);
+  return lagDays <= boundedInteger(maxLagDays, 7, 0, 30);
+}
+
+async function fetchKlineWithProviderFallback(stock, fromDate, toDate = dateFromYmd(chinaDateYmd())) {
   const normalizedFromDate = normalizeDate(fromDate) || toDate;
   const normalizedToDate = normalizeDate(toDate) || normalizedFromDate;
+  let rows = [];
+  const providerErrors = [];
+
   try {
     const primaryRows = await fetchKlineWithRetry(stock);
-    const latestDate = latestKlineDate(primaryRows);
-    const needsSupplement = normalizedFromDate && normalizedToDate && (!rowsContainDate(primaryRows, normalizedFromDate) || (latestDate && latestDate < normalizedToDate));
-    if (!needsSupplement) return primaryRows;
-    let fallbackError = null;
-    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch((fallbackFetchError) => {
-      fallbackError = fallbackFetchError;
-      return [];
-    });
-    if (fallbackRows.length) return mergeKlineRows(primaryRows, fallbackRows);
-    if (fallbackError) {
-      throw new Error(`K线最新日期 ${latestDate || "未知"}，未补到 ${normalizedToDate}；iFind fallback failed: ${fallbackError.message}`);
-    }
-    return primaryRows;
+    rows = mergeKlineRows(rows, primaryRows);
   } catch (error) {
-    let fallbackError = null;
-    const fallbackRows = await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate).catch((fallbackFetchError) => {
-      fallbackError = fallbackFetchError;
-      return [];
-    });
-    if (fallbackRows.length) return fallbackRows;
-    if (fallbackError) {
-      throw new Error(`${error.message}; iFind fallback failed: ${fallbackError.message}`);
-    }
-    throw error;
+    providerErrors.push(`东方财富: ${error.message}`);
   }
+  if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate, 0)) return rows;
+
+  try {
+    rows = mergeKlineRows(rows, await fetchTencentKlineWithRetry(stock, normalizedFromDate, normalizedToDate));
+  } catch (error) {
+    providerErrors.push(`腾讯: ${error.message}`);
+  }
+  if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate)) return rows;
+
+  if (IFIND_KLINE_FALLBACK_ENABLED && process.env.IFIND_REFRESH_TOKEN) {
+    try {
+      rows = mergeKlineRows(rows, await fetchIfindKlineRange(stock, normalizedFromDate, normalizedToDate));
+    } catch (error) {
+      providerErrors.push(`iFind: ${error.message}`);
+    }
+  }
+  if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate)) return rows;
+
+  const latestDate = latestKlineDate(rows) || "未知";
+  const detail = providerErrors.length ? `；${providerErrors.join("；")}` : "";
+  throw new Error(`K线最新日期 ${latestDate}，未补到 ${normalizedToDate}${detail}`);
 }
 
 async function loadCachedKlineRows(stock) {
@@ -4394,7 +4506,7 @@ async function loadCachedKlineRows(stock) {
 
 async function loadBestAvailableKlineForSync(stock, fromDate, toDate) {
   try {
-    const rows = await fetchKlineWithIfindFallback(stock, fromDate, toDate);
+    const rows = await fetchKlineWithProviderFallback(stock, fromDate, toDate);
     return { rows, refreshError: null, usedCacheFallback: false };
   } catch (error) {
     const rows = await loadCachedKlineRows(stock);
@@ -4667,7 +4779,7 @@ async function loadKline(stock) {
       return rows;
     }
   }
-  return fetchKline(stock);
+  return fetchKlineWithProviderFallback(stock, KLINE_DB_START_DATE);
 }
 
 function rowsContainDate(rows, date) {
@@ -4696,7 +4808,7 @@ async function loadKlineForDate(stock, date) {
   }
 
   try {
-    const freshRows = await fetchKlineWithIfindFallback(stock, date, date);
+    const freshRows = await fetchKlineWithProviderFallback(stock, date, date);
     const mergedRows = mergeKlineRows(localRows, freshRows);
     if (date && !rowsContainDate(mergedRows, date)) {
       throw new Error(`${stock.code} K线缺少目标日 ${date}`);
@@ -4737,7 +4849,7 @@ async function loadKlineForPosition(stock, date, entryMode) {
   if (!positionRowsNeedRefresh(rows, normalizedDate, entryMode)) return rows;
 
   try {
-    const freshRows = await fetchKlineWithIfindFallback(stock, normalizedDate);
+    const freshRows = await fetchKlineWithProviderFallback(stock, normalizedDate);
     if (Array.isArray(freshRows) && freshRows.length) return mergeKlineRows(rows, freshRows);
   } catch {
     // Keep the best local data we have. The caller will mark missing horizons as not matured.
@@ -4764,22 +4876,36 @@ function marketIndexCacheFile(index = MARKET_INDEX) {
 }
 
 async function fetchMarketIndexKline(index = MARKET_INDEX) {
-  const url =
-    "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
-    `?secid=${index.secid}` +
-    "&fields1=f1,f2,f3,f4,f5,f6" +
-    "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
-    "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
-  const response = await fetchWithTimeout(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Referer: "https://quote.eastmoney.com/",
-    },
-  });
-  if (!response.ok) throw new Error(`${index.name} K线请求失败：${response.status}`);
-  const json = await response.json();
-  const rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
-  if (!rows.length) throw new Error(`没有找到 ${index.name} 的日 K 数据`);
+  let rows = [];
+  let eastmoneyError = null;
+  try {
+    const url =
+      "https://push2his.eastmoney.com/api/qt/stock/kline/get" +
+      `?secid=${index.secid}` +
+      "&fields1=f1,f2,f3,f4,f5,f6" +
+      "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61" +
+      "&klt=101&fqt=1&beg=20200101&end=20500101&lmt=1000000";
+    const response = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Referer: "https://quote.eastmoney.com/",
+        },
+      },
+      EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
+    );
+    if (!response.ok) throw new Error(`${index.name} K线请求失败：${response.status}`);
+    const json = await response.json();
+    rows = (json.data?.klines || []).map(parseKlineLine).filter(Boolean);
+    if (!rows.length) throw new Error(`没有找到 ${index.name} 的日 K 数据`);
+  } catch (error) {
+    eastmoneyError = error;
+    const indexStock = { code: index.code, market: index.secid?.startsWith("1.") ? "SH" : "SZ" };
+    rows = await fetchTencentKlineWithRetry(indexStock, KLINE_DB_START_DATE, chinaDateYmd(), { persist: false }).catch((tencentError) => {
+      throw new Error(`${eastmoneyError.message}；腾讯兜底失败：${tencentError.message}`);
+    });
+  }
   try {
     fs.mkdirSync(KLINE_DIR, { recursive: true });
     fs.writeFileSync(marketIndexCacheFile(index), JSON.stringify(rows));
@@ -7263,6 +7389,11 @@ module.exports = {
   stockPreSignalMetricsFromRows,
   normalizeStock,
   fetchKlineWithRetry,
+  fetchTencentKline,
+  parseTencentKlineRows,
+  klineRowsCoverTarget,
+  fetchKlineWithProviderFallback,
+  fetchMarketIndexKline,
   loadKlineForDate,
   loadBoardKlineForDate,
   featureRecordFromDailyContext,
