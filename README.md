@@ -242,6 +242,7 @@ Install Command: npm install
 
 ```text
 DATABASE_URL=postgresql://...
+DB_SSL_CA_BASE64=Aiven 项目 CA 的 base64 内容（仅迁移到 Aiven 后需要）
 DB_POOL_MAX=2
 CRON_SECRET=一段随机长字符串
 SYNC_LOOKBACK_DAYS=60

@@ -29,6 +29,13 @@ export PATH="$(brew --prefix libpq)/bin:$PATH"
 
 ```bash
 MIGRATION_TARGET_DATABASE_URL="新 Aiven 连接串"
+MIGRATION_TARGET_SSL_CA_BASE64="Aiven 项目 CA 的 base64 内容"
+```
+
+从 Aiven 服务 Overview 下载 `ca.pem` 后，可在 macOS 生成单行配置值：
+
+```bash
+base64 < ca.pem | tr -d '\n'
 ```
 
 源库默认复用现有 `DATABASE_URL`。只有需要指定另一个源库时，才设置
@@ -40,7 +47,9 @@ MIGRATION_TARGET_DATABASE_URL="新 Aiven 连接串"
 
 ```bash
 npm run db:audit
-AUDIT_DATABASE_URL="$MIGRATION_TARGET_DATABASE_URL" npm run db:audit
+AUDIT_DATABASE_URL="$MIGRATION_TARGET_DATABASE_URL" \
+AUDIT_SSL_CA_BASE64="$MIGRATION_TARGET_SSL_CA_BASE64" \
+npm run db:audit
 ```
 
 目标数据库必须是新建且没有业务表的数据库。执行：
@@ -69,6 +78,7 @@ npm run db:verify:migration
 
 ```text
 DATABASE_URL=<Aiven connection string>
+DB_SSL_CA_BASE64=<Aiven 项目 CA 的 base64 内容>
 DB_POOL_MAX=2
 DB_CONNECTION_TIMEOUT_MS=10000
 DB_IDLE_TIMEOUT_MS=10000

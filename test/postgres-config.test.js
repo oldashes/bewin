@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { buildDatabasePoolConfig } = require("../lib/postgres");
+const { buildDatabasePoolConfig, buildSslConnectionConfig } = require("../lib/postgres");
 
 test("uses conservative serverless PostgreSQL pool defaults", () => {
   const config = buildDatabasePoolConfig("postgresql://example.invalid/db", {});
@@ -25,4 +25,22 @@ test("bounds database pool environment settings", () => {
   assert.equal(config.connectionTimeoutMillis, 1000);
   assert.equal(config.idleTimeoutMillis, 60000);
   assert.equal(config.application_name, "bewin-test");
+});
+
+test("verifies PostgreSQL with a base64-encoded CA certificate", () => {
+  const ca = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n";
+  const config = buildSslConnectionConfig(
+    "postgresql://user:password@example.invalid/db?sslmode=require",
+    Buffer.from(ca).toString("base64"),
+  );
+
+  assert.equal(config.connectionString, "postgresql://user:password@example.invalid/db");
+  assert.deepEqual(config.ssl, { ca, rejectUnauthorized: true });
+});
+
+test("rejects malformed PostgreSQL CA configuration", () => {
+  assert.throws(
+    () => buildSslConnectionConfig("postgresql://example.invalid/db", Buffer.from("not a cert").toString("base64")),
+    /base64-encoded PEM certificate/,
+  );
 });

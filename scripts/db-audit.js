@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { Client } = require("pg");
+const { buildSslConnectionConfig } = require("../lib/postgres");
 
 loadEnv();
 
@@ -11,7 +12,10 @@ async function main() {
   if (!connectionString) throw new Error("AUDIT_DATABASE_URL or DATABASE_URL is required");
 
   const client = new Client({
-    connectionString,
+    ...buildSslConnectionConfig(
+      connectionString,
+      process.env.AUDIT_SSL_CA_BASE64 || process.env.DB_SSL_CA_BASE64,
+    ),
     application_name: "bewin-db-audit",
     connectionTimeoutMillis: 10000,
   });
@@ -19,16 +23,15 @@ async function main() {
   try {
     await client.connect();
 
-    const [{ rows: summaryRows }, { rows: tableRows }, { rows: connectionRows }] = await Promise.all([
-      client.query(`
+    const { rows: summaryRows } = await client.query(`
         select
           current_database() as database,
           current_setting('server_version') as server_version,
           current_setting('max_connections')::int as max_connections,
           pg_database_size(current_database())::bigint as database_bytes,
           pg_size_pretty(pg_database_size(current_database())) as database_size
-      `),
-      client.query(`
+      `);
+    const { rows: tableRows } = await client.query(`
         select
           relname as table_name,
           n_live_tup::bigint as estimated_rows,
@@ -36,13 +39,12 @@ async function main() {
           pg_size_pretty(pg_total_relation_size(relid)) as total_size
         from pg_stat_user_tables
         order by pg_total_relation_size(relid) desc, relname
-      `),
-      client.query(`
+      `);
+    const { rows: connectionRows } = await client.query(`
         select count(*)::int as current_connections
         from pg_stat_activity
         where datname = current_database()
-      `),
-    ]);
+      `);
     const tableNames = new Set(tableRows.map((row) => row.table_name));
     const latestDates = {
       latest_bar: await loadLatestDate(client, tableNames, "stock_daily_bars", "trade_date"),

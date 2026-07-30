@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { Client } = require("pg");
+const { buildSslConnectionConfig } = require("../lib/postgres");
 
 loadEnv();
 
@@ -24,8 +25,16 @@ async function main() {
   }
   if (SOURCE_URL === TARGET_URL) throw new Error("Source and target database URLs must be different");
 
-  const source = createClient(SOURCE_URL, "bewin-migration-verify-source");
-  const target = createClient(TARGET_URL, "bewin-migration-verify-target");
+  const source = createClient(
+    SOURCE_URL,
+    "bewin-migration-verify-source",
+    process.env.MIGRATION_SOURCE_SSL_CA_BASE64,
+  );
+  const target = createClient(
+    TARGET_URL,
+    "bewin-migration-verify-target",
+    process.env.MIGRATION_TARGET_SSL_CA_BASE64,
+  );
 
   try {
     await source.connect();
@@ -66,9 +75,9 @@ async function main() {
   }
 }
 
-function createClient(connectionString, applicationName) {
+function createClient(connectionString, applicationName, caBase64) {
   return new Client({
-    connectionString,
+    ...buildSslConnectionConfig(connectionString, caBase64),
     application_name: applicationName,
     connectionTimeoutMillis: 15000,
   });
