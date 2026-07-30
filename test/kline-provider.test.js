@@ -1,7 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { klineRowsCoverTarget, normalizeStock, parseTencentKlineRows, strategyCoverageIssue } = require("../work/strategy-dashboard/server");
+const {
+  featureRunCoverageIssue,
+  klineRowsCoverTarget,
+  normalizeStock,
+  parseTencentKlineRows,
+  strategyCoverageIssue,
+} = require("../work/strategy-dashboard/server");
 
 test("parses Tencent enriched qfq daily bars", () => {
   const rows = parseTencentKlineRows({
@@ -82,4 +88,52 @@ test("keeps zero hits valid when the required popularity range is covered", () =
   });
 
   assert.equal(issue, null);
+});
+
+test("marks a feature run incomplete when generated features materially trail ranked candidates", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-07-15",
+    featureCount: 54,
+    run: {
+      status: "partial",
+      details: {
+        rankedCandidateCount: 72,
+        klineStats: { remainingTargetCount: 18 },
+      },
+    },
+  });
+
+  assert.equal(issue.code, "feature_coverage_partial");
+  assert.match(issue.message, /54/);
+  assert.match(issue.message, /72/);
+});
+
+test("accepts a nearly complete feature run", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-07-01",
+    featureCount: 88,
+    run: {
+      status: "success",
+      details: { rankedCandidateCount: 89 },
+    },
+  });
+
+  assert.equal(issue, null);
+});
+
+test("marks an interrupted feature run incomplete even before expected counts are known", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-07-28",
+    featureCount: 0,
+    run: {
+      status: "timeout",
+      details: {},
+    },
+  });
+
+  assert.equal(issue.code, "feature_coverage_partial");
+  assert.equal(issue.level, "error");
 });

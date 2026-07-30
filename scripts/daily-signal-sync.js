@@ -16,6 +16,7 @@ runDailySignalGeneration({
   rankMax: process.env.SIGNAL_RANK_MAX,
   concurrency: process.env.SIGNAL_CONCURRENCY,
   boardMode: process.env.SIGNAL_BOARD_MODE,
+  fetchMissingRankMax: envAtLeast("SIGNAL_FETCH_MISSING_RANK_MAX", 160),
   fetchMissingKlineMax: envAtLeast("SIGNAL_FETCH_MISSING_KLINE_MAX", 32),
   force: process.env.SIGNAL_FORCE,
 })

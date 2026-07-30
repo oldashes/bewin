@@ -29,6 +29,10 @@
     {
       "path": "/api/cron/daily-signal-fallback",
       "schedule": "0 12 * * 1-5"
+    },
+    {
+      "path": "/api/cron/daily-signal-backfill",
+      "schedule": "30 13 * * 1-5"
     }
   ],
   "rewrites": [
