@@ -598,6 +598,20 @@ function MetricCard({ title, help, value, detail, tone, icon }: AnyRecord) {
 function Metrics({ daily }: { daily?: AnyRecord }) {
   const stats = daily?.stats || {};
   const signal = daily?.signalStats || {};
+  const candidateCount = toFiniteNumber(stats.count);
+  const noSamples = candidateCount === 0;
+  const returnValue = (value: unknown) => {
+    if (candidateCount === null) return "-";
+    if (noSamples) return <span className="tone muted">无样本</span>;
+    return <ToneText value={value} />;
+  };
+  const returnDetail = (win: unknown, median: unknown) => (
+    candidateCount === null
+      ? "等待数据"
+      : noSamples
+        ? "当日无候选，无法计算收益"
+        : `胜率 ${pct(win, 1)}，中位数 ${pct(median)}`
+  );
   return (
     <SimpleGrid cols={{ base: 2, md: 4 }} spacing="md">
       <MetricCard
@@ -608,8 +622,8 @@ function Metrics({ daily }: { daily?: AnyRecord }) {
         icon={<IconTargetArrow size={18} />}
       />
       <MetricCard title="推荐板块" help="按候选股票聚合出的行业或概念数量。" value={daily?.boards?.length ?? "-"} detail="按候选股聚合" icon={<IconChartBar size={18} />} />
-      <MetricCard title="5日均值 / 胜率" help="信号次日开盘买入，持有5个交易日收盘卖出的平均收益和胜率。" value={<ToneText value={stats.avgRet5} />} detail={`胜率 ${pct(stats.win5, 1)}，中位数 ${pct(stats.medianRet5)}`} tone={valueTone(stats.avgRet5)} />
-      <MetricCard title="20日均值 / 胜率" help="信号次日开盘买入，持有20个交易日收盘卖出的平均收益和胜率。" value={<ToneText value={stats.avgRet20} />} detail={`胜率 ${pct(stats.win20, 1)}，中位数 ${pct(stats.medianRet20)}`} tone={valueTone(stats.avgRet20)} />
+      <MetricCard title="5日均值 / 胜率" help="信号次日开盘买入，持有5个交易日收盘卖出的平均收益和胜率。" value={returnValue(stats.avgRet5)} detail={returnDetail(stats.win5, stats.medianRet5)} tone={noSamples ? "" : valueTone(stats.avgRet5)} />
+      <MetricCard title="20日均值 / 胜率" help="信号次日开盘买入，持有20个交易日收盘卖出的平均收益和胜率。" value={returnValue(stats.avgRet20)} detail={returnDetail(stats.win20, stats.medianRet20)} tone={noSamples ? "" : valueTone(stats.avgRet20)} />
       <MetricCard title="首次 / 延续" help="波段首次信号与同一股票延续信号数量。" value={`${signal.first ?? 0} / ${signal.continuation ?? 0}`} detail="首次 / 延续" />
       <MetricCard title="观察池" help="不直接追，用于等待回踩或二次确认的候选数。" value={signal.waitForConfirm ?? 0} detail="不直接追" tone="watch" />
       <MetricCard title="过热提示" help="个股已加速或板块偏热的数量。" value={`${signal.accelerated ?? 0} / ${signal.boardHot ?? 0}`} detail="个股已加速 / 板块偏热" />
