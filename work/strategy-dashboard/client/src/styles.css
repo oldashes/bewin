@@ -419,6 +419,13 @@ a {
   white-space: nowrap;
 }
 
+.timelineGrid .timelineNoSample {
+  color: #8a9bb3;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .timelineGrid strong {
   font-size: 15px;
 }

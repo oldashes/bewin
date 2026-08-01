@@ -343,6 +343,12 @@ function ToneText({ value, children }: { value: unknown; children?: ReactNode })
   return <span className={`tone ${valueTone(value)}`}>{children ?? pct(value)}</span>;
 }
 
+function TimelineReturn({ row, value }: { row: AnyRecord; value: unknown }) {
+  if (row.computable === false) return <span className="coverageMissing">不可算</span>;
+  if ((toFiniteNumber(row.count) ?? 0) <= 0) return <span className="timelineNoSample">无样本</span>;
+  return <ToneText value={value} />;
+}
+
 function tagColor(item: string) {
   if (/双源共振/.test(item)) return "green";
   if (/共振/.test(item)) return "teal";
@@ -805,25 +811,35 @@ function TimelinePanel({ rows, selectedDate, setDate }: { rows: AnyRecord[]; sel
         <span>日期 <HelpTip label="策略在该交易日生成候选股票的日期。" /></span>
         <span>数 <HelpTip label="该信号日满足当前过滤条件的候选数量。" /></span>
         <span>强度 <HelpTip label="按列表最大候选数归一化的信号密度条，不代表收益强弱。" /></span>
-        <span>5日 <HelpTip label="当日候选 5 个交易日后的平均收益。" /></span>
-        <span>20日 <HelpTip label="当日候选 20 个交易日后的平均收益。" /></span>
+        <span>5日 <HelpTip label="有候选时，按信号次日开盘买入、持有 5 个交易日后的平均累计收益；没有候选显示“无样本”，持有期不足显示“未到期”。" /></span>
+        <span>20日 <HelpTip label="有候选时，按信号次日开盘买入、持有 20 个交易日后的平均累计收益；没有候选显示“无样本”，持有期不足显示“未到期”。" /></span>
       </div>
       <ScrollArea.Autosize mah={520} type="auto" offsetScrollbars>
         <Stack gap={4} p="xs">
-          {visibleRows.slice().reverse().map((row) => (
-            <UnstyledButton
-              key={row.date}
-              className={`timelineGrid row ${row.date === selectedDate ? "active" : ""} ${row.computable === false ? "insufficient" : ""}`}
-              onClick={() => setDate(row.date)}
-              title={row.dataIssue?.message || undefined}
-            >
-              <strong>{row.date}</strong>
-              <span className={row.computable === false ? "coverageMissing" : ""}>{row.computable === false ? "不足" : `${row.count}只`}</span>
-              <Progress value={row.computable === false ? 0 : Math.max(6, (row.count / maxCount) * 100)} size="sm" radius="xl" color={row.computable === false ? "yellow" : undefined} />
-              {row.computable === false ? <span className="coverageMissing">不可算</span> : <ToneText value={row.avgRet5} />}
-              {row.computable === false ? <span className="coverageMissing">不可算</span> : <ToneText value={row.avgRet20} />}
-            </UnstyledButton>
-          ))}
+          {visibleRows.slice().reverse().map((row) => {
+            const count = Math.max(0, toFiniteNumber(row.count) ?? 0);
+            const noSamples = row.computable !== false && count === 0;
+            const rowTitle = row.dataIssue?.message || (noSamples ? "该交易日没有候选，无法计算候选组合收益。" : undefined);
+            return (
+              <UnstyledButton
+                key={row.date}
+                className={`timelineGrid row ${row.date === selectedDate ? "active" : ""} ${row.computable === false ? "insufficient" : ""}`}
+                onClick={() => setDate(row.date)}
+                title={rowTitle}
+              >
+                <strong>{row.date}</strong>
+                <span className={row.computable === false ? "coverageMissing" : ""}>{row.computable === false ? "不足" : `${count}只`}</span>
+                <Progress
+                  value={row.computable === false || noSamples ? 0 : Math.max(6, (count / maxCount) * 100)}
+                  size="sm"
+                  radius="xl"
+                  color={row.computable === false ? "yellow" : undefined}
+                />
+                <TimelineReturn row={row} value={row.avgRet5} />
+                <TimelineReturn row={row} value={row.avgRet20} />
+              </UnstyledButton>
+            );
+          })}
         </Stack>
       </ScrollArea.Autosize>
     </Paper>
