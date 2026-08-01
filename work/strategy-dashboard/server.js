@@ -3511,10 +3511,19 @@ function syncRunView(row) {
 }
 
 function featureRunCoverageIssue({ sourceKey, selectedDate, featureCount, run }) {
-  if (!run) return null;
+  const actualCount = Math.max(0, Number(featureCount) || 0);
+  if (!run) {
+    if (actualCount > 0) return null;
+    const sourceLabel = DATA_SOURCES[sourceKey]?.label || sourceKey;
+    return {
+      level: "warning",
+      code: "feature_data_missing",
+      message: `${sourceLabel} ${selectedDate || "该日期"} 没有策略特征，也没有找到特征生成记录；当前不能把 0 个候选解释为策略未命中。`,
+      detail: "features 0; feature run missing",
+    };
+  }
   const details = run.details && typeof run.details === "object" ? run.details : {};
   const expectedCount = Number(details.rankedCandidateCount);
-  const actualCount = Math.max(0, Number(featureCount) || 0);
   const missingCount = Number.isFinite(expectedCount) ? Math.max(0, expectedCount - actualCount) : null;
   const missingRatio = Number.isFinite(expectedCount) && expectedCount > 0 ? missingCount / expectedCount : 0;
   const klineStats = details.klineStats && typeof details.klineStats === "object" ? details.klineStats : {};
@@ -3848,7 +3857,17 @@ async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate
 
 function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
   const coverage = diagnostics?.rankCoverage;
-  if (!coverage || Number(diagnostics?.finalCount) > 0) return null;
+  if (Number(diagnostics?.finalCount) > 0) return null;
+  const sourceLabel = DATA_SOURCES[sourceKey]?.label || sourceKey;
+  const strategyName = strategyLabel || "当前策略";
+  if (!coverage || Number(coverage.count) <= 0) {
+    return {
+      level: "warning",
+      code: "feature_data_missing",
+      message: `${sourceLabel}当前没有可用于计算${strategyName}的策略特征；0 个候选表示数据不足，不代表策略未命中。`,
+      detail: "feature rank coverage empty",
+    };
+  }
   const minRank = Number(coverage.minRank);
   const maxRank = Number(coverage.maxRank);
   const requiredMin = Number(coverage.requiredMin);
@@ -3863,8 +3882,6 @@ function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
     return null;
   }
 
-  const sourceLabel = DATA_SOURCES[sourceKey]?.label || sourceKey;
-  const strategyName = strategyLabel || "当前策略";
   if (maxRank < requiredMin) {
     return {
       level: "warning",
@@ -3881,7 +3898,12 @@ function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
       detail: `feature rank coverage ${minRank}-${maxRank}; required ${requiredMin}-${requiredMax}`,
     };
   }
-  return null;
+  return {
+    level: "warning",
+    code: "rank_target_range_missing",
+    message: `${sourceLabel}当前特征排名表面覆盖 ${minRank}-${maxRank}，但${strategyName}需要的 ${requiredMin}-${requiredMax} 区间实际没有样本；当前不能把 0 个候选解释为策略未命中。`,
+    detail: `feature rank coverage ${minRank}-${maxRank}; required ${requiredMin}-${requiredMax}; in range 0`,
+  };
 }
 
 function applyStrategyDataIssue(freshness, diagnostics, dataSource) {
@@ -4039,9 +4061,10 @@ async function timelinePayload(query) {
   const coverageDates = await computedDataCoverageDates(data.sourceKey);
   const dates = displayDateRange(coverageDates.length ? coverageDates : signalDates, query.date);
   const map = strict ? data.byDate : data.allByDate;
+  const databaseCoverageEnabled = shouldUseDatabase(data.sourceKey);
   let rankCoverageByDate = new Map();
   let featureRunByDate = new Map();
-  if (process.env.DATABASE_URL && dates.length) {
+  if (databaseCoverageEnabled && dates.length) {
     try {
       const params = await strategyParamsForDiagnostics(data.sourceKey, strategyKey, temporaryStrategy);
       const featureJobName = data.sourceKey === "ths" ? THS_FEATURE_JOB : DAILY_SIGNAL_JOB;
@@ -4110,15 +4133,17 @@ async function timelinePayload(query) {
     const events = map.get(date) || [];
     const summary = summarize(events);
     const featureCoverage = rankCoverageByDate.get(date);
-    const runCoverageIssue = featureRunCoverageIssue({
-      sourceKey: data.sourceKey,
-      selectedDate: date,
-      featureCount: featureCoverage?.count || 0,
-      run: featureRunByDate.get(date),
-    });
+    const runCoverageIssue = databaseCoverageEnabled
+      ? featureRunCoverageIssue({
+          sourceKey: data.sourceKey,
+          selectedDate: date,
+          featureCount: featureCoverage?.count || 0,
+          run: featureRunByDate.get(date),
+        })
+      : null;
     const coverageIssue =
       runCoverageIssue ||
-      (summary.count === 0
+      (databaseCoverageEnabled && summary.count === 0
         ? strategyCoverageIssue({
             sourceKey: data.sourceKey,
             strategyLabel: data.dataSource?.strategy?.shortLabel || data.dataSource?.strategy?.label,

@@ -90,6 +90,48 @@ test("keeps zero hits valid when the required popularity range is covered", () =
   assert.equal(issue, null);
 });
 
+test("marks sparse popularity coverage invalid when the target interval has no samples", () => {
+  const issue = strategyCoverageIssue({
+    sourceKey: "ths",
+    strategyLabel: "强共振收益",
+    diagnostics: {
+      finalCount: 0,
+      rankCoverage: {
+        count: 12,
+        minRank: 3,
+        maxRank: 1450,
+        requiredMin: 400,
+        requiredMax: 1200,
+        inRangeCount: 0,
+      },
+    },
+  });
+
+  assert.equal(issue.code, "rank_target_range_missing");
+});
+
+test("does not interpret an absent feature run and empty feature pool as zero hits", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-07-31",
+    featureCount: 0,
+    run: null,
+  });
+
+  assert.equal(issue.code, "feature_data_missing");
+});
+
+test("accepts imported feature rows even when no generation run was recorded", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-06-26",
+    featureCount: 120,
+    run: null,
+  });
+
+  assert.equal(issue, null);
+});
+
 test("marks a feature run incomplete when generated features materially trail ranked candidates", () => {
   const issue = featureRunCoverageIssue({
     sourceKey: "em",
