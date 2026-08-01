@@ -3691,13 +3691,6 @@ async function dailyFreshness({ sourceKey, selectedDate }) {
         }
       : runCoverageIssue
         ? runCoverageIssue
-        : klineStats && Number(klineStats.remainingTargetCount) > 0
-        ? {
-            level: "warning",
-            code: "kline_coverage_low",
-            message: "K线目标日覆盖不足，部分候选会被跳过。",
-            detail: `缺 ${klineStats.missingTargetCount}，尝试补 ${klineStats.fetchAttempted || 0}，成功 ${klineStats.fetchSucceeded || 0}`,
-          }
         : null;
     return {
       sourceKey,
@@ -4666,6 +4659,12 @@ function klineRowsCoverTarget(rows, fromDate, toDate, maxLagDays = KLINE_PROVIDE
   return lagDays <= boundedInteger(maxLagDays, 7, 0, 30);
 }
 
+function klineRowsProveTargetUnavailable(rows, targetDate) {
+  const target = normalizeDate(targetDate);
+  if (!target || !Array.isArray(rows) || !rows.length || rowsContainDate(rows, target)) return false;
+  return rows.some((row) => normalizeDate(row?.date) > target);
+}
+
 async function fetchKlineWithProviderFallback(stock, fromDate, toDate = dateFromYmd(chinaDateYmd())) {
   const normalizedFromDate = normalizeDate(fromDate) || toDate;
   const normalizedToDate = normalizeDate(toDate) || normalizedFromDate;
@@ -4695,6 +4694,23 @@ async function fetchKlineWithProviderFallback(stock, fromDate, toDate = dateFrom
     }
   }
   if (klineRowsCoverTarget(rows, normalizedFromDate, normalizedToDate)) return rows;
+
+  if (
+    normalizedFromDate === normalizedToDate &&
+    klineRowsProveTargetUnavailable(rows, normalizedToDate)
+  ) {
+    const nextDate = rows
+      .map((row) => normalizeDate(row?.date))
+      .filter((date) => date && date > normalizedToDate)
+      .sort()[0];
+    const error = new Error(
+      `K线目标日 ${normalizedToDate} 无交易记录${nextDate ? `，下一交易日 ${nextDate}` : ""}`,
+    );
+    error.code = "KLINE_TARGET_UNAVAILABLE";
+    error.targetDate = normalizedToDate;
+    error.nextDate = nextDate || null;
+    throw error;
+  }
 
   const latestDate = latestKlineDate(rows) || "未知";
   const detail = providerErrors.length ? `；${providerErrors.join("；")}` : "";
@@ -7514,6 +7530,7 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   const fetchConcurrency = boundedInteger(options.concurrency, DEFAULT_SIGNAL_CONCURRENCY, 1, 16);
   const missingAllCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
   const missingCodes = missingAllCodes.slice(0, fetchMissingMax);
+  const unavailableTargetCodes = new Set();
   if (stats) {
     stats.requestedCount = codes.length;
     stats.cachedRowCount = rows.length;
@@ -7523,6 +7540,8 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     stats.fetchAttempted = 0;
     stats.fetchSucceeded = 0;
     stats.fetchFailed = 0;
+    stats.targetUnavailableCount = 0;
+    stats.targetUnavailableCodes = [];
   }
   await mapLimit(missingCodes, fetchConcurrency, async (code) => {
     if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)) return;
@@ -7536,6 +7555,14 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
         if (stats) stats.fetchSucceeded += 1;
       }
     } catch (error) {
+      if (error?.code === "KLINE_TARGET_UNAVAILABLE") {
+        unavailableTargetCodes.add(code);
+        if (stats) {
+          stats.targetUnavailableCount += 1;
+          if (stats.targetUnavailableCodes.length < 20) stats.targetUnavailableCodes.push(code);
+        }
+        return;
+      }
       if (stats) {
         stats.fetchFailed += 1;
         stats.lastFetchError = error.message;
@@ -7547,7 +7574,11 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     }
   });
   if (stats) {
-    stats.remainingTargetCount = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate)).length;
+    stats.remainingTargetCount = codes.filter(
+      (code) =>
+        !unavailableTargetCodes.has(code) &&
+        !(byCode.get(code) || []).some((row) => row.date === targetDate),
+    ).length;
   }
 
   return byCode;
@@ -7986,6 +8017,7 @@ module.exports = {
   fetchTencentKline,
   parseTencentKlineRows,
   klineRowsCoverTarget,
+  klineRowsProveTargetUnavailable,
   strategyCoverageIssue,
   featureRunCoverageIssue,
   fetchKlineWithProviderFallback,

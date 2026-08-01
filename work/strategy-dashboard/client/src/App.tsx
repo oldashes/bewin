@@ -426,7 +426,7 @@ function FreshnessBadges({ daily }: { daily?: AnyRecord }) {
       {dataIssue ? <Text size="xs" c={dataIssue.level === "error" ? "red" : "yellow"}>{dataIssue.message}</Text> : null}
       {freshness.klineStats ? (
         <Text size="xs">
-          K线补齐：目标缺 {freshness.klineStats.missingTargetCount ?? 0} · 尝试 {freshness.klineStats.fetchAttempted ?? 0} · 成功 {freshness.klineStats.fetchSucceeded ?? 0} · 失败 {freshness.klineStats.fetchFailed ?? 0}
+          K线补齐：初始缺 {freshness.klineStats.missingTargetCount ?? 0} · 已补 {freshness.klineStats.fetchSucceeded ?? 0} · 目标日无交易 {freshness.klineStats.targetUnavailableCount ?? 0} · 仍缺 {freshness.klineStats.remainingTargetCount ?? 0} · 失败 {freshness.klineStats.fetchFailed ?? 0}
         </Text>
       ) : null}
       {Array.isArray(diagnostics.steps) && diagnostics.steps.length ? (

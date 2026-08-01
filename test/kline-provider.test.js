@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   featureRunCoverageIssue,
   klineRowsCoverTarget,
+  klineRowsProveTargetUnavailable,
   normalizeStock,
   parseTencentKlineRows,
   strategyCoverageIssue,
@@ -50,6 +51,15 @@ test("accepts a recent prior trading day but rejects stale K-line coverage", () 
   assert.equal(klineRowsCoverTarget(rows, "2026-07-01", "2026-07-30", 0), false);
   assert.equal(klineRowsCoverTarget(rows, "2026-06-01", "2026-08-15"), false);
   assert.equal(klineRowsCoverTarget(rows, "2026-07-30", "2026-07-30"), false);
+});
+
+test("distinguishes a target-day trading halt from provider coverage failure", () => {
+  const resumedRows = [{ date: "2026-07-24" }, { date: "2026-07-30" }];
+  const staleRows = [{ date: "2026-07-24" }];
+
+  assert.equal(klineRowsProveTargetUnavailable(resumedRows, "2026-07-29"), true);
+  assert.equal(klineRowsProveTargetUnavailable(resumedRows, "2026-07-30"), false);
+  assert.equal(klineRowsProveTargetUnavailable(staleRows, "2026-07-29"), false);
 });
 
 test("marks a zero-hit day as not computable when popularity ranks are too shallow", () => {
@@ -159,6 +169,23 @@ test("accepts a nearly complete feature run", () => {
     run: {
       status: "success",
       details: { rankedCandidateCount: 89 },
+    },
+  });
+
+  assert.equal(issue, null);
+});
+
+test("does not raise a global warning for a negligible K-line gap", () => {
+  const issue = featureRunCoverageIssue({
+    sourceKey: "em",
+    selectedDate: "2026-07-29",
+    featureCount: 199,
+    run: {
+      status: "partial",
+      details: {
+        rankedCandidateCount: 201,
+        klineStats: { remainingTargetCount: 2 },
+      },
     },
   });
 
