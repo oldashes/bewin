@@ -8763,6 +8763,7 @@ function readRequestBody(req) {
 async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   const method = String(options.method || "GET").toUpperCase();
   const body = normalizeRequestBody(options.body);
+  if (pathname === "/api/overview" && query.mode === "data-health") return dataHealthPayload(query);
   if (pathname === "/api/overview") return overviewPayload(query);
   if (pathname === "/api/daily") return dailyPayload(query);
   if (pathname === "/api/timeline") return timelinePayload(query);
