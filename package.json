@@ -13,6 +13,7 @@
     "db:schema": "node scripts/db-schema.js",
     "db:migrate:postgres": "bash scripts/migrate-postgres.sh",
     "db:verify:migration": "node scripts/verify-postgres-migration.js",
+    "health:data": "node scripts/data-health-check.js",
     "db:import": "node scripts/import-signals.js",
     "db:import-features": "node scripts/import-feature-events.js",
     "db:import-klines": "node scripts/import-klines.js",

@@ -2,13 +2,116 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  classifyDataPipelineHealth,
+  completedMarketDateFromTimestamp,
+  eastmoneyQuoteRow,
   featureRunCoverageIssue,
+  defaultCompletedMarketYmd,
   klineRowsCoverTarget,
   klineRowsProveTargetUnavailable,
+  klineRowsSupportFeatures,
   normalizeStock,
   parseTencentKlineRows,
   strategyCoverageIssue,
 } = require("../work/strategy-dashboard/server");
+
+test("targets the latest completed weekday instead of the latest cached database date", () => {
+  assert.equal(defaultCompletedMarketYmd(new Date("2026-08-03T01:00:00Z")), "20260731");
+  assert.equal(defaultCompletedMarketYmd(new Date("2026-08-02T12:00:00Z")), "20260731");
+  assert.equal(defaultCompletedMarketYmd(new Date("2026-08-03T09:00:00Z")), "20260803");
+});
+
+test("uses the market quote timestamp as the authoritative latest trading date", () => {
+  const timestamp = Math.floor(new Date("2026-10-09T07:00:00Z").getTime() / 1000);
+  assert.equal(completedMarketDateFromTimestamp(timestamp, "2026-10-10"), "2026-10-09");
+  assert.equal(completedMarketDateFromTimestamp(timestamp, "2026-10-08"), null);
+});
+
+test("parses a completed Eastmoney batch quote only for the requested market date", () => {
+  const timestamp = Math.floor(new Date("2026-08-03T07:00:00Z").getTime() / 1000);
+  const record = eastmoneyQuoteRow(
+    { f2: 12.5, f3: 2.04, f4: 0.25, f5: 1000, f6: 500000, f7: 3, f8: 1.2, f12: "300458", f14: "全志科技", f15: 12.8, f16: 12.1, f17: 12.2, f124: timestamp },
+    normalizeStock("300458"),
+    "2026-08-03",
+  );
+
+  assert.equal(record.stock.name, "全志科技");
+  assert.equal(record.row.close, 12.5);
+  assert.equal(eastmoneyQuoteRow({ f2: 12.5, f12: "300458", f17: 12.2, f124: timestamp }, normalizeStock("300458"), "2026-08-04"), null);
+});
+
+test("requires enough target-day history for strategy features", () => {
+  const dates = Array.from({ length: 25 }, (_, index) => {
+    const date = new Date("2026-07-01T00:00:00Z");
+    date.setUTCDate(date.getUTCDate() + index);
+    return date.toISOString().slice(0, 10);
+  });
+  const rows = dates.map((date, index) => ({
+    date,
+    close: 10 + index,
+    amount: 100 + index,
+    turnover: 1,
+  }));
+  const targetDate = dates.at(-1);
+  const expectedTradingDates = dates.slice(-21);
+
+  assert.equal(klineRowsSupportFeatures(rows, targetDate, expectedTradingDates), true);
+  assert.equal(klineRowsSupportFeatures(rows.slice(-10), targetDate, expectedTradingDates), false);
+
+  const threeMissing = rows.filter((row) => !expectedTradingDates.slice(3, 6).includes(row.date));
+  assert.equal(klineRowsSupportFeatures(threeMissing, targetDate, expectedTradingDates), true);
+
+  const fourMissing = rows.filter((row) => !expectedTradingDates.slice(3, 7).includes(row.date));
+  assert.equal(klineRowsSupportFeatures(fourMissing, targetDate, expectedTradingDates), false);
+});
+
+test("classifies pipeline failures separately from valid strategy zero hits", () => {
+  assert.equal(
+    classifyDataPipelineHealth({ sourceKey: "em", snapshotCount: 300, featureCount: 0, klineCount: 300, featureRun: { status: "timeout" } }).code,
+    "feature_missing",
+  );
+  assert.equal(
+    classifyDataPipelineHealth({ sourceKey: "em", snapshotCount: 300, featureCount: 180, klineCount: 300, featureRun: { status: "success" } }).code,
+    "ok",
+  );
+  assert.equal(
+    classifyDataPipelineHealth({
+      sourceKey: "em",
+      snapshotCount: 300,
+      featureCount: 0,
+      klineCount: 300,
+      featureRun: {
+        status: "success",
+        details: { rankedCandidateCount: 0, rankStats: {}, klineStats: {} },
+      },
+    }).code,
+    "no_ranked_candidates",
+  );
+  assert.equal(
+    classifyDataPipelineHealth({ sourceKey: "em", snapshotCount: 300, featureCount: 180, klineCount: 100, featureRun: { status: "success" } }).code,
+    "kline_coverage_low",
+  );
+  assert.equal(
+    classifyDataPipelineHealth({
+      sourceKey: "em",
+      targetDate: "2026-08-06",
+      snapshotCount: 300,
+      featureCount: 180,
+      klineCount: 300,
+      featureRun: {
+        status: "success",
+        details: {
+          rankedCandidateCount: 100,
+          klineCandidateCount: 100,
+          featureCount: 100,
+          rankStats: { remainingTargetCount: 0 },
+          klineStats: { remainingTargetCount: 0 },
+        },
+      },
+    }).code,
+    "feature_store_mismatch",
+  );
+});
 
 test("parses Tencent enriched qfq daily bars", () => {
   const rows = parseTencentKlineRows({

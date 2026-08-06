@@ -4,7 +4,7 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { types } = require("pg");
-const { createDatabasePool } = require("../../lib/postgres");
+const { connectDatabaseClient, createDatabasePool } = require("../../lib/postgres");
 
 types.setTypeParser(1082, (value) => value);
 
@@ -30,7 +30,7 @@ const THS_SYNC_JOB = "ths-popularity-refresh";
 const THS_FEATURE_JOB = "ths-feature-generate";
 const DAILY_SIGNAL_JOB = "daily-signal-generate";
 const DEFAULT_THS_WATCHLIST_MAX = 80;
-const DEFAULT_SIGNAL_MAX_UNIVERSE = 240;
+const DEFAULT_SIGNAL_MAX_UNIVERSE = 480;
 const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 6;
 const DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX = 160;
@@ -38,6 +38,7 @@ const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_RANK_MAX = 360;
 const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
 const DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX = 32;
 const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX = 200;
+const EASTMONEY_QUOTE_BATCH_SIZE = 60;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const EASTMONEY_KLINE_FETCH_TIMEOUT_MS = Number(process.env.EASTMONEY_KLINE_FETCH_TIMEOUT_MS || 6000);
 const TENCENT_KLINE_FETCH_TIMEOUT_MS = Number(process.env.TENCENT_KLINE_FETCH_TIMEOUT_MS || 10000);
@@ -55,6 +56,8 @@ const MARKET_INDEX = {
   code: "000300",
   secid: "1.000300",
 };
+
+const expectedTradingDatesCache = new Map();
 
 const PSEUDO_BOARD_RE =
   /(百日|新高|新低|昨日|近期|最近|连板|涨停|打板|首板|触板|一字|破板|竞价|低价|高价|融资|沪股通|深股通|破净|红利|ST|季报|年报|预增|预盈|预亏|业绩|基金|重仓|成份|送转|转债|MSCI|富时|标普|证金|养老金)/;
@@ -624,37 +627,56 @@ function chinaClockParts(date = new Date()) {
 function defaultCompletedMarketYmd(date = new Date()) {
   const ymd = chinaDateYmd(date);
   const { hour } = chinaClockParts(date);
-  return hour < 16 ? shiftYmd(ymd, -1) : ymd;
+  let candidate = hour < 16 ? shiftYmd(ymd, -1) : ymd;
+  for (let index = 0; index < 7; index += 1) {
+    const normalized = dateFromYmd(candidate);
+    const weekday = normalized ? new Date(`${normalized}T00:00:00Z`).getUTCDay() : -1;
+    if (weekday >= 1 && weekday <= 5) return candidate;
+    candidate = shiftYmd(candidate, -1);
+  }
+  return candidate;
 }
 
-async function resolveMarketTargetDate(rawDate, sourceKey = null) {
+async function resolveMarketTargetDate(rawDate) {
   const explicitDate = normalizeDate(rawDate);
   if (explicitDate) return explicitDate;
   const candidateDate = dateFromYmd(defaultCompletedMarketYmd());
-  if (!process.env.DATABASE_URL) return candidateDate;
-
+  // Automated jobs must advance to the latest completed market weekday even
+  // when the database is stale. Clamping this value to max(database_date)
+  // made a failed ingestion day permanently self-reinforcing.
   try {
-    const { rows } = await getDbPool().query(
-      `
-        select max(day)::text as date
-        from (
-          select trade_date as day
-          from stock_daily_bars
-          where trade_date <= $1::date
-          union all
-          select snapshot_date as day
-          from popularity_snapshots
-          where snapshot_date <= $1::date
-            and category = 'stock'
-            and ($2::text is null or source = $2)
-        ) d
-      `,
-      [candidateDate, sourceKey || null],
-    );
-    return normalizeDate(rows[0]?.date) || candidateDate;
+    return (await fetchLatestMarketTradingDate(candidateDate)) || candidateDate;
   } catch {
     return candidateDate;
   }
+}
+
+function completedMarketDateFromTimestamp(timestamp, candidateDate) {
+  const epoch = n(timestamp);
+  const quoteDate = Number.isFinite(epoch) ? dateFromYmd(chinaDateYmd(new Date(epoch * 1000))) : "";
+  if (!quoteDate || !candidateDate || quoteDate > candidateDate) return null;
+  return quoteDate;
+}
+
+async function fetchLatestMarketTradingDate(candidateDate) {
+  const url =
+    "https://push2.eastmoney.com/api/qt/ulist.np/get" +
+    `?fltt=2&secids=${encodeURIComponent(MARKET_INDEX.secid)}` +
+    "&fields=f12,f14,f124";
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://quote.eastmoney.com/",
+      },
+    },
+    EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
+  );
+  if (!response.ok) throw new Error(`交易日请求失败：${response.status}`);
+  const payload = await response.json();
+  const row = Array.isArray(payload?.data?.diff) ? payload.data.diff[0] : Object.values(payload?.data?.diff || {})[0];
+  return completedMarketDateFromTimestamp(row?.f124, candidateDate);
 }
 
 function chinaMinuteKey(date = new Date()) {
@@ -3510,6 +3532,37 @@ function syncRunView(row) {
   };
 }
 
+function syncRunHealthView(row) {
+  const run = syncRunView(row);
+  if (!run) return null;
+  const details = run.details || {};
+  const coverageStats = (value) => {
+    if (!value || typeof value !== "object") return null;
+    return {
+      requestedCount: Number(value.requestedCount) || 0,
+      cachedTargetCount: Number(value.cachedTargetCount) || 0,
+      missingTargetCount: Number(value.missingTargetCount) || 0,
+      fetchAttempted: Number(value.fetchAttempted) || 0,
+      fetchSucceeded: Number(value.fetchSucceeded) || 0,
+      fetchFailed: Number(value.fetchFailed) || 0,
+      remainingTargetCount: Number(value.remainingTargetCount) || 0,
+      authError: value.authError || null,
+    };
+  };
+  return {
+    ...run,
+    details: {
+      generatedDate: normalizeDate(details.generatedDate || details.targetDate || details.params?.targetDate),
+      rankedCandidateCount: Number(details.rankedCandidateCount) || 0,
+      klineCandidateCount: Number(details.klineCandidateCount) || 0,
+      featureCount: Number(details.featureCount) || 0,
+      stoppedByTimeBudget: details.stoppedByTimeBudget === true,
+      rankStats: coverageStats(details.rankStats),
+      klineStats: coverageStats(details.klineStats),
+    },
+  };
+}
+
 function featureRunCoverageIssue({ sourceKey, selectedDate, featureCount, run }) {
   const actualCount = Math.max(0, Number(featureCount) || 0);
   if (!run) {
@@ -3530,10 +3583,26 @@ function featureRunCoverageIssue({ sourceKey, selectedDate, featureCount, run })
   const rankStats = details.rankStats && typeof details.rankStats === "object" ? details.rankStats : {};
   const klineRemaining = Math.max(0, Number(klineStats.remainingTargetCount) || 0);
   const rankRemaining = Math.max(0, Number(rankStats.remainingTargetCount) || 0);
+  const hasGeneratedCount = Object.prototype.hasOwnProperty.call(details, "featureCount");
+  const generatedCount = hasGeneratedCount ? Math.max(0, Number(details.featureCount) || 0) : null;
+  const storeMismatch =
+    run.status === "success" &&
+    Number.isFinite(generatedCount) &&
+    actualCount !== generatedCount;
+  if (storeMismatch) {
+    const sourceLabel = DATA_SOURCES[sourceKey]?.label || sourceKey;
+    return {
+      level: "error",
+      code: "feature_store_mismatch",
+      message: `${sourceLabel} ${selectedDate || "该日期"} 本次生成 ${generatedCount} 个特征，但数据库实际有 ${actualCount} 个；可能存在旧特征残留，当前候选结果不可视为完整策略结论。`,
+      detail: `generated features ${generatedCount}; stored features ${actualCount}`,
+    };
+  }
   const interrupted = ["running", "failed", "timeout"].includes(run.status) || details.stoppedByTimeBudget === true;
   const materiallyMissing = Number.isFinite(missingCount) && missingCount >= 3 && missingRatio > 0.1;
   const coverageBase = Number.isFinite(expectedCount) && expectedCount > 0 ? expectedCount : Math.max(1, actualCount + klineRemaining + rankRemaining);
-  const materiallyMissingKlines = klineRemaining >= 3 && klineRemaining / coverageBase > 0.02;
+  const klineCoverageBase = Math.max(1, Number(details.klineCandidateCount) || coverageBase);
+  const materiallyMissingKlines = klineRemaining >= 3 && klineRemaining / klineCoverageBase > 0.05;
   const materiallyMissingRanks = rankRemaining >= 3 && rankRemaining / coverageBase > 0.02;
   if (!interrupted && !materiallyMissing && !materiallyMissingKlines && !materiallyMissingRanks) return null;
 
@@ -4429,6 +4498,89 @@ async function fetchKlineWithRetry(stock) {
   return retryFetch(() => fetchKline(stock), { attempts: 2, delayMs: 500 });
 }
 
+function eastmoneyQuoteRow(item, stock, targetDate) {
+  const code = String(item?.f12 || stock?.code || "").match(/\d{6}/)?.[0] || "";
+  const timestamp = n(item?.f124);
+  const quoteDate = Number.isFinite(timestamp) ? dateFromYmd(chinaDateYmd(new Date(timestamp * 1000))) : "";
+  const open = n(item?.f17);
+  const close = n(item?.f2);
+  if (!code || quoteDate !== targetDate || !Number.isFinite(open) || !Number.isFinite(close)) return null;
+  return {
+    stock: {
+      ...(stock || normalizeStock(code)),
+      code,
+      name: String(item?.f14 || code),
+    },
+    row: {
+      date: targetDate,
+      open,
+      close,
+      high: n(item?.f15),
+      low: n(item?.f16),
+      volume: n(item?.f5),
+      amount: n(item?.f6),
+      amplitude: n(item?.f7),
+      pct: n(item?.f3),
+      change: n(item?.f4),
+      turnover: n(item?.f8),
+    },
+  };
+}
+
+async function fetchEastmoneyDailyQuoteBatch(stocks, targetDate) {
+  const normalizedStocks = [
+    ...new Map(
+      (stocks || [])
+        .map((item) => {
+          try {
+            const stock = typeof item === "object" && item?.code ? { ...normalizeStock(item.code), ...item } : normalizeStock(item);
+            return [stock.code, stock];
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean),
+    ).values(),
+  ];
+  if (!normalizedStocks.length || !normalizeDate(targetDate)) return [];
+
+  const stockByCode = new Map(normalizedStocks.map((stock) => [stock.code, stock]));
+  const records = [];
+  let firstError = null;
+  for (let index = 0; index < normalizedStocks.length; index += EASTMONEY_QUOTE_BATCH_SIZE) {
+    try {
+      const chunk = normalizedStocks.slice(index, index + EASTMONEY_QUOTE_BATCH_SIZE);
+      const secids = chunk.map((stock) => stock.secid).join(",");
+      const url =
+        "https://push2.eastmoney.com/api/qt/ulist.np/get" +
+        `?fltt=2&secids=${encodeURIComponent(secids)}` +
+        "&fields=f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f124";
+      const response = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            "User-Agent": "Mozilla/5.0",
+            Referer: "https://quote.eastmoney.com/",
+          },
+        },
+        EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
+      );
+      if (!response.ok) throw new Error(`东方财富批量行情请求失败：${response.status}`);
+      const payload = await response.json();
+      const diff = Array.isArray(payload?.data?.diff) ? payload.data.diff : Object.values(payload?.data?.diff || {});
+      for (const item of diff) {
+        const code = String(item?.f12 || "").match(/\d{6}/)?.[0] || "";
+        const record = eastmoneyQuoteRow(item, stockByCode.get(code), targetDate);
+        if (record) records.push(record);
+      }
+    } catch (error) {
+      firstError ||= error;
+    }
+  }
+  if (!records.length && firstError) throw firstError;
+  return records;
+}
+
 function tencentStockSymbol(stock) {
   const prefix = stock.market === "SH" ? "sh" : stock.market === "BJ" ? "bj" : "sz";
   return `${prefix}${stock.code}`;
@@ -4513,6 +4665,52 @@ async function fetchTencentKline(stock, fromDate, toDate, options = {}) {
 
 async function fetchTencentKlineWithRetry(stock, fromDate, toDate, options = {}) {
   return retryFetch(() => fetchTencentKline(stock, fromDate, toDate, options), { attempts: 2, delayMs: 500 });
+}
+
+async function loadExpectedTradingDates(targetDate, count = 21) {
+  const normalizedTarget = normalizeDate(targetDate);
+  const normalizedCount = boundedInteger(count, 21, 2, 60);
+  if (!normalizedTarget) return [];
+  const cacheKey = `${normalizedTarget}:${normalizedCount}`;
+  if (expectedTradingDatesCache.has(cacheKey)) return expectedTradingDatesCache.get(cacheKey);
+
+  const pending = (async () => {
+    const fromDate = dateFromYmd(shiftYmd(normalizedTarget.replaceAll("-", ""), -120));
+    try {
+      const rows = await fetchTencentKlineWithRetry(
+        { code: MARKET_INDEX.code, market: "SH" },
+        fromDate,
+        normalizedTarget,
+        { persist: false },
+      );
+      const dates = [...new Set(rows.map((row) => normalizeDate(row.date)).filter((date) => date && date <= normalizedTarget))];
+      if (dates.length) return dates.sort().slice(-normalizedCount);
+    } catch {
+      // Fall through to the local market calendar inferred from broad K-line coverage.
+    }
+
+    if (!process.env.DATABASE_URL) return [];
+    const { rows } = await getDbPool().query(
+      `
+        select trade_date::text as date
+        from stock_daily_bars
+        where trade_date between ($1::date - interval '120 days') and $1::date
+        group by trade_date
+        having count(distinct code) >= 20
+        order by trade_date desc
+        limit $2::int
+      `,
+      [normalizedTarget, normalizedCount],
+    );
+    return rows.map((row) => normalizeDate(row.date)).filter(Boolean).sort();
+  })();
+  expectedTradingDatesCache.set(cacheKey, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    expectedTradingDatesCache.delete(cacheKey);
+    throw error;
+  }
 }
 
 let cachedIfindAccessToken = null;
@@ -5359,6 +5557,89 @@ async function saveKlineToDb(stock, rows, source = "eastmoney") {
   }
 }
 
+async function saveDailyQuoteRecordsToDb(records, source = "eastmoney-quote") {
+  const cleanRecords = [
+    ...new Map(
+      (records || [])
+        .map((record) => {
+          const code = String(record?.stock?.code || "").match(/\d{6}/)?.[0] || "";
+          const row = record?.row || {};
+          if (!code || !normalizeDate(row.date) || !Number.isFinite(row.open) || !Number.isFinite(row.close)) return null;
+          const stock = { ...normalizeStock(code), ...record.stock, code };
+          return [`${code}:${row.date}`, { stock, row }];
+        })
+        .filter(Boolean),
+    ).values(),
+  ];
+  if (!cleanRecords.length) return 0;
+
+  await bulkUpsertStocksForSnapshots(
+    cleanRecords.map(({ stock }) => ({
+      code: stock.code,
+      name: stock.name || stock.code,
+      exchange: stock.market,
+      board: null,
+      industry: null,
+      region: null,
+      concepts: [],
+      listing_date: null,
+    })),
+  );
+  const bars = cleanRecords.map(({ stock, row }) => ({
+    code: stock.code,
+    trade_date: row.date,
+    market: stock.market,
+    source,
+    open: row.open,
+    close: row.close,
+    high: row.high,
+    low: row.low,
+    volume: row.volume,
+    amount: row.amount,
+    amplitude: row.amplitude,
+    pct: row.pct,
+    change: row.change,
+    turnover: row.turnover,
+  }));
+  await getDbPool().query(
+    `
+      with input as (
+        select *
+        from jsonb_to_recordset($1::jsonb) as x(
+          code text, trade_date date, market text, source text,
+          open numeric, close numeric, high numeric, low numeric,
+          volume numeric, amount numeric, amplitude numeric, pct numeric,
+          change numeric, turnover numeric
+        )
+      )
+      insert into stock_daily_bars (
+        code, trade_date, market, open, close, high, low, volume, amount,
+        amplitude, pct, change, turnover, source, updated_at
+      )
+      select
+        code, trade_date, market, open, close, high, low, volume, amount,
+        amplitude, pct, change, turnover, source, now()
+      from input
+      on conflict (code, trade_date) do update set
+        market = excluded.market,
+        open = excluded.open,
+        close = excluded.close,
+        high = excluded.high,
+        low = excluded.low,
+        volume = excluded.volume,
+        amount = excluded.amount,
+        amplitude = excluded.amplitude,
+        pct = excluded.pct,
+        change = excluded.change,
+        turnover = excluded.turnover,
+        source = excluded.source,
+        updated_at = now()
+    `,
+    [JSON.stringify(bars)],
+  );
+  return bars.length;
+}
+
 function boundedInteger(value, fallback, min, max) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -5611,13 +5892,15 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
         lb.latest_bar_date::text as latest_bar_date,
         lb.latest_bar_updated_at,
         coalesce(lb.post_signal_bar_count, 0)::int as post_signal_bar_count,
+        coalesce(lb.recent_bar_count, 0)::int as recent_bar_count,
         count(*) over()::int as pending_count
       from deduped d
       left join lateral (
         select
           max(b.trade_date) as latest_bar_date,
           max(b.updated_at) as latest_bar_updated_at,
-          count(*) filter (where b.trade_date > d.latest_signal_date) as post_signal_bar_count
+          count(*) filter (where b.trade_date > d.latest_signal_date) as post_signal_bar_count,
+          count(*) filter (where b.trade_date between ($7::date - interval '45 days') and $7::date) as recent_bar_count
         from stock_daily_bars b
         where b.code = d.code
       ) lb on true
@@ -5653,6 +5936,7 @@ async function selectDailySyncStocks({ sourceKey, strategyKey, lookbackDays, max
     latestBarDate: normalizeDate(row.latest_bar_date),
     latestBarUpdatedAt: row.latest_bar_updated_at ? new Date(row.latest_bar_updated_at).toISOString() : null,
     postSignalBarCount: n(row.post_signal_bar_count) || 0,
+    recentBarCount: n(row.recent_bar_count) || 0,
     pendingCount: n(row.pending_count) || 0,
   }));
 }
@@ -6123,7 +6407,7 @@ async function runDailySignalGeneration(options = {}) {
     options.fetchMissingRankMax === undefined
       ? Math.max(configuredFetchMissingRankMax, DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX)
       : configuredFetchMissingRankMax;
-  const boardMode = String(options.boardMode || process.env.SIGNAL_BOARD_MODE || "fetch").toLowerCase();
+  const boardMode = String(options.boardMode || process.env.SIGNAL_BOARD_MODE || "aggregate").toLowerCase();
   const force = options.force === true || options.force === "1" || options.force === "true";
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
@@ -6146,6 +6430,10 @@ async function runDailySignalGeneration(options = {}) {
     const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
     const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax, targetDate });
     const universeSources = universeSourceCounts(universe);
+    // Persist the completed target-day quote for the whole universe before
+    // slower per-stock rank-history repair can consume the cron budget.
+    const targetQuoteStats = {};
+    await prefillTargetDateBars(universe.map((item) => item.code), targetDate, targetQuoteStats);
     const rankHistoryByCode = await loadCachedRankHistories({
       sourceKey,
       codes: universe.map((item) => item.code),
@@ -6195,22 +6483,49 @@ async function runDailySignalGeneration(options = {}) {
     const boardMetricsByKey = new Map();
     const featureRecords = [];
     let savedFeatures = 0;
+    let prunedFeatures = 0;
     const featureConcurrency = Math.min(concurrency, 6);
     const featureChunkSize = Math.max(featureConcurrency * 2, 6);
     const klineStats = {};
     const rankedCodes = rankedCandidates.map((entry) => normalizeStock(entry.item.code).code);
-    const stockRowsByCode = await loadStockDailyBarsForFeatures(rankedCodes, targetDate, {
-      fetchMissingMax: fetchMissingKlineMax,
-      concurrency,
-      startedAtMs,
-      timeBudgetMs,
-      stats: klineStats,
-    });
+    const expectedTradingDates = await loadExpectedTradingDates(targetDate, 21);
+    const boardPreloadStats = {};
+    const boardAggregateStats = {};
+    const [stockRowsByCode, boardMetricsByName] = await Promise.all([
+      loadStockDailyBarsForFeatures(rankedCodes, targetDate, {
+        fetchMissingMax: fetchMissingKlineMax,
+        concurrency,
+        startedAtMs,
+        timeBudgetMs,
+        stats: klineStats,
+        expectedTradingDates,
+      }),
+      loadBoardAggregateMetricsByName(
+        rankedCandidates.map((entry) => entry.item),
+        targetDate,
+        boardAggregateStats,
+      ),
+      boardMode === "fetch"
+        ? preloadBoardMetricsForFeatures(
+            rankedCandidates.map((entry) => entry.item.bestBoardCode),
+            targetDate,
+            boardMode,
+            boardRowsByCode,
+            boardMetricsByKey,
+            boardPreloadStats,
+          )
+        : Promise.resolve(boardMetricsByKey),
+    ]);
     const buildFeatureEntry = async (entry) => {
       const item = entry.item;
       const result = entry.result;
       try {
         const stockRows = stockRowsByCode.get(normalizeStock(item.code).code) || [];
+        if (!klineRowsSupportFeatures(stockRows, targetDate, expectedTradingDates)) {
+          result.status = "feature_skipped";
+          result.reason = "incomplete_trading_date_coverage";
+          return null;
+        }
         const stockMetrics = stockPreSignalMetricsFromRows(stockRows, targetDate);
         if (
           !Number.isFinite(stockMetrics.prev5) ||
@@ -6222,8 +6537,8 @@ async function runDailySignalGeneration(options = {}) {
           return null;
         }
 
-        let boardMetrics = null;
-        if (item.bestBoardCode && /^BK\d{4}$/i.test(item.bestBoardCode)) {
+        let boardMetrics = boardMetricsByName.get(item.bestBoardName) || null;
+        if (!boardMetrics && boardMode === "fetch" && item.bestBoardCode && /^BK\d{4}$/i.test(item.bestBoardCode)) {
           boardMetrics = await loadBoardMetricsForFeature(
             item.bestBoardCode,
             targetDate,
@@ -6268,13 +6583,28 @@ async function runDailySignalGeneration(options = {}) {
       const featureEntries = await mapLimit(chunk, featureConcurrency, buildFeatureEntry);
       const chunkFeatures = featureEntries.filter(Boolean);
       featureRecords.push(...chunkFeatures);
-      savedFeatures += await bulkUpsertStrategyFeatureEvents(chunkFeatures);
       if (Date.now() - startedAtMs > timeBudgetMs) {
         stoppedByTimeBudget = true;
         break;
       }
     }
     results.push(...histories.map((entry) => entry.result));
+
+    const rankRemainingCount = Number(rankStats.remainingTargetCount) || 0;
+    const klineRemainingCount = Number(klineStats.remainingTargetCount) || 0;
+    const replaceCoverageComplete =
+      !stoppedByTimeBudget &&
+      !rankStats.authError &&
+      !klineStats.authError &&
+      rankRemainingCount <= Math.max(2, Math.ceil(universe.length * 0.01)) &&
+      klineRemainingCount <= Math.max(2, Math.ceil(Math.max(1, rankedCandidates.length) * 0.02));
+    if (replaceCoverageComplete) {
+      const replacement = await replaceStrategyFeatureEventsForDate(sourceKey, targetDate, featureRecords);
+      savedFeatures = replacement.savedCount;
+      prunedFeatures = replacement.prunedCount;
+    } else {
+      savedFeatures = await bulkUpsertStrategyFeatureEvents(featureRecords);
+    }
 
     const featureFailedCount = results.filter((item) => /failed$/.test(item.status)).length;
     const failedCount = featureFailedCount + (Number(klineStats.fetchFailed) || 0);
@@ -6290,14 +6620,20 @@ async function runDailySignalGeneration(options = {}) {
       rankSnapshotCount,
       savedRankSnapshots,
       rankedCandidateCount: rankedCandidates.length,
+      klineCandidateCount: rankedCandidates.length,
       featureCount: featureRecords.length,
+      prunedFeatureCount: prunedFeatures,
+      replaceCoverageComplete,
       generatedDate: targetDate,
       universeSources,
+      targetQuoteStats,
       processedUniverseCount: histories.length,
       remainingUniverseCount: Math.max(0, universe.length - histories.length),
       stoppedByTimeBudget,
       rankStats,
       klineStats,
+      boardPreloadStats,
+      boardAggregateStats,
       results: results.slice(0, 200),
     };
     const hasIncompleteCoverage = Number(rankStats.remainingTargetCount) > 0 || Number(klineStats.remainingTargetCount) > 0;
@@ -6394,6 +6730,127 @@ async function dailySignalFeatureCoverage(date) {
   return { complete: Boolean(run) && !issue, featureCount, run, issue };
 }
 
+function classifyDataPipelineHealth({ sourceKey, targetDate, snapshotCount, featureCount, klineCount, featureRun }) {
+  if (!snapshotCount) {
+    return { status: "error", code: "snapshot_missing", message: `${DATA_SOURCES[sourceKey]?.shortLabel || sourceKey}榜单快照缺失。` };
+  }
+  if (!klineCount) {
+    return { status: "error", code: "kline_missing", message: "目标交易日 K 线尚未入库。" };
+  }
+  const klineCandidateCount = Number(featureRun?.details?.klineCandidateCount) || 0;
+  const rankedCandidateCount = Number(featureRun?.details?.rankedCandidateCount) || 0;
+  const requiredKlineCount = klineCandidateCount || rankedCandidateCount || snapshotCount;
+  const klineCoverageRatio = requiredKlineCount ? Math.min(1, klineCount / requiredKlineCount) : 0;
+  if (klineCoverageRatio < 0.8) {
+    return {
+      status: "error",
+      code: "kline_coverage_low",
+      message: `目标日待生成特征股票的 K 线仅覆盖 ${klineCount}/${requiredKlineCount}，不足以生成完整特征。`,
+    };
+  }
+  if (!featureCount) {
+    const runStatus = featureRun?.status || "missing";
+    const details = featureRun?.details || {};
+    const validEmptyRun =
+      runStatus === "success" &&
+      Number(details.rankedCandidateCount) === 0 &&
+      !details.stoppedByTimeBudget &&
+      !Number(details.rankStats?.remainingTargetCount) &&
+      !Number(details.klineStats?.remainingTargetCount);
+    if (validEmptyRun) {
+      return { status: "healthy", code: "no_ranked_candidates", message: "数据覆盖完整，本日没有进入特征生成池的股票。" };
+    }
+    return {
+      status: "error",
+      code: "feature_missing",
+      message: `榜单已有 ${snapshotCount} 只，但策略特征仍为 0（任务状态：${runStatus}）。`,
+    };
+  }
+  const runIssue = featureRunCoverageIssue({ sourceKey, selectedDate: targetDate, featureCount, run: featureRun });
+  if (runIssue) {
+    return {
+      status: runIssue.level === "error" ? "error" : "warning",
+      code: runIssue.code,
+      message: runIssue.message,
+    };
+  }
+  if (klineCoverageRatio < 0.95) {
+    return {
+      status: "warning",
+      code: "kline_coverage_partial",
+      message: `目标日待生成特征股票的 K 线覆盖 ${klineCount}/${requiredKlineCount}，少量停牌或缺失样本已跳过。`,
+    };
+  }
+  return { status: "healthy", code: "ok", message: "榜单、K 线与策略特征均已就绪。" };
+}
+
+async function sourceDataHealth(sourceKey, targetDate) {
+  const featureJob = sourceKey === "ths" ? THS_FEATURE_JOB : DAILY_SIGNAL_JOB;
+  const { rows } = await getDbPool().query(
+    `
+      select
+        (
+          select count(distinct code)::int
+          from popularity_snapshots
+          where source = $1 and category = 'stock' and snapshot_date = $2::date
+        ) as snapshot_count,
+        (
+          select count(*)::int
+          from strategy_feature_events
+          where source = $1 and feature_set = $3 and signal_date = $2::date
+        ) as feature_count,
+        (
+          select count(distinct b.code)::int
+          from stock_daily_bars b
+          where b.trade_date = $2::date
+            and exists (
+              select 1
+              from popularity_snapshots p
+              where p.source = $1
+                and p.category = 'stock'
+                and p.snapshot_date = $2::date
+                and p.code = b.code
+            )
+        ) as kline_count
+    `,
+    [sourceKey, targetDate, FEATURE_SET],
+  );
+  const { rows: runRows } = await getDbPool().query(
+    `
+      select job_name, status, started_at, finished_at, selected_count, success_count, failed_count, error, details
+      from sync_runs
+      where job_name = $1
+        and coalesce(details->>'generatedDate', details->>'targetDate', details->'params'->>'targetDate') = $2
+      order by started_at desc
+      limit 1
+    `,
+    [featureJob, targetDate],
+  );
+  const counts = rows[0] || {};
+  const result = {
+    sourceKey,
+    targetDate,
+    snapshotCount: Number(counts.snapshot_count) || 0,
+    featureCount: Number(counts.feature_count) || 0,
+    klineCount: Number(counts.kline_count) || 0,
+    featureRun: syncRunHealthView(runRows[0]),
+  };
+  return { ...result, health: classifyDataPipelineHealth(result) };
+}
+
+async function dataHealthPayload(query = {}) {
+  requireDatabase();
+  const targetDate = await resolveMarketTargetDate(query.date);
+  const sources = [];
+  for (const sourceKey of ["em", "ths"]) sources.push(await sourceDataHealth(sourceKey, targetDate));
+  const status = sources.some((item) => item.health.status === "error")
+    ? "error"
+    : sources.some((item) => item.health.status === "warning")
+      ? "warning"
+      : "healthy";
+  return { status, targetDate, checkedAt: new Date().toISOString(), sources };
+}
+
 async function dailySignalFallbackPayload(query = {}, headers = {}) {
   assertCronAuthorized(query, headers);
   if (query.mode === "backfill") return dailySignalBackfillPayload(query, headers);
@@ -6403,6 +6860,25 @@ async function dailySignalFallbackPayload(query = {}, headers = {}) {
   if (!explicitCurrentRun) {
     const coverage = await dailySignalFeatureCoverage(targetDate);
     if (coverage.complete) {
+      const thsHealth = await sourceDataHealth("ths", targetDate);
+      if (thsHealth.health.status !== "healthy") {
+        const repair = await runThsFeatureGeneration({
+          date: targetDate,
+          metric: "attention",
+          repairDependencies: true,
+          timeBudgetMs: query.timeBudgetMs || 45000,
+          fetchMissingKlineMax: query.fetchMissingKlineMax || 80,
+        });
+        const postHealth = await sourceDataHealth("ths", targetDate);
+        return {
+          ...repair,
+          fallbackTargetDate: targetDate,
+          fallbackAction: "ths_dependency_repair",
+          previousHealth: thsHealth,
+          postHealth,
+          healthy: postHealth.health.status === "healthy",
+        };
+      }
       const backfill = await dailySignalBackfillPayload(query, headers);
       return { ...backfill, fallbackTargetDate: targetDate, fallbackAction: "historical_backfill" };
     }
@@ -6413,14 +6889,21 @@ async function dailySignalFallbackPayload(query = {}, headers = {}) {
       ...query,
       force: query.force || "1",
       maxUniverse: query.maxUniverse || process.env.SIGNAL_FALLBACK_MAX_UNIVERSE || "480",
-      boardMode: query.boardMode || process.env.SIGNAL_FALLBACK_BOARD_MODE || "cached",
+      boardMode: query.boardMode || process.env.SIGNAL_FALLBACK_BOARD_MODE || "aggregate",
       fetchMissingRankMax:
         query.fetchMissingRankMax || process.env.SIGNAL_FALLBACK_FETCH_MISSING_RANK_MAX || String(DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_RANK_MAX),
       fetchMissingKlineMax:
         query.fetchMissingKlineMax || process.env.SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX || String(DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX),
     },
   );
-  return { ...result, fallbackTargetDate: targetDate, fallbackAction: "current_date_repair" };
+  const postHealth = await sourceDataHealth("em", targetDate);
+  return {
+    ...result,
+    fallbackTargetDate: targetDate,
+    fallbackAction: "current_date_repair",
+    postHealth,
+    healthy: postHealth.health.status === "healthy",
+  };
 }
 
 async function selectDailySignalBackfillDate(options = {}) {
@@ -6529,7 +7012,7 @@ async function dailySignalBackfillPayload(query = {}, headers = {}) {
     rankMax: query.rankMax,
     concurrency: query.concurrency || process.env.SIGNAL_BACKFILL_CONCURRENCY || 8,
     timeBudgetMs: query.timeBudgetMs,
-    boardMode: query.boardMode || process.env.SIGNAL_BACKFILL_BOARD_MODE || "cached",
+    boardMode: query.boardMode || process.env.SIGNAL_BACKFILL_BOARD_MODE || "aggregate",
     fetchMissingRankMax:
       query.fetchMissingRankMax || process.env.SIGNAL_BACKFILL_FETCH_MISSING_RANK_MAX || DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_RANK_MAX,
     fetchMissingKlineMax:
@@ -6585,6 +7068,11 @@ async function runDailyKlineSync(options = {}) {
   try {
     const candidates = await selectDailySyncStocks(params);
     const pendingCount = candidates[0]?.pendingCount || candidates.length;
+    const expectedTradingDates = await loadExpectedTradingDates(targetDate, 21);
+    const previousTradingDate = expectedTradingDates.filter((date) => date < targetDate).at(-1) || null;
+    const quoteStats = {};
+    const quoteRecords = await prefillTargetDateBars(candidates.map((candidate) => candidate.code), targetDate, quoteStats);
+    const quoteCodes = new Set(quoteRecords.map((record) => record.stock.code));
     let successCount = 0;
     let staleCount = 0;
     let failedCount = 0;
@@ -6595,7 +7083,15 @@ async function runDailyKlineSync(options = {}) {
         return { stoppedByTimeBudget: true };
       }
       const stock = normalizeStock(candidate.code);
-      const fallbackFromDate = candidate.latestBarDate || candidate.latestSignalDate || KLINE_DB_START_DATE;
+      const recentHistoryReady =
+        candidate.recentBarCount >= 18 &&
+        previousTradingDate &&
+        candidate.latestBarDate &&
+        candidate.latestBarDate >= previousTradingDate;
+      const historyFromDate = dateFromYmd(shiftYmd(targetDate.replaceAll("-", ""), -140));
+      const fallbackFromDate = recentHistoryReady
+        ? candidate.latestBarDate || candidate.latestSignalDate || historyFromDate
+        : historyFromDate;
       const item = {
         code: candidate.code,
         name: candidate.name,
@@ -6606,6 +7102,14 @@ async function runDailyKlineSync(options = {}) {
         status: "pending",
       };
       try {
+        if (quoteCodes.has(candidate.code) && recentHistoryReady) {
+          item.status = "synced_quote";
+          item.latestBarDate = targetDate;
+          item.targetDate = targetDate;
+          item.hasTargetDate = true;
+          item.usedCacheFallback = false;
+          return item;
+        }
         const { rows, refreshError, usedCacheFallback } = await loadBestAvailableKlineForSync(stock, fallbackFromDate, targetDate);
         const latestRow = rows[rows.length - 1] || null;
         const hasTargetDate = rowsContainDate(rows, targetDate);
@@ -6637,7 +7141,7 @@ async function runDailyKlineSync(options = {}) {
           continue;
         }
         results.push(item);
-        if (item.status === "synced" || item.status === "synced_fallback" || item.status === "synced_cached") successCount += 1;
+        if (["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)) successCount += 1;
         if (item.status === "stale") staleCount += 1;
         if (item.status === "failed") failedCount += 1;
       }
@@ -6655,6 +7159,9 @@ async function runDailyKlineSync(options = {}) {
       successCount,
       staleCount,
       failedCount,
+      quoteStats,
+      expectedTradingDateCount: expectedTradingDates.length,
+      previousTradingDate,
       results,
       stoppedByTimeBudget,
       remainingCount: Math.max(0, pendingCount - results.length),
@@ -6678,7 +7185,7 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: results.length,
-      successCount: results.filter((item) => item.status === "synced" || item.status === "synced_fallback" || item.status === "synced_cached").length,
+      successCount: results.filter((item) => ["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)).length,
       staleCount: results.filter((item) => item.status === "stale").length,
       failedCount: results.filter((item) => item.status === "failed").length,
       results,
@@ -6962,14 +7469,14 @@ async function deleteSupersededPopularitySnapshots(records) {
   return rowCount;
 }
 
-async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000) {
+async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000, queryable = getDbPool()) {
   const cleanRecords = records.filter((record) => record.source && record.feature_set && record.signal_date && record.code);
   if (!cleanRecords.length) return 0;
 
   let savedCount = 0;
   for (let index = 0; index < cleanRecords.length; index += chunkSize) {
     const chunk = cleanRecords.slice(index, index + chunkSize);
-    await getDbPool().query(
+    await queryable.query(
       `
         with input as (
           select *
@@ -7079,6 +7586,42 @@ async function bulkUpsertStrategyFeatureEvents(records, chunkSize = 2000) {
   return savedCount;
 }
 
+async function replaceStrategyFeatureEventsForDate(sourceKey, signalDate, records) {
+  const source = DATA_SOURCES[sourceKey]?.key || sourceKey;
+  const normalizedDate = normalizeDate(signalDate);
+  if (!source || !normalizedDate) throw new Error("invalid feature replacement scope");
+  const cleanRecords = (records || []).filter(
+    (record) =>
+      record.source === source &&
+      record.feature_set === FEATURE_SET &&
+      normalizeDate(record.signal_date) === normalizedDate &&
+      record.code,
+  );
+  const keepCodes = [...new Set(cleanRecords.map((record) => String(record.code)))];
+  const client = await connectDatabaseClient(getDbPool());
+  try {
+    await client.query("begin");
+    const savedCount = await bulkUpsertStrategyFeatureEvents(cleanRecords, 2000, client);
+    const { rowCount: prunedCount } = await client.query(
+      `
+        delete from strategy_feature_events
+        where source = $1
+          and feature_set = $2
+          and signal_date = $3::date
+          and not (code = any($4::text[]))
+      `,
+      [source, FEATURE_SET, normalizedDate, keepCodes],
+    );
+    await client.query("commit");
+    return { savedCount, prunedCount };
+  } catch (error) {
+    await client.query("rollback").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function bulkUpsertStocksForSnapshots(records) {
   if (!records.length) return;
   await getDbPool().query(
@@ -7164,18 +7707,19 @@ async function runThsPopularitySync(options = {}) {
 
     if (includeAttention) {
       const watchlist = await selectThsAttentionWatchlist(watchlistMax, lookbackDays);
-      const attentionCodes = [...new Set(["300674", ...watchlist])];
-      const item = { category: "stock", metric: "attention", status: "pending", requestedCodes: attentionCodes.length };
-      const attentionRecords = [];
+      // The endpoint returns the same global top-101 list regardless of the
+      // requested stock. Calling it once per watchlist item previously wasted
+      // most of the serverless execution window.
+      const seedCode = watchlist[0] || "300674";
+      const item = { category: "stock", metric: "attention", status: "pending", requestedCodes: 1, seedCode };
+      let attentionRecords = [];
       const failures = [];
-      for (const code of attentionCodes) {
-        try {
-          attentionRecords.push(...(await fetchThsAttentionDegree(code, actualYmd)));
-        } catch (error) {
-          failures.push({ code, error: error.message });
-        }
+      try {
+        attentionRecords = await fetchThsAttentionDegree(seedCode, actualYmd);
+      } catch (error) {
+        failures.push({ code: seedCode, error: error.message });
       }
-      item.status = failures.length && !attentionRecords.length ? "failed" : failures.length ? "partial" : "fetched";
+      item.status = failures.length ? "failed" : "fetched";
       item.recordCount = attentionRecords.length;
       item.uniqueCount = new Set(attentionRecords.map((record) => record.code)).size;
       item.failures = failures.slice(0, 10);
@@ -7248,7 +7792,7 @@ async function runThsFeatureGeneration(options = {}) {
   const prev5Max = (Number.isFinite(Number(options.prev5MaxPct ?? process.env.IFIND_FEATURE_PREV5_MAX_PCT))
     ? Number(options.prev5MaxPct ?? process.env.IFIND_FEATURE_PREV5_MAX_PCT)
     : 35) / 100;
-  const boardMode = String(options.boardMode || process.env.IFIND_FEATURE_BOARD_MODE || "cached").toLowerCase();
+  const boardMode = String(options.boardMode || process.env.IFIND_FEATURE_BOARD_MODE || "aggregate").toLowerCase();
   const metric = String(options.metric || process.env.IFIND_FEATURE_METRIC || "attention").toLowerCase();
   const timeBudgetMs = boundedInteger(
     options.timeBudgetMs ?? process.env.THS_FEATURE_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
@@ -7283,8 +7827,28 @@ async function runThsFeatureGeneration(options = {}) {
     fetchMissingKlineMax,
   };
   const run = await createSyncRun(THS_FEATURE_JOB, { params, startedAt });
+  let dependencyRepair = null;
 
   try {
+  const { rows: dependencyRows } = await getDbPool().query(
+    `
+      select count(*)::int as count
+      from popularity_snapshots
+      where source = 'ths'
+        and category = 'stock'
+        and metric = $2
+        and snapshot_date = $1::date
+    `,
+    [targetDate, metric],
+  );
+  if (Number(dependencyRows[0]?.count) === 0 && options.repairDependencies !== false && options.repairDependencies !== "false") {
+    dependencyRepair = await runThsPopularitySync({
+      date: targetDate,
+      includeAttention: metric === "attention",
+      categories: "stock,concept,industry",
+      watchlistMax: 1,
+    });
+  }
   const { rows: todaySnapshotRows } = await getDbPool().query(
     `
       select
@@ -7341,10 +7905,24 @@ async function runThsFeatureGeneration(options = {}) {
         [codes, targetDate, rankMax, metric],
       )
     : { rows: [] };
+  const expectedTradingDates = await loadExpectedTradingDates(targetDate, 21);
+  const klineStats = {};
   const [klineByCode, donorByKey] = await Promise.all([
-    loadStockDailyBarsForFeatures(codes, targetDate, { fetchMissingMax: fetchMissingKlineMax, startedAtMs, timeBudgetMs }),
+    loadStockDailyBarsForFeatures(codes, targetDate, {
+      fetchMissingMax: fetchMissingKlineMax,
+      startedAtMs,
+      timeBudgetMs,
+      stats: klineStats,
+      expectedTradingDates,
+    }),
     loadEmBoardDonorsForFeatures(codes, targetDate),
   ]);
+  const boardAggregateStats = {};
+  const boardMetricsByName = await loadBoardAggregateMetricsByName(
+    todayRows.map((row) => ({ bestBoardName: row.industry || row.concepts?.[0] || row.board || "" })),
+    targetDate,
+    boardAggregateStats,
+  );
   const historyByCode = new Map();
   for (const row of historyRows) {
     const code = String(row.code || "");
@@ -7370,6 +7948,9 @@ async function runThsFeatureGeneration(options = {}) {
     metric,
     snapshotCount: todayRows.length,
     generatedCount: 0,
+    rankReadyCount: 0,
+    stockMetricReadyCount: 0,
+    ruleFilteredCount: 0,
     skippedMissingRank20: 0,
     skippedMissingStockKline: 0,
     skippedMissingStockMetrics: 0,
@@ -7391,9 +7972,10 @@ async function runThsFeatureGeneration(options = {}) {
       stats.skippedMissingRank20 += 1;
       continue;
     }
+    stats.rankReadyCount += 1;
     if (rank20 - row.rank < minRankDelta20) continue;
     const stockRows = klineByCode.get(row.code);
-    if (!stockRows?.length) {
+    if (!klineRowsSupportFeatures(stockRows, targetDate, expectedTradingDates)) {
       stats.skippedMissingStockKline += 1;
       continue;
     }
@@ -7406,12 +7988,14 @@ async function runThsFeatureGeneration(options = {}) {
       stats.skippedMissingStockMetrics += 1;
       continue;
     }
+    stats.stockMetricReadyCount += 1;
     if (
       stockMetrics.amountRatio < amountRatioMin ||
       stockMetrics.amountRatio > amountRatioMax ||
       stockMetrics.prev5 < prev5Min ||
       stockMetrics.prev5 > prev5Max
     ) {
+      stats.ruleFilteredCount += 1;
       continue;
     }
     const donor = donorByKey.get(row.code) || null;
@@ -7428,10 +8012,13 @@ async function runThsFeatureGeneration(options = {}) {
       bestBoardCode: donor?.best_board_code || boardCodeByName.get(bestBoardName) || "",
       source: "ifind-daily",
     };
-    let boardMetrics = boardMetricsFromFeatureDonor(donor);
-    if (boardMetrics) {
+    const donorMetrics = boardMetricsFromFeatureDonor(donor);
+    let boardMetrics = donorMetrics || boardMetricsByName.get(bestBoardName) || null;
+    if (donorMetrics) {
       stats.boardDonorCount += 1;
-    } else if (item.bestBoardCode) {
+    } else if (boardMetrics) {
+      stats.boardComputedCount += 1;
+    } else if (boardMode === "fetch" && item.bestBoardCode) {
       boardMetrics = await loadBoardMetricsForFeature(item.bestBoardCode, targetDate, boardMode, boardRowsByCode, boardMetricsByKey);
       if (boardMetrics) stats.boardComputedCount += 1;
       else stats.boardMissingCount += 1;
@@ -7461,30 +8048,78 @@ async function runThsFeatureGeneration(options = {}) {
     featureRecords.push(feature);
   }
 
-  const savedCount = await bulkUpsertStrategyFeatureEvents(featureRecords);
+  const rankMissingCount = stats.skippedMissingRank20;
+  const klineMissingCount = Math.max(
+    Number(klineStats.remainingTargetCount) || 0,
+    stats.skippedMissingStockKline + stats.skippedMissingStockMetrics,
+  );
+  const materiallyMissingRanks = rankMissingCount > Math.max(2, Math.ceil(Math.max(1, todayRows.length) * 0.02));
+  const materiallyMissingKlines = klineMissingCount > Math.max(2, Math.ceil(Math.max(1, stats.rankReadyCount) * 0.02));
+  const replaceCoverageComplete = !stats.stoppedByTimeBudget && !materiallyMissingRanks && !materiallyMissingKlines;
+  let savedCount = 0;
+  let prunedFeatureCount = 0;
+  if (replaceCoverageComplete) {
+    const replacement = await replaceStrategyFeatureEventsForDate("ths", targetDate, featureRecords);
+    savedCount = replacement.savedCount;
+    prunedFeatureCount = replacement.prunedCount;
+  } else {
+    savedCount = await bulkUpsertStrategyFeatureEvents(featureRecords);
+  }
   cachedDbData.clear();
   cachedThsData.clear();
-  const resultStatus = stats.stoppedByTimeBudget ? (savedCount ? "partial" : "timeout") : savedCount ? "success" : "empty";
+  const coverageIncomplete = stats.stoppedByTimeBudget || materiallyMissingRanks || materiallyMissingKlines;
+  const resultStatus = coverageIncomplete ? (savedCount ? "partial" : "failed") : "success";
+  const rankStats = {
+    requestedCount: todayRows.length,
+    cachedTargetCount: stats.rankReadyCount,
+    missingTargetCount: rankMissingCount,
+    fetchAttempted: 0,
+    fetchSucceeded: 0,
+    fetchFailed: 0,
+    remainingTargetCount: rankMissingCount,
+  };
   const summary = {
     jobName: THS_FEATURE_JOB,
     runId: run.id,
     params,
     ...stats,
+    generatedDate: targetDate,
+    rankedCandidateCount: featureRecords.length,
+    klineCandidateCount: stats.rankReadyCount,
+    featureCount: featureRecords.length,
     generatedCount: featureRecords.length,
     savedCount,
+    prunedFeatureCount,
+    replaceCoverageComplete,
+    rankStats,
+    klineStats,
+    boardAggregateStats,
+    dependencyRepair: dependencyRepair
+      ? {
+          status: dependencyRepair.status,
+          successCount: dependencyRepair.successCount,
+          failedCount: dependencyRepair.failedCount,
+        }
+      : null,
     finishedAt: new Date().toISOString(),
     status: resultStatus,
   };
   await finishSyncRun(
     run.id,
-    resultStatus === "timeout" ? "failed" : resultStatus,
+    resultStatus,
     {
       ...summary,
       selectedCount: todayRows.length,
       successCount: savedCount,
       failedCount: 0,
     },
-    stats.stoppedByTimeBudget ? "time budget reached before all ths features were generated" : null,
+    stats.stoppedByTimeBudget
+      ? "time budget reached before all ths features were generated"
+      : materiallyMissingRanks
+        ? "ths rank history coverage is incomplete"
+        : materiallyMissingKlines
+          ? "ths K-line coverage is incomplete"
+          : null,
   );
   return summary;
   } catch (error) {
@@ -7503,9 +8138,61 @@ async function runThsFeatureGeneration(options = {}) {
   }
 }
 
+async function prefillTargetDateBars(codes, targetDate, stats = null) {
+  const cleanCodes = [...new Set((codes || []).map((code) => String(code || "").match(/\d{6}/)?.[0]).filter(Boolean))];
+  if (!cleanCodes.length || !normalizeDate(targetDate)) return [];
+  if (stats) {
+    stats.batchQuoteRequested = cleanCodes.length;
+    stats.batchQuoteFetched = 0;
+    stats.batchQuoteSaved = 0;
+  }
+  try {
+    const records = await fetchEastmoneyDailyQuoteBatch(cleanCodes, targetDate);
+    const savedCount = await saveDailyQuoteRecordsToDb(records);
+    if (stats) {
+      stats.batchQuoteFetched = records.length;
+      stats.batchQuoteSaved = savedCount;
+    }
+    return records;
+  } catch (error) {
+    if (stats) stats.batchQuoteError = error.message;
+    return [];
+  }
+}
+
+function klineRowsSupportFeatures(rows, targetDate, expectedTradingDates = []) {
+  const normalizedTarget = normalizeDate(targetDate);
+  if (!normalizedTarget) return false;
+  const cleanRows = mergeKlineRows([], rows || []).filter((row) => row.date && row.date <= normalizedTarget);
+  const targetIndex = cleanRows.findIndex((row) => row.date === normalizedTarget);
+  if (targetIndex < 20) return false;
+
+  const expectedDates = [...new Set((expectedTradingDates || []).map(normalizeDate).filter((date) => date && date <= normalizedTarget))]
+    .sort()
+    .slice(-21);
+  if (expectedDates.length >= 10) {
+    if (!expectedDates.includes(normalizedTarget)) return false;
+    const rowDates = new Set(cleanRows.map((row) => row.date));
+    const coveredCount = expectedDates.filter((date) => rowDates.has(date)).length;
+    const minimumCovered = Math.max(10, Math.ceil(expectedDates.length * 0.85));
+    if (coveredCount < minimumCovered) return false;
+  }
+
+  const metrics = stockPreSignalMetricsFromRows(cleanRows, normalizedTarget);
+  return (
+    Number.isFinite(metrics.prev5) &&
+    Number.isFinite(metrics.prev10) &&
+    Number.isFinite(metrics.amountRatio) &&
+    Number.isFinite(metrics.signalClose)
+  );
+}
+
 async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   if (!codes.length) return new Map();
   const stats = options.stats && typeof options.stats === "object" ? options.stats : null;
+  const expectedTradingDates = Array.isArray(options.expectedTradingDates)
+    ? options.expectedTradingDates
+    : await loadExpectedTradingDates(targetDate, 21);
   const { rows } = await getDbPool().query(
     `
       select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
@@ -7528,14 +8215,13 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
   const safetyWindowMs = 15000;
   const fetchConcurrency = boundedInteger(options.concurrency, DEFAULT_SIGNAL_CONCURRENCY, 1, 16);
-  const missingAllCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
-  const missingCodes = missingAllCodes.slice(0, fetchMissingMax);
+  let missingTargetCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
   const unavailableTargetCodes = new Set();
   if (stats) {
     stats.requestedCount = codes.length;
     stats.cachedRowCount = rows.length;
-    stats.cachedTargetCount = codes.length - missingAllCodes.length;
-    stats.missingTargetCount = missingAllCodes.length;
+    stats.cachedTargetCount = codes.length - missingTargetCodes.length;
+    stats.missingTargetCount = missingTargetCodes.length;
     stats.fetchLimit = fetchMissingMax;
     stats.fetchAttempted = 0;
     stats.fetchSucceeded = 0;
@@ -7543,14 +8229,35 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     stats.targetUnavailableCount = 0;
     stats.targetUnavailableCodes = [];
   }
+
+  const quoteRecords = await prefillTargetDateBars(missingTargetCodes, targetDate, stats);
+  for (const record of quoteRecords) {
+    const code = record.stock.code;
+    byCode.set(code, mergeKlineRows(byCode.get(code) || [], [record.row]));
+  }
+  missingTargetCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
+  const missingFeatureCodes = codes.filter(
+    (code) => !klineRowsSupportFeatures(byCode.get(code), targetDate, expectedTradingDates),
+  );
+  const missingCodes = missingFeatureCodes.slice(0, fetchMissingMax);
+  if (stats) {
+    stats.cachedTargetCount = codes.length - missingTargetCodes.length;
+    stats.missingTargetCount = missingTargetCodes.length;
+    stats.featureReadyCount = codes.length - missingFeatureCodes.length;
+    stats.missingFeatureMetricCount = missingFeatureCodes.length;
+    stats.expectedTradingDateCount = expectedTradingDates.length;
+    stats.expectedTradingDateFrom = expectedTradingDates[0] || null;
+    stats.expectedTradingDateTo = expectedTradingDates.at(-1) || null;
+  }
+  const featureFromDate = dateFromYmd(shiftYmd(targetDate.replaceAll("-", ""), -140));
   await mapLimit(missingCodes, fetchConcurrency, async (code) => {
     if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)) return;
     try {
       if (stats) stats.fetchAttempted += 1;
       const stock = normalizeStock(code);
-      const freshRows = await fetchKlineWithProviderFallback(stock, targetDate, targetDate);
+      const freshRows = await fetchKlineWithProviderFallback(stock, featureFromDate, targetDate);
       const stockRows = mergeKlineRows(byCode.get(code) || [], freshRows);
-      if (stockRows.length && rowsContainDate(stockRows, targetDate)) {
+      if (stockRows.length && klineRowsSupportFeatures(stockRows, targetDate, expectedTradingDates)) {
         byCode.set(code, stockRows);
         if (stats) stats.fetchSucceeded += 1;
       }
@@ -7577,8 +8284,9 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     stats.remainingTargetCount = codes.filter(
       (code) =>
         !unavailableTargetCodes.has(code) &&
-        !(byCode.get(code) || []).some((row) => row.date === targetDate),
+        !klineRowsSupportFeatures(byCode.get(code), targetDate, expectedTradingDates),
     ).length;
+    stats.featureReadyCount = codes.length - stats.remainingTargetCount;
   }
 
   return byCode;
@@ -7606,6 +8314,92 @@ function boardMetricsFromFeatureDonor(row) {
   const amountRatio = n(row.best_board_amount_ratio);
   if (!Number.isFinite(prev5) || !Number.isFinite(amountRatio)) return null;
   return { prev5, prev10: n(row.best_board_ret_10), amountRatio };
+}
+
+async function loadBoardAggregateMetricsByName(items, date, stats = null) {
+  const normalizedDate = normalizeDate(date);
+  const names = [...new Set((items || []).map((item) => String(item?.bestBoardName || "").trim()).filter(Boolean))];
+  if (stats) {
+    stats.requestedCount = names.length;
+    stats.memberStockCount = 0;
+    stats.readyCount = 0;
+    stats.missingCount = names.length;
+  }
+  if (!normalizedDate || !names.length) return new Map();
+
+  const { rows: memberRows } = await getDbPool().query(
+    `
+      select code, industry, concepts
+      from stocks
+      where industry = any($1::text[])
+         or coalesce(concepts, '[]'::jsonb) ?| $1::text[]
+    `,
+    [names],
+  );
+  const requestedNames = new Set(names);
+  const membersByName = new Map(names.map((name) => [name, new Set()]));
+  for (const row of memberRows) {
+    const code = String(row.code || "").match(/\d{6}/)?.[0] || "";
+    if (!code) continue;
+    const industry = String(row.industry || "").trim();
+    if (requestedNames.has(industry)) membersByName.get(industry).add(code);
+    for (const concept of normalizeConceptList(row.concepts)) {
+      if (requestedNames.has(concept)) membersByName.get(concept).add(code);
+    }
+  }
+  const memberCodes = [...new Set([...membersByName.values()].flatMap((members) => [...members]))];
+  if (stats) stats.memberStockCount = memberCodes.length;
+  if (!memberCodes.length) return new Map();
+
+  const { rows: barRows } = await getDbPool().query(
+    `
+      with ranked as (
+        select
+          code, trade_date, open, close, high, low, volume, amount, turnover, pct,
+          row_number() over (partition by code order by trade_date desc) as row_num
+        from stock_daily_bars
+        where code = any($1::text[])
+          and trade_date <= $2::date
+          and trade_date >= ($2::date - interval '60 days')
+      )
+      select code, trade_date::text as trade_date, open, close, high, low, volume, amount, turnover, pct
+      from ranked
+      where row_num <= 15
+      order by code asc, trade_date asc
+    `,
+    [memberCodes, normalizedDate],
+  );
+  const rowsByCode = new Map();
+  for (const row of barRows) {
+    const code = String(row.code || "");
+    if (!rowsByCode.has(code)) rowsByCode.set(code, []);
+    rowsByCode.get(code).push(dbBarRowToKline(row));
+  }
+  const metricsByCode = new Map();
+  for (const [code, rows] of rowsByCode) {
+    const metrics = stockPreSignalMetricsFromRows(rows, normalizedDate);
+    if (Number.isFinite(metrics.prev5) && Number.isFinite(metrics.amountRatio) && Number.isFinite(metrics.signalClose)) {
+      metricsByCode.set(code, metrics);
+    }
+  }
+
+  const result = new Map();
+  for (const [name, members] of membersByName) {
+    const metrics = [...members].map((code) => metricsByCode.get(code)).filter(Boolean);
+    if (metrics.length < 5) continue;
+    result.set(name, {
+      prev5: median(metrics.map((item) => item.prev5)),
+      prev10: median(metrics.map((item) => item.prev10).filter(Number.isFinite)),
+      amountRatio: median(metrics.map((item) => item.amountRatio)),
+      memberSampleCount: metrics.length,
+      source: "database-member-aggregate",
+    });
+  }
+  if (stats) {
+    stats.readyCount = result.size;
+    stats.missingCount = names.length - result.size;
+  }
+  return result;
 }
 
 async function loadBoardMemberAggregateMetrics(boardCode, date) {
@@ -7687,6 +8481,25 @@ async function loadBoardMetricsForFeature(boardCode, date, boardMode, rowsByCode
     metricsByKey.delete(key);
     throw error;
   }
+}
+
+async function preloadBoardMetricsForFeatures(boardCodes, date, boardMode, rowsByCode, metricsByKey, stats = null) {
+  const codes = [...new Set((boardCodes || []).map((code) => String(code || "").toUpperCase()).filter((code) => /^BK\d{4}$/.test(code)))];
+  if (stats) {
+    stats.requestedCount = codes.length;
+    stats.readyCount = 0;
+    stats.missingCount = 0;
+  }
+  if (!codes.length || boardMode === "none") return metricsByKey;
+  const values = await mapLimit(codes, Math.min(16, Math.max(1, codes.length)), async (code) => ({
+    code,
+    value: await loadBoardMetricsForFeature(code, date, boardMode, rowsByCode, metricsByKey).catch(() => null),
+  }));
+  if (stats) {
+    stats.readyCount = values.filter((item) => item.value).length;
+    stats.missingCount = values.length - stats.readyCount;
+  }
+  return metricsByKey;
 }
 
 async function thsSyncPayload(query = {}, headers = {}) {
@@ -7958,6 +8771,7 @@ async function handleApiRequest(pathname, query, headers = {}, options = {}) {
   if (pathname === "/api/strategy-configs" && method === "POST") return saveStrategyConfigPayload({ ...body, source: body.source || query.source });
   if (pathname === "/api/stock-signals") return stockSignalsPayload(query);
   if (pathname === "/api/position") return positionPayload(query);
+  if (pathname === "/api/data-health") return dataHealthPayload(query);
   if (pathname === "/api/cron/daily-sync") return dailySyncPayload(query, headers);
   if (pathname === "/api/cron/ths-sync") return thsSyncPayload(query, headers);
   if (pathname === "/api/cron/ths-feature-sync") return thsFeaturePayload(query, headers);
@@ -8006,6 +8820,8 @@ module.exports = {
   runThsFeatureGeneration,
   dailySignalPayload,
   dailySignalFallbackPayload,
+  dataHealthPayload,
+  classifyDataPipelineHealth,
   dailySignalBackfillPayload,
   selectDailySignalBackfillDate,
   runDailySignalGeneration,
@@ -8016,8 +8832,10 @@ module.exports = {
   fetchKlineWithRetry,
   fetchTencentKline,
   parseTencentKlineRows,
+  eastmoneyQuoteRow,
   klineRowsCoverTarget,
   klineRowsProveTargetUnavailable,
+  klineRowsSupportFeatures,
   strategyCoverageIssue,
   featureRunCoverageIssue,
   fetchKlineWithProviderFallback,
@@ -8026,4 +8844,8 @@ module.exports = {
   loadBoardKlineForDate,
   featureRecordFromDailyContext,
   readBoardCodeByName,
+  defaultCompletedMarketYmd,
+  completedMarketDateFromTimestamp,
+  loadExpectedTradingDates,
+  resolveMarketTargetDate,
 };
