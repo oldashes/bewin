@@ -8234,18 +8234,43 @@ async function prefillTargetDateBars(codes, targetDate, stats = null, options = 
     500,
   );
   const fallbackConcurrency = boundedInteger(options.concurrency, DEFAULT_SYNC_CONCURRENCY, 1, 12);
+
+  // Skip codes that already have the target-day bar in DB so resume/feature
+  // generation does not burn the whole budget re-fetching known quotes.
+  let missingCodes = cleanCodes;
+  let alreadyCachedCount = 0;
+  try {
+    const { rows: existingRows } = await getDbPool().query(
+      `
+        select distinct code
+        from stock_daily_bars
+        where trade_date = $1::date
+          and code = any($2::text[])
+      `,
+      [targetDate, cleanCodes],
+    );
+    const existing = new Set(existingRows.map((row) => String(row.code || "")));
+    alreadyCachedCount = existing.size;
+    missingCodes = cleanCodes.filter((code) => !existing.has(code));
+  } catch (error) {
+    if (stats) stats.cacheLookupError = error.message;
+    missingCodes = cleanCodes;
+  }
+
   if (stats) {
-    stats.batchQuoteRequested = cleanCodes.length;
+    stats.batchQuoteRequested = missingCodes.length;
+    stats.batchQuoteCached = alreadyCachedCount;
     stats.batchQuoteFetched = 0;
     stats.batchQuoteSaved = 0;
     stats.quoteFallbackRequested = 0;
     stats.quoteFallbackSucceeded = 0;
     stats.quoteFallbackFailed = 0;
   }
+  if (!missingCodes.length) return [];
 
   let records = [];
   try {
-    records = await fetchEastmoneyDailyQuoteBatch(cleanCodes, targetDate);
+    records = await fetchEastmoneyDailyQuoteBatch(missingCodes, targetDate);
   } catch (error) {
     if (stats) stats.batchQuoteError = error.message;
     records = [];
@@ -8260,12 +8285,12 @@ async function prefillTargetDateBars(codes, targetDate, stats = null, options = 
   }
 
   const covered = new Set(records.map((record) => record.stock.code));
-  const missingCodes = cleanCodes.filter((code) => !covered.has(code));
-  if (!missingCodes.length || fallbackMax <= 0) return records;
+  const stillMissingCodes = missingCodes.filter((code) => !covered.has(code));
+  if (!stillMissingCodes.length || fallbackMax <= 0) return records;
 
   const prefillBudgetMs = Math.max(3000, Math.floor(timeBudgetMs * 0.45));
   const fallbackDeadlineMs = startedAtMs + prefillBudgetMs;
-  const fallbackCodes = missingCodes.slice(0, fallbackMax);
+  const fallbackCodes = stillMissingCodes.slice(0, fallbackMax);
   if (stats) {
     stats.quoteFallbackRequested = fallbackCodes.length;
     stats.prefillBudgetMs = prefillBudgetMs;
