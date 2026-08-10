@@ -35,10 +35,12 @@ const DEFAULT_SIGNAL_RANK_MAX = 1600;
 const DEFAULT_SIGNAL_CONCURRENCY = 6;
 const DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX = 160;
 const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_RANK_MAX = 360;
-const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 8;
-const DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX = 32;
-const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX = 200;
-const EASTMONEY_QUOTE_BATCH_SIZE = 60;
+const DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX = 80;
+const DEFAULT_SIGNAL_FETCH_MISSING_KLINE_MAX = 120;
+const DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX = 240;
+const EASTMONEY_QUOTE_BATCH_SIZE = 40;
+const DEFAULT_QUOTE_FALLBACK_MAX = 120;
+const DEFAULT_KLINE_SHARD_SIZE = 80;
 const KLINE_FETCH_TIMEOUT_MS = Number(process.env.KLINE_FETCH_TIMEOUT_MS || 15000);
 const EASTMONEY_KLINE_FETCH_TIMEOUT_MS = Number(process.env.EASTMONEY_KLINE_FETCH_TIMEOUT_MS || 6000);
 const TENCENT_KLINE_FETCH_TIMEOUT_MS = Number(process.env.TENCENT_KLINE_FETCH_TIMEOUT_MS || 10000);
@@ -4447,6 +4449,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function retryFetch(fn, { attempts = 3, delayMs = 600 } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -4547,34 +4553,48 @@ async function fetchEastmoneyDailyQuoteBatch(stocks, targetDate) {
   const stockByCode = new Map(normalizedStocks.map((stock) => [stock.code, stock]));
   const records = [];
   let firstError = null;
-  for (let index = 0; index < normalizedStocks.length; index += EASTMONEY_QUOTE_BATCH_SIZE) {
-    try {
-      const chunk = normalizedStocks.slice(index, index + EASTMONEY_QUOTE_BATCH_SIZE);
-      const secids = chunk.map((stock) => stock.secid).join(",");
-      const url =
-        "https://push2.eastmoney.com/api/qt/ulist.np/get" +
-        `?fltt=2&secids=${encodeURIComponent(secids)}` +
-        "&fields=f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f124";
-      const response = await fetchWithTimeout(
-        url,
-        {
-          headers: {
-            "User-Agent": "Mozilla/5.0",
-            Referer: "https://quote.eastmoney.com/",
-          },
+  const fetchChunk = async (chunk) => {
+    const secids = chunk.map((stock) => stock.secid).join(",");
+    const url =
+      "https://push2.eastmoney.com/api/qt/ulist.np/get" +
+      `?fltt=2&secids=${encodeURIComponent(secids)}` +
+      "&fields=f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f124";
+    const response = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          Referer: "https://quote.eastmoney.com/",
         },
-        EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
-      );
-      if (!response.ok) throw new Error(`东方财富批量行情请求失败：${response.status}`);
-      const payload = await response.json();
-      const diff = Array.isArray(payload?.data?.diff) ? payload.data.diff : Object.values(payload?.data?.diff || {});
-      for (const item of diff) {
-        const code = String(item?.f12 || "").match(/\d{6}/)?.[0] || "";
-        const record = eastmoneyQuoteRow(item, stockByCode.get(code), targetDate);
-        if (record) records.push(record);
-      }
+      },
+      EASTMONEY_KLINE_FETCH_TIMEOUT_MS,
+    );
+    if (!response.ok) throw new Error(`东方财富批量行情请求失败：${response.status}`);
+    const payload = await response.json();
+    const diff = Array.isArray(payload?.data?.diff) ? payload.data.diff : Object.values(payload?.data?.diff || {});
+    const chunkRecords = [];
+    for (const item of diff) {
+      const code = String(item?.f12 || "").match(/\d{6}/)?.[0] || "";
+      const record = eastmoneyQuoteRow(item, stockByCode.get(code), targetDate);
+      if (record) chunkRecords.push(record);
+    }
+    return chunkRecords;
+  };
+
+  for (let index = 0; index < normalizedStocks.length; index += EASTMONEY_QUOTE_BATCH_SIZE) {
+    const chunk = normalizedStocks.slice(index, index + EASTMONEY_QUOTE_BATCH_SIZE);
+    try {
+      records.push(...(await fetchChunk(chunk)));
     } catch (error) {
       firstError ||= error;
+      // Retry once after a short backoff; keep going so one 502 does not discard later chunks.
+      try {
+        await delay(350);
+        records.push(...(await fetchChunk(chunk)));
+        firstError = firstError === error ? null : firstError;
+      } catch (retryError) {
+        firstError ||= retryError;
+      }
     }
   }
   if (!records.length && firstError) throw firstError;
@@ -6433,7 +6453,12 @@ async function runDailySignalGeneration(options = {}) {
     // Persist the completed target-day quote for the whole universe before
     // slower per-stock rank-history repair can consume the cron budget.
     const targetQuoteStats = {};
-    await prefillTargetDateBars(universe.map((item) => item.code), targetDate, targetQuoteStats);
+    await prefillTargetDateBars(universe.map((item) => item.code), targetDate, targetQuoteStats, {
+      startedAtMs,
+      timeBudgetMs,
+      concurrency,
+      fallbackMax: Math.min(universe.length, Math.max(fetchMissingKlineMax, DEFAULT_QUOTE_FALLBACK_MAX)),
+    });
     const rankHistoryByCode = await loadCachedRankHistories({
       sourceKey,
       codes: universe.map((item) => item.code),
@@ -6867,7 +6892,7 @@ async function dailySignalFallbackPayload(query = {}, headers = {}) {
           metric: "attention",
           repairDependencies: true,
           timeBudgetMs: query.timeBudgetMs || 45000,
-          fetchMissingKlineMax: query.fetchMissingKlineMax || 80,
+          fetchMissingKlineMax: query.fetchMissingKlineMax || DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
         });
         const postHealth = await sourceDataHealth("ths", targetDate);
         return {
@@ -7058,28 +7083,58 @@ async function runDailyKlineSync(options = {}) {
     300000,
   );
   const force = options.force === true || options.force === "1" || options.force === "true";
+  const shardSize = boundedInteger(
+    options.shardSize ?? process.env.DAILY_KLINE_SHARD_SIZE ?? process.env.SYNC_SHARD_SIZE,
+    DEFAULT_KLINE_SHARD_SIZE,
+    10,
+    500,
+  );
   const targetDate = await resolveMarketTargetDate(options.date, sourceKey);
-  const params = { sourceKey, strategyKey, lookbackDays, maxStocks, force, timeBudgetMs, concurrency, targetDate };
+  const params = {
+    sourceKey,
+    strategyKey,
+    lookbackDays,
+    maxStocks,
+    force,
+    timeBudgetMs,
+    concurrency,
+    targetDate,
+    shardSize,
+  };
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
   const run = await createSyncRun(DAILY_SYNC_JOB, { params, startedAt });
   const results = [];
 
   try {
-    const candidates = await selectDailySyncStocks(params);
-    const pendingCount = candidates[0]?.pendingCount || candidates.length;
+    const selected = await selectDailySyncStocks(params);
+    // Process one shard per invocation so cron can resume the remainder next run.
+    const candidates = selected.slice(0, Math.min(selected.length, shardSize, maxStocks));
+    const pendingCount = selected[0]?.pendingCount || selected.length;
     const expectedTradingDates = await loadExpectedTradingDates(targetDate, 21);
     const previousTradingDate = expectedTradingDates.filter((date) => date < targetDate).at(-1) || null;
     const quoteStats = {};
-    const quoteRecords = await prefillTargetDateBars(candidates.map((candidate) => candidate.code), targetDate, quoteStats);
+    const quoteRecords = await prefillTargetDateBars(
+      candidates.map((candidate) => candidate.code),
+      targetDate,
+      quoteStats,
+      {
+        startedAtMs,
+        timeBudgetMs: Math.max(5000, Math.floor(timeBudgetMs * 0.45)),
+        concurrency,
+        fallbackMax: Math.min(candidates.length, Math.max(20, Math.floor(DEFAULT_QUOTE_FALLBACK_MAX / 2))),
+      },
+    );
     const quoteCodes = new Set(quoteRecords.map((record) => record.stock.code));
     let successCount = 0;
     let staleCount = 0;
     let failedCount = 0;
     let stoppedByTimeBudget = false;
+    // Keep enough budget for full-history repair after quote prefill.
+    const syncDeadlineMs = startedAtMs + timeBudgetMs;
 
     const syncCandidate = async (candidate) => {
-      if (Date.now() - startedAtMs > timeBudgetMs) {
+      if (Date.now() > syncDeadlineMs) {
         return { stoppedByTimeBudget: true };
       }
       const stock = normalizeStock(candidate.code);
@@ -7102,28 +7157,43 @@ async function runDailyKlineSync(options = {}) {
         status: "pending",
       };
       try {
-        if (quoteCodes.has(candidate.code) && recentHistoryReady) {
-          item.status = "synced_quote";
+        // Target-day quote coverage is already valuable for feature gates. Count it as
+        // success even when older history still needs a later shard pass.
+        if (quoteCodes.has(candidate.code)) {
+          item.status = recentHistoryReady ? "synced_quote" : "synced_quote_partial";
           item.latestBarDate = targetDate;
           item.targetDate = targetDate;
           item.hasTargetDate = true;
           item.usedCacheFallback = false;
-          return item;
+          item.recentHistoryReady = recentHistoryReady;
+          if (recentHistoryReady || Date.now() > syncDeadlineMs - 5000) return item;
         }
         const { rows, refreshError, usedCacheFallback } = await loadBestAvailableKlineForSync(stock, fallbackFromDate, targetDate);
         const latestRow = rows[rows.length - 1] || null;
-        const hasTargetDate = rowsContainDate(rows, targetDate);
+        const hasTargetDate = rowsContainDate(rows, targetDate) || quoteCodes.has(candidate.code);
         const usedFallbackOnly = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS;
-        item.status = hasTargetDate ? (usedFallbackOnly ? "synced_fallback" : usedCacheFallback ? "synced_cached" : "synced") : "stale";
+        if (hasTargetDate) {
+          item.status = usedFallbackOnly ? "synced_fallback" : usedCacheFallback ? "synced_cached" : quoteCodes.has(candidate.code) ? "synced_quote" : "synced";
+        } else {
+          item.status = "stale";
+        }
         item.rowCount = rows.length;
-        item.latestBarDate = latestRow?.date || null;
+        item.latestBarDate = latestRow?.date || (hasTargetDate ? targetDate : null);
         item.targetDate = targetDate;
         item.hasTargetDate = hasTargetDate;
         item.usedCacheFallback = usedCacheFallback;
         if (refreshError) item.refreshError = refreshError;
       } catch (error) {
-        item.status = "failed";
-        item.error = error.message;
+        if (quoteCodes.has(candidate.code)) {
+          item.status = "synced_quote_partial";
+          item.latestBarDate = targetDate;
+          item.targetDate = targetDate;
+          item.hasTargetDate = true;
+          item.error = error.message;
+        } else {
+          item.status = "failed";
+          item.error = error.message;
+        }
       }
       return item;
     };
@@ -7141,13 +7211,21 @@ async function runDailyKlineSync(options = {}) {
           continue;
         }
         results.push(item);
-        if (["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)) successCount += 1;
+        if (["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)) successCount += 1;
         if (item.status === "stale") staleCount += 1;
         if (item.status === "failed") failedCount += 1;
       }
       if (stoppedByTimeBudget) break;
     }
 
+    const remainingCodes = [
+      ...candidates
+        .filter((candidate) => !results.some((item) => item.code === candidate.code))
+        .map((candidate) => candidate.code),
+      ...results.filter((item) => !["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)).map((item) => item.code),
+      ...selected.slice(candidates.length).map((candidate) => candidate.code),
+    ];
+    const uniqueRemainingCodes = [...new Set(remainingCodes)].filter(Boolean);
     const summary = {
       jobName: DAILY_SYNC_JOB,
       runId: run.id,
@@ -7155,6 +7233,7 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: candidates.length,
+      universeCount: selected.length,
       pendingCount,
       successCount,
       staleCount,
@@ -7164,16 +7243,21 @@ async function runDailyKlineSync(options = {}) {
       previousTradingDate,
       results,
       stoppedByTimeBudget,
-      remainingCount: Math.max(0, pendingCount - results.length),
+      remainingCount: uniqueRemainingCodes.length,
+      remainingCodes: uniqueRemainingCodes.slice(0, 120),
+      shardComplete: uniqueRemainingCodes.length === 0,
+      targetDate,
     };
-    const status = stoppedByTimeBudget || failedCount || staleCount || pendingCount > results.length
+    const status = stoppedByTimeBudget || failedCount || staleCount || uniqueRemainingCodes.length
       ? (successCount || staleCount ? "partial" : "failed")
       : "success";
     const errorMessage = stoppedByTimeBudget
       ? "time budget reached before all selected stocks were synced"
-      : failedCount && !successCount
-        ? "all selected stocks failed"
-        : null;
+      : uniqueRemainingCodes.length && successCount
+        ? `shard complete with ${uniqueRemainingCodes.length} stocks remaining`
+        : failedCount && !successCount
+          ? "all selected stocks failed"
+          : null;
     await finishSyncRun(run.id, status, summary, errorMessage);
     cachedDbData.clear();
     return { ...summary, status };
@@ -7185,7 +7269,7 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: results.length,
-      successCount: results.filter((item) => ["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)).length,
+      successCount: results.filter((item) => ["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)).length,
       staleCount: results.filter((item) => item.status === "stale").length,
       failedCount: results.filter((item) => item.status === "failed").length,
       results,
@@ -7804,7 +7888,7 @@ async function runThsFeatureGeneration(options = {}) {
     options.fetchMissingKlineMax ?? process.env.IFIND_FEATURE_FETCH_MISSING_KLINE_MAX,
     DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX,
     0,
-    200,
+    400,
   );
   const fetchMissingKlineMax =
     options.fetchMissingKlineMax === undefined
@@ -8138,26 +8222,105 @@ async function runThsFeatureGeneration(options = {}) {
   }
 }
 
-async function prefillTargetDateBars(codes, targetDate, stats = null) {
+async function prefillTargetDateBars(codes, targetDate, stats = null, options = {}) {
   const cleanCodes = [...new Set((codes || []).map((code) => String(code || "").match(/\d{6}/)?.[0]).filter(Boolean))];
   if (!cleanCodes.length || !normalizeDate(targetDate)) return [];
+  const startedAtMs = Number(options.startedAtMs) || Date.now();
+  const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
+  const fallbackMax = boundedInteger(
+    options.fallbackMax ?? process.env.QUOTE_FALLBACK_MAX,
+    DEFAULT_QUOTE_FALLBACK_MAX,
+    0,
+    500,
+  );
+  const fallbackConcurrency = boundedInteger(options.concurrency, DEFAULT_SYNC_CONCURRENCY, 1, 12);
+
+  // Skip codes that already have the target-day bar in DB so resume/feature
+  // generation does not burn the whole budget re-fetching known quotes.
+  let missingCodes = cleanCodes;
+  let alreadyCachedCount = 0;
+  try {
+    const { rows: existingRows } = await getDbPool().query(
+      `
+        select distinct code
+        from stock_daily_bars
+        where trade_date = $1::date
+          and code = any($2::text[])
+      `,
+      [targetDate, cleanCodes],
+    );
+    const existing = new Set(existingRows.map((row) => String(row.code || "")));
+    alreadyCachedCount = existing.size;
+    missingCodes = cleanCodes.filter((code) => !existing.has(code));
+  } catch (error) {
+    if (stats) stats.cacheLookupError = error.message;
+    missingCodes = cleanCodes;
+  }
+
   if (stats) {
-    stats.batchQuoteRequested = cleanCodes.length;
+    stats.batchQuoteRequested = missingCodes.length;
+    stats.batchQuoteCached = alreadyCachedCount;
     stats.batchQuoteFetched = 0;
     stats.batchQuoteSaved = 0;
+    stats.quoteFallbackRequested = 0;
+    stats.quoteFallbackSucceeded = 0;
+    stats.quoteFallbackFailed = 0;
   }
+  if (!missingCodes.length) return [];
+
+  let records = [];
   try {
-    const records = await fetchEastmoneyDailyQuoteBatch(cleanCodes, targetDate);
+    records = await fetchEastmoneyDailyQuoteBatch(missingCodes, targetDate);
+  } catch (error) {
+    if (stats) stats.batchQuoteError = error.message;
+    records = [];
+  }
+
+  if (records.length) {
     const savedCount = await saveDailyQuoteRecordsToDb(records);
     if (stats) {
       stats.batchQuoteFetched = records.length;
       stats.batchQuoteSaved = savedCount;
     }
-    return records;
-  } catch (error) {
-    if (stats) stats.batchQuoteError = error.message;
-    return [];
   }
+
+  const covered = new Set(records.map((record) => record.stock.code));
+  const stillMissingCodes = missingCodes.filter((code) => !covered.has(code));
+  if (!stillMissingCodes.length || fallbackMax <= 0) return records;
+
+  const prefillBudgetMs = Math.max(3000, Math.floor(timeBudgetMs * 0.45));
+  const fallbackDeadlineMs = startedAtMs + prefillBudgetMs;
+  const fallbackCodes = stillMissingCodes.slice(0, fallbackMax);
+  if (stats) {
+    stats.quoteFallbackRequested = fallbackCodes.length;
+    stats.prefillBudgetMs = prefillBudgetMs;
+  }
+  const fallbackRecords = [];
+  await mapLimit(fallbackCodes, fallbackConcurrency, async (code) => {
+    if (Date.now() > fallbackDeadlineMs) return;
+    try {
+      const stock = normalizeStock(code);
+      // Single-day tencent pull is enough for target-day quote prefill; full history
+      // repair still happens in the dedicated K-line path when needed.
+      const rows = await fetchTencentKlineWithRetry(stock, targetDate, targetDate, { persist: true });
+      const row = rows.find((item) => item.date === targetDate);
+      if (!row) return;
+      fallbackRecords.push({ stock, row });
+      if (stats) stats.quoteFallbackSucceeded += 1;
+    } catch {
+      if (stats) stats.quoteFallbackFailed += 1;
+    }
+  });
+
+  if (fallbackRecords.length) {
+    const savedFallback = await saveDailyQuoteRecordsToDb(fallbackRecords, "tencent-quote");
+    if (stats) {
+      stats.batchQuoteSaved = (Number(stats.batchQuoteSaved) || 0) + savedFallback;
+      stats.batchQuoteFetched = (Number(stats.batchQuoteFetched) || 0) + fallbackRecords.length;
+    }
+    records = [...records, ...fallbackRecords];
+  }
+  return records;
 }
 
 function klineRowsSupportFeatures(rows, targetDate, expectedTradingDates = []) {
@@ -8210,10 +8373,10 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     byCode.get(code).push(dbBarRowToKline(row));
   }
 
-  const fetchMissingMax = boundedInteger(options.fetchMissingMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX, 0, 200);
+  const fetchMissingMax = boundedInteger(options.fetchMissingMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX, 0, 400);
   const startedAtMs = Number(options.startedAtMs) || Date.now();
   const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
-  const safetyWindowMs = 15000;
+  const safetyWindowMs = 10000;
   const fetchConcurrency = boundedInteger(options.concurrency, DEFAULT_SIGNAL_CONCURRENCY, 1, 16);
   let missingTargetCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
   const unavailableTargetCodes = new Set();
@@ -8228,9 +8391,15 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     stats.fetchFailed = 0;
     stats.targetUnavailableCount = 0;
     stats.targetUnavailableCodes = [];
+    stats.remainingCodes = [];
   }
 
-  const quoteRecords = await prefillTargetDateBars(missingTargetCodes, targetDate, stats);
+  const quoteRecords = await prefillTargetDateBars(missingTargetCodes, targetDate, stats, {
+    startedAtMs,
+    timeBudgetMs,
+    concurrency: Math.min(fetchConcurrency, 8),
+    fallbackMax: Math.max(fetchMissingMax, DEFAULT_QUOTE_FALLBACK_MAX),
+  });
   for (const record of quoteRecords) {
     const code = record.stock.code;
     byCode.set(code, mergeKlineRows(byCode.get(code) || [], [record.row]));
@@ -8239,7 +8408,11 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
   const missingFeatureCodes = codes.filter(
     (code) => !klineRowsSupportFeatures(byCode.get(code), targetDate, expectedTradingDates),
   );
-  const missingCodes = missingFeatureCodes.slice(0, fetchMissingMax);
+  // Prefer codes still missing the target bar, then the rest of incomplete feature history.
+  const missingCodes = [
+    ...missingTargetCodes,
+    ...missingFeatureCodes.filter((code) => !missingTargetCodes.includes(code)),
+  ].slice(0, fetchMissingMax);
   if (stats) {
     stats.cachedTargetCount = codes.length - missingTargetCodes.length;
     stats.missingTargetCount = missingTargetCodes.length;
@@ -8281,12 +8454,14 @@ async function loadStockDailyBarsForFeatures(codes, targetDate, options = {}) {
     }
   });
   if (stats) {
-    stats.remainingTargetCount = codes.filter(
+    const remainingCodes = codes.filter(
       (code) =>
         !unavailableTargetCodes.has(code) &&
         !klineRowsSupportFeatures(byCode.get(code), targetDate, expectedTradingDates),
-    ).length;
+    );
+    stats.remainingTargetCount = remainingCodes.length;
     stats.featureReadyCount = codes.length - stats.remainingTargetCount;
+    stats.remainingCodes = remainingCodes.slice(0, 80);
   }
 
   return byCode;
