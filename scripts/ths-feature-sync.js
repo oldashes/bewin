@@ -20,7 +20,7 @@ runThsFeatureGeneration({
   metric: process.env.IFIND_FEATURE_METRIC,
   boardMode: process.env.IFIND_FEATURE_BOARD_MODE,
   timeBudgetMs: envAtLeast("IFIND_FEATURE_TIME_BUDGET_MS", 55000),
-  fetchMissingKlineMax: envAtLeast("IFIND_FEATURE_FETCH_MISSING_KLINE_MAX", 8),
+  fetchMissingKlineMax: envAtLeast("IFIND_FEATURE_FETCH_MISSING_KLINE_MAX", 80),
 })
   .then((summary) => {
     console.log(JSON.stringify(summary, null, 2));
