@@ -7118,16 +7118,23 @@ async function runDailyKlineSync(options = {}) {
       candidates.map((candidate) => candidate.code),
       targetDate,
       quoteStats,
-      { startedAtMs, timeBudgetMs, concurrency, fallbackMax: Math.min(candidates.length, DEFAULT_QUOTE_FALLBACK_MAX) },
+      {
+        startedAtMs,
+        timeBudgetMs: Math.max(5000, Math.floor(timeBudgetMs * 0.45)),
+        concurrency,
+        fallbackMax: Math.min(candidates.length, Math.max(20, Math.floor(DEFAULT_QUOTE_FALLBACK_MAX / 2))),
+      },
     );
     const quoteCodes = new Set(quoteRecords.map((record) => record.stock.code));
     let successCount = 0;
     let staleCount = 0;
     let failedCount = 0;
     let stoppedByTimeBudget = false;
+    // Keep enough budget for full-history repair after quote prefill.
+    const syncDeadlineMs = startedAtMs + timeBudgetMs;
 
     const syncCandidate = async (candidate) => {
-      if (Date.now() - startedAtMs > timeBudgetMs) {
+      if (Date.now() > syncDeadlineMs) {
         return { stoppedByTimeBudget: true };
       }
       const stock = normalizeStock(candidate.code);
@@ -7150,28 +7157,43 @@ async function runDailyKlineSync(options = {}) {
         status: "pending",
       };
       try {
-        if (quoteCodes.has(candidate.code) && recentHistoryReady) {
-          item.status = "synced_quote";
+        // Target-day quote coverage is already valuable for feature gates. Count it as
+        // success even when older history still needs a later shard pass.
+        if (quoteCodes.has(candidate.code)) {
+          item.status = recentHistoryReady ? "synced_quote" : "synced_quote_partial";
           item.latestBarDate = targetDate;
           item.targetDate = targetDate;
           item.hasTargetDate = true;
           item.usedCacheFallback = false;
-          return item;
+          item.recentHistoryReady = recentHistoryReady;
+          if (recentHistoryReady || Date.now() > syncDeadlineMs - 5000) return item;
         }
         const { rows, refreshError, usedCacheFallback } = await loadBestAvailableKlineForSync(stock, fallbackFromDate, targetDate);
         const latestRow = rows[rows.length - 1] || null;
-        const hasTargetDate = rowsContainDate(rows, targetDate);
+        const hasTargetDate = rowsContainDate(rows, targetDate) || quoteCodes.has(candidate.code);
         const usedFallbackOnly = rows.some((row) => row.date === fallbackFromDate) && rows.length <= IFIND_KLINE_FALLBACK_MAX_DAYS;
-        item.status = hasTargetDate ? (usedFallbackOnly ? "synced_fallback" : usedCacheFallback ? "synced_cached" : "synced") : "stale";
+        if (hasTargetDate) {
+          item.status = usedFallbackOnly ? "synced_fallback" : usedCacheFallback ? "synced_cached" : quoteCodes.has(candidate.code) ? "synced_quote" : "synced";
+        } else {
+          item.status = "stale";
+        }
         item.rowCount = rows.length;
-        item.latestBarDate = latestRow?.date || null;
+        item.latestBarDate = latestRow?.date || (hasTargetDate ? targetDate : null);
         item.targetDate = targetDate;
         item.hasTargetDate = hasTargetDate;
         item.usedCacheFallback = usedCacheFallback;
         if (refreshError) item.refreshError = refreshError;
       } catch (error) {
-        item.status = "failed";
-        item.error = error.message;
+        if (quoteCodes.has(candidate.code)) {
+          item.status = "synced_quote_partial";
+          item.latestBarDate = targetDate;
+          item.targetDate = targetDate;
+          item.hasTargetDate = true;
+          item.error = error.message;
+        } else {
+          item.status = "failed";
+          item.error = error.message;
+        }
       }
       return item;
     };
@@ -7189,7 +7211,7 @@ async function runDailyKlineSync(options = {}) {
           continue;
         }
         results.push(item);
-        if (["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)) successCount += 1;
+        if (["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)) successCount += 1;
         if (item.status === "stale") staleCount += 1;
         if (item.status === "failed") failedCount += 1;
       }
@@ -7200,7 +7222,7 @@ async function runDailyKlineSync(options = {}) {
       ...candidates
         .filter((candidate) => !results.some((item) => item.code === candidate.code))
         .map((candidate) => candidate.code),
-      ...results.filter((item) => !["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)).map((item) => item.code),
+      ...results.filter((item) => !["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)).map((item) => item.code),
       ...selected.slice(candidates.length).map((candidate) => candidate.code),
     ];
     const uniqueRemainingCodes = [...new Set(remainingCodes)].filter(Boolean);
@@ -7247,7 +7269,7 @@ async function runDailyKlineSync(options = {}) {
       finishedAt: new Date().toISOString(),
       params,
       selectedCount: results.length,
-      successCount: results.filter((item) => ["synced", "synced_fallback", "synced_cached", "synced_quote"].includes(item.status)).length,
+      successCount: results.filter((item) => ["synced", "synced_fallback", "synced_cached", "synced_quote", "synced_quote_partial"].includes(item.status)).length,
       staleCount: results.filter((item) => item.status === "stale").length,
       failedCount: results.filter((item) => item.status === "failed").length,
       results,
@@ -8241,11 +8263,16 @@ async function prefillTargetDateBars(codes, targetDate, stats = null, options = 
   const missingCodes = cleanCodes.filter((code) => !covered.has(code));
   if (!missingCodes.length || fallbackMax <= 0) return records;
 
+  const prefillBudgetMs = Math.max(3000, Math.floor(timeBudgetMs * 0.45));
+  const fallbackDeadlineMs = startedAtMs + prefillBudgetMs;
   const fallbackCodes = missingCodes.slice(0, fallbackMax);
-  if (stats) stats.quoteFallbackRequested = fallbackCodes.length;
+  if (stats) {
+    stats.quoteFallbackRequested = fallbackCodes.length;
+    stats.prefillBudgetMs = prefillBudgetMs;
+  }
   const fallbackRecords = [];
   await mapLimit(fallbackCodes, fallbackConcurrency, async (code) => {
-    if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - 8000)) return;
+    if (Date.now() > fallbackDeadlineMs) return;
     try {
       const stock = normalizeStock(code);
       // Single-day tencent pull is enough for target-day quote prefill; full history
