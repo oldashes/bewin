@@ -5067,6 +5067,33 @@ function applyCurrentRanksToHistories(historiesByCode, topRanks, targetDate) {
   return historiesByCode;
 }
 
+/** True when targetDate is strictly before the latest completed market trading day. */
+function isHistoricalMarketTargetDate(targetDate, latestCompletedMarketDate) {
+  const target = normalizeDate(targetDate);
+  const latest = normalizeDate(latestCompletedMarketDate);
+  if (!target || !latest) return false;
+  return target < latest;
+}
+
+/**
+ * Live getAllCurrentList must only stamp the latest completed trading day.
+ * Historical/backfill dates cannot recover the past top-100 list; stamping
+ * today's live ranks onto an old date corrupts popularity_snapshots.
+ */
+function shouldSkipLiveCurrentList(options = {}) {
+  const skipFlag = options.skipLiveCurrentList;
+  if (skipFlag === true || skipFlag === "1" || skipFlag === "true") return true;
+  if (
+    options.mode === "backfill" ||
+    options.backfill === true ||
+    options.backfill === "1" ||
+    options.backfill === "true"
+  ) {
+    return true;
+  }
+  return isHistoricalMarketTargetDate(options.targetDate, options.latestCompletedMarketDate);
+}
+
 function selectMissingRankCandidates(universe, historiesByCode, targetDate, options = {}) {
   const fetchLimit = boundedInteger(options.maxFetch, DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX, 0, 1000);
   const prioritize = new Set(cleanStockCodes(options.prioritizeCodes));
@@ -5099,9 +5126,9 @@ function selectMissingRankCandidates(universe, historiesByCode, targetDate, opti
   };
 }
 
-async function loadLatestDailySignalCoverage(targetDate) {
+async function loadLatestSyncCoverage(jobName, targetDate) {
   const selectedDate = normalizeDate(targetDate);
-  if (!selectedDate) return { remainingRankCodes: [], remainingKlineCodes: [] };
+  if (!selectedDate || !jobName) return { remainingRankCodes: [], remainingKlineCodes: [] };
   const { rows } = await getDbPool().query(
     `
       select details
@@ -5116,7 +5143,7 @@ async function loadLatestDailySignalCoverage(targetDate) {
       order by started_at desc
       limit 1
     `,
-    [DAILY_SIGNAL_JOB, selectedDate],
+    [jobName, selectedDate],
   );
   const details = rows[0]?.details && typeof rows[0].details === "object" ? rows[0].details : {};
   const rankStats = details.rankStats && typeof details.rankStats === "object" ? details.rankStats : {};
@@ -5125,6 +5152,14 @@ async function loadLatestDailySignalCoverage(targetDate) {
     remainingRankCodes: cleanStockCodes(rankStats.remainingCodes),
     remainingKlineCodes: cleanStockCodes(klineStats.remainingCodes),
   };
+}
+
+async function loadLatestDailySignalCoverage(targetDate) {
+  return loadLatestSyncCoverage(DAILY_SIGNAL_JOB, targetDate);
+}
+
+async function loadLatestThsFeatureCoverage(targetDate) {
+  return loadLatestSyncCoverage(THS_FEATURE_JOB, targetDate);
 }
 
 async function fetchEastmoneyCurrentTopRanks(limit = 100) {
@@ -6578,6 +6613,14 @@ async function runDailySignalGeneration(options = {}) {
   const force = options.force === true || options.force === "1" || options.force === "true";
   const startedAt = new Date().toISOString();
   const startedAtMs = Date.now();
+  const latestCompletedMarketDate = dateFromYmd(defaultCompletedMarketYmd());
+  const skipLiveCurrentList = shouldSkipLiveCurrentList({
+    targetDate,
+    latestCompletedMarketDate,
+    skipLiveCurrentList: options.skipLiveCurrentList,
+    mode: options.mode,
+    backfill: options.backfill,
+  });
   const params = {
     sourceKey,
     targetDate,
@@ -6589,18 +6632,24 @@ async function runDailySignalGeneration(options = {}) {
     timeBudgetMs,
     fetchMissingRankMax,
     fetchMissingKlineMax,
+    skipLiveCurrentList,
+    latestCompletedMarketDate,
   };
   const run = await createSyncRun(DAILY_SIGNAL_JOB, { params, startedAt });
 
   const results = [];
   try {
-    const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
+    let topRanks = [];
     let savedCurrentSnapshots = 0;
-    if (topRanks.length) {
-      // Live getAllCurrentList is cheap and is the board-of-record for data-health.
-      // Persist it before slower per-stock history/kline shards so snapshotCount
-      // is not left at 0 when the 60s cron budget is exhausted.
-      savedCurrentSnapshots = await upsertPopularitySnapshots(eastmoneyCurrentRanksToSnapshots(topRanks, targetDate));
+    if (!skipLiveCurrentList) {
+      topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
+      if (topRanks.length) {
+        // Live getAllCurrentList is cheap and is the board-of-record for data-health.
+        // Persist it before slower per-stock history/kline shards so snapshotCount
+        // is not left at 0 when the 60s cron budget is exhausted.
+        // Only for the latest completed trading day — never stamp live ranks onto history.
+        savedCurrentSnapshots = await upsertPopularitySnapshots(eastmoneyCurrentRanksToSnapshots(topRanks, targetDate));
+      }
     }
     const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax, targetDate });
     const universeSources = universeSourceCounts(universe);
@@ -6612,7 +6661,9 @@ async function runDailySignalGeneration(options = {}) {
       lookbackDays: 150,
       metric: "rank",
     });
-    applyCurrentRanksToHistories(rankHistoryByCode, topRanks, targetDate);
+    if (!skipLiveCurrentList) {
+      applyCurrentRanksToHistories(rankHistoryByCode, topRanks, targetDate);
+    }
     const rankStats = {};
     await refreshMissingRankHistories({
       universe,
@@ -6817,6 +6868,14 @@ async function runDailySignalGeneration(options = {}) {
       processedUniverseCount: histories.length,
       remainingUniverseCount: Math.max(0, universe.length - histories.length),
       stoppedByTimeBudget,
+      skipLiveCurrentList,
+      latestCompletedMarketDate,
+      // Historical backfill cannot recover past getAllCurrentList top-100.
+      // snapshotCount / savedCurrentSnapshots may stay low (often 0) while
+      // getHisList rank histories and feature generation still proceed.
+      historicalSnapshotNote: skipLiveCurrentList
+        ? "historical/backfill: live current-list skipped; snapshotCount may stay low while rank histories/features fill via getHisList"
+        : null,
       rankStats,
       klineStats,
       boardPreloadStats,
@@ -6872,6 +6931,9 @@ async function dailySignalPayload(query = {}, headers = {}) {
     fetchMissingRankMax: query.fetchMissingRankMax,
     fetchMissingKlineMax: query.fetchMissingKlineMax,
     force: query.force,
+    skipLiveCurrentList: query.skipLiveCurrentList,
+    mode: query.mode,
+    backfill: query.backfill,
   });
 }
 
@@ -7205,6 +7267,8 @@ async function dailySignalBackfillPayload(query = {}, headers = {}) {
     fetchMissingKlineMax:
       query.fetchMissingKlineMax || process.env.SIGNAL_BACKFILL_FETCH_MISSING_KLINE_MAX || DEFAULT_SIGNAL_FALLBACK_FETCH_MISSING_KLINE_MAX,
     force: true,
+    mode: "backfill",
+    skipLiveCurrentList: true,
   });
   return { ...result, backfill: selected };
 }
@@ -8039,6 +8103,8 @@ async function runThsFeatureGeneration(options = {}) {
     ? Number(options.prev5MaxPct ?? process.env.IFIND_FEATURE_PREV5_MAX_PCT)
     : 35) / 100;
   const boardMode = String(options.boardMode || process.env.IFIND_FEATURE_BOARD_MODE || "aggregate").toLowerCase();
+  // metric=attention covers hot top ranks from free THS scrape; early (400–1200)
+  // needs deeper daily ranks from the paid iFind script (follow-up, needs token).
   const metric = String(options.metric || process.env.IFIND_FEATURE_METRIC || "attention").toLowerCase();
   const timeBudgetMs = boundedInteger(
     options.timeBudgetMs ?? process.env.THS_FEATURE_TIME_BUDGET_MS ?? process.env.CRON_TIME_BUDGET_MS,
@@ -8152,6 +8218,7 @@ async function runThsFeatureGeneration(options = {}) {
       )
     : { rows: [] };
   const expectedTradingDates = await loadExpectedTradingDates(targetDate, 21);
+  const previousCoverage = await loadLatestThsFeatureCoverage(targetDate);
   const klineStats = {};
   const [klineByCode, donorByKey] = await Promise.all([
     loadStockDailyBarsForFeatures(codes, targetDate, {
@@ -8160,6 +8227,7 @@ async function runThsFeatureGeneration(options = {}) {
       timeBudgetMs,
       stats: klineStats,
       expectedTradingDates,
+      prioritizeCodes: previousCoverage.remainingKlineCodes,
     }),
     loadEmBoardDonorsForFeatures(codes, targetDate),
   ]);
@@ -9193,6 +9261,10 @@ module.exports = {
   displayMarketPrefix,
   eastmoneyCurrentRanksToSnapshots,
   applyCurrentRanksToHistories,
+  isHistoricalMarketTargetDate,
+  shouldSkipLiveCurrentList,
+  loadLatestDailySignalCoverage,
+  loadLatestThsFeatureCoverage,
   selectMissingRankCandidates,
   rankHistoryContainsDate,
 };
