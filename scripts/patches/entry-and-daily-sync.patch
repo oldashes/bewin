@@ -31,3 +31,393 @@
          ]} />
          <Button mt={24} onClick={() => verify()} loading={loading}>计算收益</Button>
        </SimpleGrid>
+--- a/work/strategy-dashboard/server.js
++++ b/work/strategy-dashboard/server.js
+@@ -49,6 +49,11 @@
+ const TENCENT_KLINE_MAX_COUNT = Number(process.env.TENCENT_KLINE_MAX_COUNT || 1095);
+ const KLINE_PROVIDER_MAX_LAG_DAYS = Number(process.env.KLINE_PROVIDER_MAX_LAG_DAYS || 7);
+ const DEFAULT_CRON_TIME_BUDGET_MS = 55000;
++// Vercel cron maxDuration is 60s (Hobby/Pro). Keep a 55s budget and resume
++// leftover rank/kline shards from sync_runs instead of raising maxDuration.
++const RANK_FETCH_SAFETY_WINDOW_MS = 8000;
++const KLINE_FETCH_SAFETY_WINDOW_MS = 8000;
++const COVERAGE_RESUME_CODE_LIMIT = 240;
+ const IFIND_BASE_URL = process.env.IFIND_BASE_URL || "https://quantapi.51ifind.com/api/v1";
+ const IFIND_KLINE_FALLBACK_ENABLED = /^(?:1|true)$/i.test(process.env.IFIND_KLINE_FALLBACK_ENABLED || "");
+ const IFIND_KLINE_FALLBACK_MAX_DAYS = Number(process.env.IFIND_KLINE_FALLBACK_MAX_DAYS || 15);
+@@ -1956,7 +1961,7 @@
+   const event = {
+     source: sourceName,
+     strategyKey: "hot",
+-    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
++    em: displayEmCode(code),
+     code,
+     name: meta.name || baseName,
+     signalDate,
+@@ -2425,7 +2430,7 @@
+   const event = {
+     source: strategyKey === "hot" ? "Neon 热门确认" : raw.source === "最新候选" ? "Neon 最新候选" : "Neon 回测事件",
+     strategyKey,
+-    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
++    em: displayEmCode(code),
+     code,
+     name: meta.name || baseName,
+     signalDate,
+@@ -2505,7 +2510,7 @@
+   const event = {
+     source: strategySource,
+     strategyKey,
+-    em: `${code.startsWith("6") ? "SH" : "SZ"}${code}`,
++    em: displayEmCode(code),
+     code,
+     name: meta.name || baseName,
+     signalDate,
+@@ -4435,6 +4440,38 @@
+   };
+ }
+ 
++function displayMarketPrefix(code) {
++  const clean = String(code || "").match(/\d{6}/)?.[0] || "";
++  if (!clean) return "SZ";
++  if (/^(?:4|8|92)/.test(clean)) return "BJ";
++  if (clean.startsWith("6")) return "SH";
++  return "SZ";
++}
++
++function displayEmCode(code) {
++  const clean = String(code || "").match(/\d{6}/)?.[0] || "";
++  return clean ? `${displayMarketPrefix(clean)}${clean}` : "";
++}
++
++function normalizePositionEntry(entry) {
++  const raw = entry == null || String(entry).trim() === "" ? "nextOpen" : String(entry).trim();
++  const compact = raw.replace(/[-_\s]/g, "").toLowerCase();
++  if (compact === "nextopen") return "nextOpen";
++  if (compact === "close" || compact === "sameclose") return "close";
++  if (compact === "open" || compact === "sameopen") return "open";
++  return "nextOpen";
++}
++
++function cleanStockCodes(codes) {
++  return [...new Set((codes || []).map((code) => {
++    try {
++      return normalizeStock(code).code;
++    } catch {
++      return String(code || "").match(/\d{6}/)?.[0] || "";
++    }
++  }).filter(Boolean))];
++}
++
+ async function fetchWithTimeout(url, options = {}, timeoutMs = KLINE_FETCH_TIMEOUT_MS) {
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), timeoutMs);
+@@ -4983,6 +5020,113 @@
+   return normalized ? `${normalized}T15:00:00+08:00` : null;
+ }
+ 
++function eastmoneyCurrentRanksToSnapshots(topRanks, targetDate) {
++  const date = normalizeDate(targetDate);
++  if (!date) return [];
++  const ymd = date.replaceAll("-", "");
++  return (topRanks || [])
++    .map((item) => {
++      const code = String(item.code || "").match(/\d{6}/)?.[0] || "";
++      const rank = n(item.rank);
++      if (!code || !Number.isFinite(rank)) return null;
++      return {
++        source: "em",
++        category: "stock",
++        metric: "rank",
++        snapshot_date: date,
++        snapshot_key: ymd,
++        snapshot_time: emRankSnapshotTime(date),
++        code,
++        name: item.name || code,
++        market: code.startsWith("6") ? "1" : "0",
++        rank,
++        rank_change: n(item.rankChange),
++        heat_value: null,
++        pct: null,
++        price: null,
++        float_market_value: null,
++        main_tag: "",
++        raw: {},
++      };
++    })
++    .filter(Boolean);
++}
++
++function applyCurrentRanksToHistories(historiesByCode, topRanks, targetDate) {
++  const date = normalizeDate(targetDate);
++  if (!date || !historiesByCode) return historiesByCode;
++  for (const item of topRanks || []) {
++    const code = String(item.code || "").match(/\d{6}/)?.[0] || "";
++    const rank = n(item.rank);
++    if (!code || !Number.isFinite(rank)) continue;
++    historiesByCode.set(
++      code,
++      mergeRankHistory(historiesByCode.get(code), [{ date, rank, raw: { currentList: true } }]),
++    );
++  }
++  return historiesByCode;
++}
++
++function selectMissingRankCandidates(universe, historiesByCode, targetDate, options = {}) {
++  const fetchLimit = boundedInteger(options.maxFetch, DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX, 0, 1000);
++  const prioritize = new Set(cleanStockCodes(options.prioritizeCodes));
++  const missingCandidates = (universe || [])
++    .filter((item) => {
++      try {
++        const code = normalizeStock(item.code).code;
++        return !rankHistoryContainsDate(historiesByCode.get(code), targetDate);
++      } catch {
++        return false;
++      }
++    })
++    .sort((a, b) => {
++      const aCode = normalizeStock(a.code).code;
++      const bCode = normalizeStock(b.code).code;
++      const aPriority = prioritize.has(aCode) ? 0 : 1;
++      const bPriority = prioritize.has(bCode) ? 0 : 1;
++      if (aPriority !== bPriority) return aPriority - bPriority;
++      const aHistory = historiesByCode.get(aCode) || [];
++      const bHistory = historiesByCode.get(bCode) || [];
++      const aRank = rankAtOffset(aHistory, targetDate, 0);
++      const bRank = rankAtOffset(bHistory, targetDate, 0);
++      const aEarly = Number.isFinite(aRank) && aRank >= STRATEGY_PARAM_DEFAULTS.early.rankMin && aRank <= STRATEGY_PARAM_DEFAULTS.early.rankMax;
++      const bEarly = Number.isFinite(bRank) && bRank >= STRATEGY_PARAM_DEFAULTS.early.rankMin && bRank <= STRATEGY_PARAM_DEFAULTS.early.rankMax;
++      return Number(bEarly) - Number(aEarly) || (a.universePriority ?? 9) - (b.universePriority ?? 9) || (aRank ?? 999999) - (bRank ?? 999999);
++    });
++  return {
++    missingCandidates,
++    candidates: missingCandidates.slice(0, fetchLimit),
++  };
++}
++
++async function loadLatestDailySignalCoverage(targetDate) {
++  const selectedDate = normalizeDate(targetDate);
++  if (!selectedDate) return { remainingRankCodes: [], remainingKlineCodes: [] };
++  const { rows } = await getDbPool().query(
++    `
++      select details
++      from sync_runs
++      where job_name = $1
++        and coalesce(
++          details->>'generatedDate',
++          details->>'targetDate',
++          details->'params'->>'targetDate'
++        ) = $2
++        and status <> 'running'
++      order by started_at desc
++      limit 1
++    `,
++    [DAILY_SIGNAL_JOB, selectedDate],
++  );
++  const details = rows[0]?.details && typeof rows[0].details === "object" ? rows[0].details : {};
++  const rankStats = details.rankStats && typeof details.rankStats === "object" ? details.rankStats : {};
++  const klineStats = details.klineStats && typeof details.klineStats === "object" ? details.klineStats : {};
++  return {
++    remainingRankCodes: cleanStockCodes(rankStats.remainingCodes),
++    remainingKlineCodes: cleanStockCodes(klineStats.remainingCodes),
++  };
++}
++
+ async function fetchEastmoneyCurrentTopRanks(limit = 100) {
+   const pageSize = Math.min(Math.max(Number(limit) || 100, 1), 100);
+   const response = await fetchWithTimeout(
+@@ -5152,24 +5296,15 @@
+   startedAtMs,
+   timeBudgetMs,
+   stats,
++  prioritizeCodes,
+ }) {
+-  const safetyWindowMs = 30000;
+-  const fetchLimit = boundedInteger(maxFetch, DEFAULT_SIGNAL_FETCH_MISSING_RANK_MAX, 0, 1000);
+-  const missingCandidates = (universe || [])
+-    .filter((item) => {
+-      const code = normalizeStock(item.code).code;
+-      return !rankHistoryContainsDate(historiesByCode.get(code), targetDate);
+-    })
+-    .sort((a, b) => {
+-      const aHistory = historiesByCode.get(normalizeStock(a.code).code) || [];
+-      const bHistory = historiesByCode.get(normalizeStock(b.code).code) || [];
+-      const aRank = rankAtOffset(aHistory, targetDate, 0);
+-      const bRank = rankAtOffset(bHistory, targetDate, 0);
+-      const aEarly = Number.isFinite(aRank) && aRank >= STRATEGY_PARAM_DEFAULTS.early.rankMin && aRank <= STRATEGY_PARAM_DEFAULTS.early.rankMax;
+-      const bEarly = Number.isFinite(bRank) && bRank >= STRATEGY_PARAM_DEFAULTS.early.rankMin && bRank <= STRATEGY_PARAM_DEFAULTS.early.rankMax;
+-      return Number(bEarly) - Number(aEarly) || (a.universePriority ?? 9) - (b.universePriority ?? 9) || (aRank ?? 999999) - (bRank ?? 999999);
+-    });
+-  const candidates = missingCandidates.slice(0, fetchLimit);
++  // 30s leftover used to skip every rank fetch after quote prefill on a 55s cron.
++  const safetyWindowMs = RANK_FETCH_SAFETY_WINDOW_MS;
++  const { missingCandidates, candidates } = selectMissingRankCandidates(universe, historiesByCode, targetDate, {
++    maxFetch,
++    prioritizeCodes,
++  });
++  const fetchLimit = candidates.length;
+ 
+   if (stats) {
+     stats.missingTargetCount = missingCandidates.length;
+@@ -5180,13 +5315,23 @@
+     stats.savedSnapshots = 0;
+   }
+   if (!candidates.length) {
+-    if (stats) stats.remainingTargetCount = missingCandidates.length;
++    if (stats) {
++      stats.remainingTargetCount = missingCandidates.length;
++      stats.remainingCodes = missingCandidates.map((item) => normalizeStock(item.code).code).slice(0, COVERAGE_RESUME_CODE_LIMIT);
++    }
+     return historiesByCode;
+   }
+ 
+   const records = [];
+   await mapLimit(candidates, Math.min(Math.max(Number(concurrency) || 1, 1), 16), async (item) => {
+-    if (Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)) return;
++    // Never no-op a whole shard: the old 30s window skipped every fetch
++    // (fetchAttempted=0) after quote prefill. Allow the first wave, then stop.
++    if (
++      (stats?.fetchAttempted || 0) > 0 &&
++      Date.now() - startedAtMs > Math.max(0, timeBudgetMs - safetyWindowMs)
++    ) {
++      return;
++    }
+     const code = normalizeStock(item.code).code;
+     try {
+       if (stats) stats.fetchAttempted += 1;
+@@ -5207,10 +5352,12 @@
+     if (stats) stats.savedSnapshots = saved;
+   }
+   if (stats) {
+-    stats.remainingTargetCount = missingCandidates.filter((item) => {
++    const remaining = missingCandidates.filter((item) => {
+       const code = normalizeStock(item.code).code;
+       return !rankHistoryContainsDate(historiesByCode.get(code), targetDate);
+-    }).length;
++    });
++    stats.remainingTargetCount = remaining.length;
++    stats.remainingCodes = remaining.map((item) => normalizeStock(item.code).code).slice(0, COVERAGE_RESUME_CODE_LIMIT);
+   }
+   return historiesByCode;
+ }
+@@ -6448,17 +6595,16 @@
+   const results = [];
+   try {
+     const topRanks = await fetchEastmoneyCurrentTopRanks(100).catch(() => []);
++    let savedCurrentSnapshots = 0;
++    if (topRanks.length) {
++      // Live getAllCurrentList is cheap and is the board-of-record for data-health.
++      // Persist it before slower per-stock history/kline shards so snapshotCount
++      // is not left at 0 when the 60s cron budget is exhausted.
++      savedCurrentSnapshots = await upsertPopularitySnapshots(eastmoneyCurrentRanksToSnapshots(topRanks, targetDate));
++    }
+     const universe = await selectDailySignalUniverse({ sourceKey, maxUniverse, topRanks, rankMax, targetDate });
+     const universeSources = universeSourceCounts(universe);
+-    // Persist the completed target-day quote for the whole universe before
+-    // slower per-stock rank-history repair can consume the cron budget.
+-    const targetQuoteStats = {};
+-    await prefillTargetDateBars(universe.map((item) => item.code), targetDate, targetQuoteStats, {
+-      startedAtMs,
+-      timeBudgetMs,
+-      concurrency,
+-      fallbackMax: Math.min(universe.length, Math.max(fetchMissingKlineMax, DEFAULT_QUOTE_FALLBACK_MAX)),
+-    });
++    const previousCoverage = await loadLatestDailySignalCoverage(targetDate);
+     const rankHistoryByCode = await loadCachedRankHistories({
+       sourceKey,
+       codes: universe.map((item) => item.code),
+@@ -6466,6 +6612,7 @@
+       lookbackDays: 150,
+       metric: "rank",
+     });
++    applyCurrentRanksToHistories(rankHistoryByCode, topRanks, targetDate);
+     const rankStats = {};
+     await refreshMissingRankHistories({
+       universe,
+@@ -6476,6 +6623,19 @@
+       startedAtMs,
+       timeBudgetMs,
+       stats: rankStats,
++      prioritizeCodes: previousCoverage.remainingRankCodes,
++    });
++    // Batch quotes are fast; skip slow per-stock fallback while rank shards remain
++    // so later crons actually fetch remaining rank history (fetchAttempted > 0).
++    const targetQuoteStats = {};
++    const rankRemainingBeforeQuotes = Number(rankStats.remainingTargetCount) || 0;
++    await prefillTargetDateBars(universe.map((item) => item.code), targetDate, targetQuoteStats, {
++      startedAtMs,
++      timeBudgetMs,
++      concurrency,
++      fallbackMax: rankRemainingBeforeQuotes > 0
++        ? 0
++        : Math.min(universe.length, Math.max(fetchMissingKlineMax, DEFAULT_QUOTE_FALLBACK_MAX)),
+     });
+     const histories = universe.map((item) => {
+       const history = rankHistoryByCode.get(normalizeStock(item.code).code) || [];
+@@ -6489,7 +6649,7 @@
+       return { item, history, snapshots: [], result };
+     });
+     const rankSnapshotCount = [...rankHistoryByCode.values()].reduce((total, history) => total + history.length, 0);
+-    const savedRankSnapshots = Number(rankStats.savedSnapshots) || 0;
++    const savedRankSnapshots = (Number(rankStats.savedSnapshots) || 0) + savedCurrentSnapshots;
+     let stoppedByTimeBudget = false;
+ 
+     const rankedCandidates = histories
+@@ -6524,6 +6684,7 @@
+         timeBudgetMs,
+         stats: klineStats,
+         expectedTradingDates,
++        prioritizeCodes: previousCoverage.remainingKlineCodes,
+       }),
+       loadBoardAggregateMetricsByName(
+         rankedCandidates.map((entry) => entry.item),
+@@ -6644,6 +6805,7 @@
+       failedCount,
+       rankSnapshotCount,
+       savedRankSnapshots,
++      savedCurrentSnapshots,
+       rankedCandidateCount: rankedCandidates.length,
+       klineCandidateCount: rankedCandidates.length,
+       featureCount: featureRecords.length,
+@@ -8376,9 +8538,11 @@
+   const fetchMissingMax = boundedInteger(options.fetchMissingMax, DEFAULT_FEATURE_FETCH_MISSING_KLINE_MAX, 0, 400);
+   const startedAtMs = Number(options.startedAtMs) || Date.now();
+   const timeBudgetMs = Number(options.timeBudgetMs) || DEFAULT_CRON_TIME_BUDGET_MS;
+-  const safetyWindowMs = 10000;
++  const safetyWindowMs = KLINE_FETCH_SAFETY_WINDOW_MS;
+   const fetchConcurrency = boundedInteger(options.concurrency, DEFAULT_SIGNAL_CONCURRENCY, 1, 16);
++  const prioritizeKline = new Set(cleanStockCodes(options.prioritizeCodes));
+   let missingTargetCodes = codes.filter((code) => !(byCode.get(code) || []).some((row) => row.date === targetDate));
++  missingTargetCodes.sort((a, b) => Number(prioritizeKline.has(b)) - Number(prioritizeKline.has(a)) || a.localeCompare(b));
+   const unavailableTargetCodes = new Set();
+   if (stats) {
+     stats.requestedCount = codes.length;
+@@ -8461,7 +8625,7 @@
+     );
+     stats.remainingTargetCount = remainingCodes.length;
+     stats.featureReadyCount = codes.length - stats.remainingTargetCount;
+-    stats.remainingCodes = remainingCodes.slice(0, 80);
++    stats.remainingCodes = remainingCodes.slice(0, COVERAGE_RESUME_CODE_LIMIT);
+   }
+ 
+   return byCode;
+@@ -8844,7 +9008,7 @@
+   if (!query.date) throw new Error("请输入买入日期");
+   const requestedDate = normalizeDate(query.date);
+   if (!requestedDate) throw new Error("买入日期格式不正确");
+-  const entryMode = query.entry || "nextOpen";
++  const entryMode = normalizePositionEntry(query.entry);
+   const rows = await loadKlineForPosition(stock, requestedDate, entryMode);
+   const benchmarkRows = await loadMarketIndexKline().catch(() => []);
+   const names = readStockNames();
+@@ -9024,4 +9188,11 @@
+   completedMarketDateFromTimestamp,
+   loadExpectedTradingDates,
+   resolveMarketTargetDate,
++  normalizePositionEntry,
++  displayEmCode,
++  displayMarketPrefix,
++  eastmoneyCurrentRanksToSnapshots,
++  applyCurrentRanksToHistories,
++  selectMissingRankCandidates,
++  rankHistoryContainsDate,
+ };
