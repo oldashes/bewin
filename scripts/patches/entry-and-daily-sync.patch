@@ -1,0 +1,33 @@
+--- a/work/strategy-dashboard/client/src/App.tsx
++++ b/work/strategy-dashboard/client/src/App.tsx
+@@ -319,7 +319,7 @@
+ 
+ function quoteUrl(stock: AnyRecord) {
+   const code = stock.code || "";
+-  const prefix = code.startsWith("6") ? "sh" : "sz";
++  const prefix = /^(?:4|8|92)/.test(code) ? "bj" : code.startsWith("6") ? "sh" : "sz";
+   return `https://quote.eastmoney.com/${prefix}${code}.html`;
+ }
+ 
+@@ -1051,7 +1051,7 @@
+ function PositionVerifier({ selectedDate, initialCode }: { selectedDate?: string; initialCode?: string }) {
+   const [code, setCode] = useState(initialCode || "");
+   const [date, setDate] = useState(selectedDate || "");
+-  const [entry, setEntry] = useState("next_open");
++  const [entry, setEntry] = useState("nextOpen");
+   const [payload, setPayload] = useState\u003cAnyRecord | null>(null);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState("");
+@@ -1087,9 +1087,9 @@
+       \u003cSimpleGrid cols={{ base: 1, md: 4 }} mt="md" className="verifyForm">
+         \u003cTextInput label="股票代码" value={code} onChange={(event) => setCode(event.currentTarget.value)} placeholder="例如 605178" />
+         \u003cTextInput label="买入日期" type="date" value={date} onChange={(event) => setDate(event.currentTarget.value)} />
+-        \u003cSelect label="买入方式" value={entry} onChange={(value) => setEntry(value || "next_open")} data={[
+-          { value: "next_open", label: "信号次日开盘" },
+-          { value: "same_close", label: "信号日收盘" },
++        \u003cSelect label="买入方式" value={entry} onChange={(value) => setEntry(value || "nextOpen")} data={[
++          { value: "nextOpen", label: "信号次日开盘" },
++          { value: "close", label: "信号日收盘" },
+         ]} />
+         \u003cButton mt={24} onClick={() => verify()} loading={loading}>计算收益\u003c/Button>
+       \u003c/SimpleGrid>
