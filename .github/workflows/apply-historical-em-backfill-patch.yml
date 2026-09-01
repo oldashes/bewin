@@ -3,9 +3,9 @@ on:
   push:
     branches:
       - fix/historical-em-backfill-ths-kline
+  workflow_dispatch:
 jobs:
   apply:
-    if: contains(github.event.head_commit.message, '[apply-patch]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,6 +16,10 @@ jobs:
       - name: Apply patch and push real file changes
         run: |
           set -euo pipefail
+          if [ ! -f scripts/patches/historical-em-backfill-ths-kline.patch ]; then
+            echo "patch already applied"
+            exit 0
+          fi
           git apply scripts/patches/historical-em-backfill-ths-kline.patch
           rm -f scripts/patches/historical-em-backfill-ths-kline.patch
           rm -f .github/workflows/apply-historical-em-backfill-patch.yml
@@ -26,14 +30,5 @@ jobs:
           git add -A
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "$(cat <<'MSG'
-fix: skip live EM current-list on historical backfill; resume THS kline
-
-- Detect historical targetDate vs latest completed market day and skip getAllCurrentList/snapshot upsert/applyCurrentRanksToHistories
-- dailySignalBackfillPayload always sets skipLiveCurrentList
-- Document low snapshotCount on historical sync_runs; keep getHisList + features
-- THS feature generation prioritizes klineStats.remainingCodes from prior sync_runs
-- Note early 400-1200 still needs iFind (no token wiring in this PR)
-MSG
-)"
+          git commit -m "fix: skip live EM current-list on historical backfill; resume THS kline"
           git push
