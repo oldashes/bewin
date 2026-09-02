@@ -3815,6 +3815,12 @@ async function strategyParamsForDiagnostics(sourceKey, strategyKey, temporaryStr
   return normalizeStrategyParams(STRATEGY_PARAM_DEFAULTS[baseKey] || STRATEGY_PARAM_DEFAULTS.early, baseKey);
 }
 
+function boardFiltersBypassed(params) {
+  const boardRet5Open = params.boardRet5MinPct <= -100 && params.boardRet5MaxPct >= 300;
+  const boardAmountOpen = params.boardAmountRatioMin <= 0 && params.boardAmountRatioMax >= 20;
+  return boardRet5Open && boardAmountOpen;
+}
+
 function featureRowsFilterDiagnostics(rows, params, strategyKey) {
   const steps = [];
   let current = rows;
@@ -3822,6 +3828,12 @@ function featureRowsFilterDiagnostics(rows, params, strategyKey) {
     current = current.filter(predicate);
     steps.push({ key, label, count: current.length });
   };
+
+  const boardRet5Active = !(params.boardRet5MinPct <= -100 && params.boardRet5MaxPct >= 300);
+  const boardAmountActive = !(params.boardAmountRatioMin <= 0 && params.boardAmountRatioMax >= 20);
+  // Hot's wide-open board window short-circuits without checking finiteness; skip the
+  // metrics-present step in that case so diagnostics match filter behavior.
+  const boardMetricsStepActive = !boardFiltersBypassed(params);
 
   steps.push({ key: "features", label: "特征池", count: current.length });
   addStep("rank", `人气 ${params.rankMin}-${params.rankMax}`, (row) => {
@@ -3840,13 +3852,29 @@ function featureRowsFilterDiagnostics(rows, params, strategyKey) {
     const value = n(row.prev_5);
     return Number.isFinite(value) && value >= params.stockPrev5MinPct / 100 && value <= params.stockPrev5MaxPct / 100;
   });
+
+  let missingBoardMetricsCount = 0;
+  if (boardMetricsStepActive) {
+    const beforeBoardMetrics = current.length;
+    addStep("boardMetrics", "板块指标可用", (row) => {
+      const boardRet5 = n(row.best_board_ret_5);
+      if (!Number.isFinite(boardRet5)) return false;
+      if (boardAmountActive) {
+        const boardAmount = n(row.best_board_amount_ratio);
+        if (!Number.isFinite(boardAmount)) return false;
+      }
+      return true;
+    });
+    missingBoardMetricsCount = Math.max(0, beforeBoardMetrics - current.length);
+  }
+
   addStep("boardRet5", `板块5日 ${percentRule(params.boardRet5MinPct)}-${percentRule(params.boardRet5MaxPct)}`, (row) => {
-    if (params.boardRet5MinPct <= -100 && params.boardRet5MaxPct >= 300) return true;
+    if (!boardRet5Active) return true;
     const value = n(row.best_board_ret_5);
     return Number.isFinite(value) && value >= params.boardRet5MinPct / 100 && value <= params.boardRet5MaxPct / 100;
   });
   addStep("boardAmount", `板块量能 ${params.boardAmountRatioMin}-${params.boardAmountRatioMax}`, (row) => {
-    if (params.boardAmountRatioMin <= 0 && params.boardAmountRatioMax >= 20) return true;
+    if (!boardAmountActive) return true;
     const value = n(row.best_board_amount_ratio);
     return Number.isFinite(value) && value >= params.boardAmountRatioMin && value <= params.boardAmountRatioMax;
   });
@@ -3860,7 +3888,7 @@ function featureRowsFilterDiagnostics(rows, params, strategyKey) {
     });
   }
 
-  return steps;
+  return { steps, missingBoardMetricsCount };
 }
 
 function featureRankCoverage(rows, params) {
@@ -3898,7 +3926,7 @@ async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate
       `,
       [sourceKey, FEATURE_SET, selectedDate],
     );
-    const steps = featureRowsFilterDiagnostics(rows, params, strategyKey);
+    const { steps, missingBoardMetricsCount } = featureRowsFilterDiagnostics(rows, params, strategyKey);
     const finalCount = steps.at(-1)?.count || 0;
     const bottleneck =
       steps
@@ -3917,6 +3945,7 @@ async function strategyDiagnosticsForDate({ sourceKey, strategyKey, selectedDate
       finalCount,
       steps,
       bottleneck,
+      missingBoardMetricsCount,
       rankCoverage: featureRankCoverage(rows, params),
     };
   } catch (error) {
@@ -3941,6 +3970,13 @@ function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
   const maxRank = Number(coverage.maxRank);
   const requiredMin = Number(coverage.requiredMin);
   const requiredMax = Number(coverage.requiredMax);
+  const rankRangeCovered =
+    Number.isFinite(minRank) &&
+    Number.isFinite(maxRank) &&
+    Number.isFinite(requiredMin) &&
+    Number.isFinite(requiredMax) &&
+    Number(coverage.inRangeCount) > 0;
+
   if (
     !Number.isFinite(minRank) ||
     !Number.isFinite(maxRank) ||
@@ -3948,6 +3984,15 @@ function strategyCoverageIssue({ sourceKey, strategyLabel, diagnostics }) {
     !Number.isFinite(requiredMax) ||
     Number(coverage.inRangeCount) > 0
   ) {
+    const missingBoard = Number(diagnostics?.missingBoardMetricsCount) || 0;
+    if (rankRangeCovered && missingBoard > 0) {
+      return {
+        level: "warning",
+        code: "board_metrics_missing",
+        message: `${sourceLabel}${strategyName}漏斗最终为 0，但有 ${missingBoard} 条个股/量能幸存者缺少板块指标（best_board_ret_5 等为 null），不是「板块5日甜区」单独杀光；请检查板块 K 线/特征回填。`,
+        detail: `missingBoardMetricsCount=${missingBoard}; finalCount=0`,
+      };
+    }
     return null;
   }
 
@@ -9245,6 +9290,7 @@ module.exports = {
   klineRowsProveTargetUnavailable,
   klineRowsSupportFeatures,
   strategyCoverageIssue,
+  featureRowsFilterDiagnostics,
   featureRunCoverageIssue,
   fetchKlineWithProviderFallback,
   fetchMarketIndexKline,
